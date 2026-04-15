@@ -1,0 +1,11 @@
+pub mod builder_macro;
+pub mod clustering;
+#[cfg(feature = "ml")]
+pub mod feature_extraction;
+pub mod io;
+#[cfg(feature = "ml")]
+pub mod machine_learning;
+pub mod plotting;
+pub mod spectrum;
+pub mod workflow;
+pub use spectrum::*;

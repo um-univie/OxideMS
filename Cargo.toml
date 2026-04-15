@@ -1,0 +1,52 @@
+[package]
+name = "oxidems_lib"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+similarity = "0.2.0"
+nohash-hasher = "0.2"
+chemistry_consts = "0.1.6"
+rayon = "1.11.0"
+rkyv = {version="0.8.15", features = ["pointer_width_64"]}
+rand = "0.10.0"
+rand_distr = "0.6.0"
+plotters = "0.3.7"
+xxhash-rust = {version="0.8.15", features = ["xxh32"]}
+fast-float = "0.2.0"
+memmap2 = "0.9.10"
+memchr = "2.8.0"
+compact_str = "0.9.0"
+matrixmultiply = "0.3.10"
+itertools = "0.14.0"
+
+
+
+ndarray = {version= "0.16.1", features=["rayon"], optional = true}
+burn = {version="0.20.1", features=["train", "wgpu", "ndarray"], optional=true}
+serde_json = {version= "1.0.149", optional = true}
+serde = {version="1.0.228", optional = true}
+
+
+[dev-dependencies]
+criterion = "0.8.2"
+pollster = "0.4.0"
+wgpu = "29.0.1"
+bytemuck = "1.25.0"
+
+
+[features]
+ml = ["dep:burn", "dep:serde_json", "dep:serde", "dep:ndarray"]
+# plotting = ["dep:plotters"]
+
+[profile.release]
+#debug = true
+strip=true
+opt-level = 3
+#codegen-units = 1
+
+
+
+[[bench]]
+name = "wgpu_bench"
+harness = false

@@ -1,0 +1,15 @@
+/target
+/test_files
+/data
+/temp_spectra
+/tests
+/plots
+/benches
+src/sirius.rs
+src/formula_generator.rs
+.zed
+*.svg
+*.py
+*.csv
+*.bib
+*.sh
