@@ -4,7 +4,6 @@
 /temp_spectra
 /tests
 /plots
-/benches
 src/sirius.rs
 src/formula_generator.rs
 .zed
