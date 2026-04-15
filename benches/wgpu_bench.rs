@@ -802,7 +802,7 @@ fn bench_sgemm(c: &mut Criterion) {
     group.sample_size(10);
 
     let k = 800;
-    let m_sizes = [256, 1024, 5000, 10000, 20000];
+    let m_sizes = [256, 1024, 5000, 10000, 20000, 30000];
 
     let dbscan_eps = 0.90; // Similarity threshold
     let dbscan_minpts = 10;

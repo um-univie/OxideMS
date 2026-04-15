@@ -1,6 +1,9 @@
 use crate::{
     HashedSpectrumConfig, MSNSpectrum, SpectrumHasher,
-    clustering::k_cluster_ivf::{BucketIndex, graph_dbscan},
+    clustering::{
+        bitset::{BitSetOpsMSB0, WORDSIZE},
+        k_cluster_ivf::{BucketIndex, graph_dbscan},
+    },
     io::mgf::{MGF_SPECTRA_SIZE, MgfParser, MgfParserConfig},
     workflow::*,
 };
@@ -64,8 +67,8 @@ struct Node {
 }
 
 const MIN_NEIGHBORS: usize = 2;
-const LARGE_BATCH_THRESHOLD: usize = 20_000;
-const FAST_BATCH_NUMBER: usize = 5_120;
+const LARGE_BATCH_THRESHOLD: usize = 30_000;
+const FAST_BATCH_NUMBER: usize = 10000;
 
 pub struct FlatClusters {
     pub data: Vec<usize>,    // All IDs packed together
@@ -344,17 +347,6 @@ fn get_similarity(matrix: &[f32], n: usize, p: usize, q: usize) -> f32 {
 
     matrix[idx]
 }
-/// Retrieves the similarity score from a full N x N flat matrix.
-fn get_similarity_square(
-    matrix: &[f32],
-    matrix_size: usize,
-    row_index: usize,
-    column_index: usize,
-) -> f32 {
-    // Standard 2D-to-1D mapping for a square matrix
-    let idx = row_index * matrix_size + column_index;
-    matrix[idx]
-}
 
 /// Runs DBSCAN on a precomputed upper-triangular similarity matrix.
 ///
@@ -508,6 +500,158 @@ pub fn dbscan_full(
     }
 
     labels
+}
+
+/// Retrieves the similarity score from a full N x N flat matrix.
+fn get_similarity_square(
+    matrix: &[f32],
+    matrix_size: usize,
+    row_index: usize,
+    column_index: usize,
+) -> f32 {
+    // Standard 2D-to-1D mapping for a square matrix
+    let idx = row_index * matrix_size + column_index;
+    matrix[idx]
+}
+/// A compact Union-Find implementation using path compression and union-by-rank.
+struct DSU {
+    parent: Vec<i32>,
+}
+
+impl DSU {
+    fn new(size: usize) -> Self {
+        // Initialize with -1. Negative values indicate a root,
+        // and the absolute value is the rank (tree height).
+        Self {
+            parent: vec![-1; size],
+        }
+    }
+
+    fn find(&mut self, i: usize) -> usize {
+        if self.parent[i] < 0 {
+            i
+        } else {
+            // Path compression: point node directly to the root
+            let root = self.find(self.parent[i] as usize);
+            self.parent[i] = root as i32;
+            root
+        }
+    }
+
+    fn union(&mut self, i: usize, j: usize) {
+        let root_i = self.find(i);
+        let root_j = self.find(j);
+
+        if root_i != root_j {
+            // Union by rank: attach the shorter tree to the taller one
+            if self.parent[root_i] < self.parent[root_j] {
+                self.parent[root_j] = root_i as i32;
+            } else {
+                if self.parent[root_i] == self.parent[root_j] {
+                    self.parent[root_j] -= 1; // Increase rank
+                }
+                self.parent[root_i] = root_j as i32;
+            }
+        }
+    }
+}
+
+pub fn dbscan_upper_triangular(
+    similarity_matrix: &[f32],
+    num_points: usize,
+    min_similarity: f32,
+    min_pts: usize,
+) -> Vec<ClusterLabel> {
+    let words_per_vertex = (num_points + WORDSIZE - 1) / WORDSIZE;
+
+    // 1. Pre-allocate the Bit-Matrix (N x words_per_vertex)
+    // Using a single flat Vec for cache locality
+    let mut bit_matrix = vec![0usize; num_points * words_per_vertex];
+
+    // 2. Build Bit-Matrix in Parallel
+    // We process rows in parallel. Each row becomes a full BitSet.
+    bit_matrix
+        .par_chunks_mut(words_per_vertex)
+        .enumerate()
+        .for_each(|(i, row_bits)| {
+            for j in 0..num_points {
+                // Access similarity (Symmetric logic)
+                let (r, c) = if i <= j { (i, j) } else { (j, i) };
+                if similarity_matrix[r * num_points + c] >= min_similarity {
+                    row_bits.set_bit(j);
+                }
+            }
+        });
+
+    let mut labels = vec![ClusterLabel::Unclassified; num_points];
+    let mut visited = vec![0usize; words_per_vertex]; // Tracks globally visited points
+    let mut current_cluster_id = 0;
+    let mut seed_set = Vec::with_capacity(num_points);
+
+    for p in 0..num_points {
+        if labels[p] != ClusterLabel::Unclassified {
+            continue;
+        }
+
+        let p_row = &bit_matrix[p * words_per_vertex..(p + 1) * words_per_vertex];
+
+        // Fast neighbor count using POPCNT
+        if p_row.population_count() < min_pts as u32 {
+            labels[p] = ClusterLabel::Noise;
+            continue;
+        }
+
+        // Found a core point
+        labels[p] = ClusterLabel::Cluster(current_cluster_id);
+        seed_set.clear();
+
+        // Initial expansion from p
+        let mut idx = p_row.next_set_bit(0);
+        while let Some(q) = idx {
+            if q != p {
+                if labels[q] == ClusterLabel::Unclassified || labels[q] == ClusterLabel::Noise {
+                    labels[q] = ClusterLabel::Cluster(current_cluster_id);
+                    seed_set.push(q);
+                }
+            }
+            idx = p_row.next_set_bit(q + 1);
+        }
+
+        // 3. Cluster Expansion (The "Greedy" Loop)
+        let mut i = 0;
+        while i < seed_set.len() {
+            let q = seed_set[i];
+            let q_row = &bit_matrix[q * words_per_vertex..(q + 1) * words_per_vertex];
+
+            if q_row.population_count() >= min_pts as u32 {
+                let mut neighbor_idx = q_row.next_set_bit(0);
+                while let Some(n) = neighbor_idx {
+                    if labels[n] == ClusterLabel::Unclassified {
+                        labels[n] = ClusterLabel::Cluster(current_cluster_id);
+                        seed_set.push(n);
+                    } else if labels[n] == ClusterLabel::Noise {
+                        labels[n] = ClusterLabel::Cluster(current_cluster_id);
+                    }
+                    neighbor_idx = q_row.next_set_bit(n + 1);
+                }
+            }
+            i += 1;
+        }
+        current_cluster_id += 1;
+    }
+
+    labels
+}
+
+/// Retrieves the similarity score from an N x N matrix where only the
+/// upper triangle is guaranteed to be valid.
+fn get_similarity_upper(matrix: &[f32], num_points: usize, row: usize, col: usize) -> f32 {
+    // If we are in the lower triangle, swap row and column to access the upper triangle
+    let (r, c) = if row <= col { (row, col) } else { (col, row) };
+
+    // Standard row-major mapping: index = row * width + col
+    let idx = r * num_points + c;
+    matrix[idx]
 }
 
 /// Represents a mass spectrum as a collection of peaks
@@ -1161,6 +1305,9 @@ impl ClusterEngine {
         let hash_size = self.hash_size();
         let epsilon = self.epsilon;
         let fast_file_path = format!("{TEMP_FOLDER_NAME}/fast_batches.bin");
+        let start_time = std::time::Instant::now();
+        println!("Starting fast batch");
+
         if let Ok(file) = File::open(&fast_file_path) {
             // Map the file into virtual memory
             let mmap = unsafe { Mmap::map(&file)? };
@@ -1200,20 +1347,50 @@ impl ClusterEngine {
                                     buffer_slice,
                                 );
                             });
+                        let mut dbscan_labels;
+                        #[cfg(all(target_vendor = "apple"))]
+                        {
+                            unsafe {
+                                similarity_matrix_buffer.resize(n_spectra * n_spectra, 0.0);
+                                cblas_ssyrk(
+                                    101,                                   // CblasRowMajor
+                                    121, // CblasUpper (only calculate the top-right triangle)
+                                    111, // CblasNoTrans (A is Row-Major)
+                                    n_spectra as i32, // N: dimension of the result (20,000)
+                                    hash_size as i32, // K: shared dimension (800)
+                                    1.0, // alpha
+                                    spectral_buffer.as_ptr(), // A
+                                    hash_size as i32, // lda: row stride (800)
+                                    0.0, // beta
+                                    similarity_matrix_buffer.as_mut_ptr(), // C
+                                    n_spectra as i32, // ldc: row stride (20,000)
+                                );
+                            }
 
-                        // Compute using single threaded_sgemm
-                        compute_similarity_matrix(
-                            similarity_matrix_buffer,
-                            spectral_buffer,
-                            hash_size,
-                        );
+                            dbscan_labels = dbscan_upper_triangular(
+                                similarity_matrix_buffer,
+                                n_spectra,
+                                1.0 - self.epsilon,
+                                MIN_NEIGHBORS,
+                            );
+                        }
 
-                        let dbscan_labels = dbscan_full(
-                            similarity_matrix_buffer,
-                            n_spectra,
-                            1.0 - epsilon,
-                            MIN_NEIGHBORS,
-                        );
+                        #[cfg(not(all(target_vendor = "apple")))]
+                        {
+                            // Compute using single threaded_sgemm
+                            compute_similarity_matrix(
+                                similarity_matrix_buffer,
+                                spectral_buffer,
+                                hash_size,
+                            );
+
+                            dbscan_labels = dbscan_full(
+                                similarity_matrix_buffer,
+                                n_spectra,
+                                1.0 - epsilon,
+                                MIN_NEIGHBORS,
+                            );
+                        }
 
                         let mut local_cluster_assignments = Vec::new();
                         let mut max_value = 0;
@@ -1251,6 +1428,16 @@ impl ClusterEngine {
             drop(file);
         }
 
+        // Starting slow batch
+        // #[cfg(debug_assertions)]
+        println!(
+            "Done with fast batch after: {}",
+            start_time.elapsed().as_secs_f32()
+        );
+
+        // #[cfg(debug_assertions)]
+        println!("Starting slow batch");
+        let start_time = std::time::Instant::now();
         // After finishing the fast batches fix-up phase:
         let slow_file_path = format!("{TEMP_FOLDER_NAME}/slow_batches.bin");
         if let Ok(file) = File::open(&slow_file_path) {
@@ -1266,6 +1453,7 @@ impl ClusterEngine {
                 let archived_spectra = batch.batch.as_slice();
                 let n_spectra = batch.batch.len();
 
+                let start_time = std::time::Instant::now();
                 self.spectral_buffer
                     .resize(archived_spectra.len() * self.hash_size(), 0.0);
                 self.spectral_buffer.fill(0.0);
@@ -1283,7 +1471,6 @@ impl ClusterEngine {
                     });
 
                 let dbscan_labels;
-                let start_time = std::time::Instant::now();
                 if n_spectra > LARGE_BATCH_THRESHOLD {
                     let index = BucketIndex::build(&self.spectral_buffer, hash_size, 64);
                     let edges = index.extract_edges(64, self.epsilon);
@@ -1308,20 +1495,25 @@ impl ClusterEngine {
                                 n_spectra as i32, // ldc: row stride (20,000)
                             );
                         }
+
+                        dbscan_labels = dbscan_upper_triangular(
+                            &self.similarity_matrix_buffer,
+                            n_spectra,
+                            1.0 - self.epsilon,
+                            MIN_NEIGHBORS,
+                        );
                     }
                     #[cfg(not(target_vendor = "apple"))]
                     {
-                        println!("calling matrix for size: {}", n_spectra);
                         self.compute_similarity_matrix_parallel();
 
-                        println!("Done after: {}", start_time.elapsed().as_secs_f32());
+                        dbscan_labels = dbscan_full(
+                            &self.similarity_matrix_buffer,
+                            n_spectra,
+                            1.0 - self.epsilon,
+                            MIN_NEIGHBORS,
+                        );
                     }
-                    dbscan_labels = dbscan_full(
-                        &self.similarity_matrix_buffer,
-                        n_spectra,
-                        1.0 - self.epsilon,
-                        MIN_NEIGHBORS,
-                    );
                 }
 
                 let mut max_value = 0;
@@ -1340,6 +1532,13 @@ impl ClusterEngine {
                 current_clusters_size += max_value;
             }
         };
+
+        // Starting slow batch
+        // #[cfg(debug_assertions)]
+        println!(
+            "Done with slow batch after: {}",
+            start_time.elapsed().as_secs_f32()
+        );
 
         // let assignments: Vec<(usize, usize)> = cluster_assignments
         //     .into_iter()

@@ -1,3 +1,4 @@
+pub mod bitset;
 pub mod cluster;
 #[cfg(feature = "ml")]
 pub mod cluster_burn;
