@@ -264,7 +264,14 @@ impl SpectralExperiment {
         let mut local_metadata = Vec::new();
         let processed_spectra: Vec<MSNSpectrum> = spectra
             .into_iter()
-            .filter(|s| !s.peaks().is_empty() && s.get_charge() != 0)
+            .filter(|s| {
+                !s.peaks().is_empty()
+                    && if self.filter_unknown_charge {
+                        s.get_charge() != 0
+                    } else {
+                        true
+                    }
+            })
             .enumerate()
             .map(|(local_idx, s)| {
                 let scan_number = s
