@@ -46,10 +46,6 @@ use oxidems_lib::{
 
 fn main() {
     let start_time = std::time::Instant::now();
-    let config = MgfParserConfig::default();
-    let mut parser = MgfParser::new(config);
-    // let mut msn_spectra = Vec::new();
-
     let mut spectral_experiment = SpectralExperiment::proteomics();
     spectral_experiment.engine.exact = true;
 

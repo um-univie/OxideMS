@@ -18,7 +18,6 @@ const MIN_NEIGHBORS: usize = 2;
 const LARGE_BATCH_THRESHOLD: usize = 30_000;
 const FAST_BATCH_NUMBER: usize = 10000;
 
-
 #[cfg(target_vendor = "apple")]
 #[link(name = "Accelerate", kind = "framework")]
 unsafe extern "C" {
@@ -153,8 +152,10 @@ pub struct ClusterEngine {
     pub mz_tolerance: MassTolerance,
     pub epsilon: f32,
     pub(super) batch_size_threshold: usize,
+    approximate_threshold: usize,
     pub(super) hasher: SpectrumHasher,
     pub exact: bool,
+    pub min_neighbors: usize,
     pub use_gpu: bool,
     pub(super) fast_batches: Vec<MassSpectrumBatch>,
     pub(super) slow_batches: Vec<MassSpectrumBatch>,
@@ -174,8 +175,10 @@ impl Default for ClusterEngine {
             epsilon: eps,
             mz_tolerance: MassTolerance::Ppm(20.0),
             batch_size_threshold: FAST_BATCH_NUMBER,
+            approximate_threshold: LARGE_BATCH_THRESHOLD,
             hasher: SpectrumHasher::new(100.0, 1500.0, MassTolerance::Da(0.05), hash_size),
             exact: false,
+            min_neighbors: MIN_NEIGHBORS,
             use_gpu: false,
             fast_batches: Vec::new(),
             slow_batches: Vec::new(),
@@ -186,25 +189,6 @@ impl Default for ClusterEngine {
 }
 
 impl ClusterEngine {
-    pub fn new(hash_size: usize, eps: f32) -> Self {
-        let number_of_spectra = 128;
-        let matrix_size = number_of_spectra * (number_of_spectra + 1) / 2;
-        ClusterEngine {
-            spectral_buffer: vec![0.0; number_of_spectra * hash_size],
-            similarity_matrix_buffer: vec![0.0; matrix_size],
-            epsilon: eps,
-            mz_tolerance: MassTolerance::Ppm(20.0),
-            batch_size_threshold: FAST_BATCH_NUMBER,
-            hasher: SpectrumHasher::new(100.0, 1500.0, MassTolerance::Da(0.05), hash_size),
-            exact: false,
-            use_gpu: false,
-            fast_batches: Vec::new(),
-            slow_batches: Vec::new(),
-            #[cfg(feature = "gpu")]
-            gpu: None,
-        }
-    }
-
     #[cfg(feature = "gpu")]
     pub fn enable_gpu(&mut self, max_batch: usize) {
         let max_m = if max_batch == 0 {
@@ -363,8 +347,8 @@ impl ClusterEngine {
         println!("Starting fast batch");
 
         if !fast_batches.is_empty() {
-            use faer::sparse::{SparseRowMat, Triplet};
             use faer::sparse::linalg::matmul::sparse_sparse_matmul;
+            use faer::sparse::{SparseRowMat, Triplet};
 
             let hasher = &self.hasher;
             let batch_results: Vec<_> = if self.exact {
@@ -380,20 +364,24 @@ impl ClusterEngine {
                             let spectra = batch.batch.as_slice();
                             let n_spectra = spectra.len();
 
-                            if n_spectra == 2 && MIN_NEIGHBORS == 2 {
+                            if n_spectra == 2 && self.min_neighbors == 2 {
                                 let mut spectrum1 = spectra[0].spectrum.to_soa(mz_tolerance);
                                 spectrum1.l2_normalize();
                                 let mut spectrum2 = spectra[1].spectrum.to_soa(mz_tolerance);
                                 spectrum2.l2_normalize();
 
-                                let similarity = crate::clustering::similarities::branching_cosine_sim(
-                                    &spectrum1.mz_bins,
-                                    &spectrum1.intensities,
-                                    &spectrum2.mz_bins,
-                                    &spectrum2.intensities,
-                                );
+                                let similarity =
+                                    crate::clustering::similarities::branching_cosine_sim(
+                                        &spectrum1.mz_bins,
+                                        &spectrum1.intensities,
+                                        &spectrum2.mz_bins,
+                                        &spectrum2.intensities,
+                                    );
                                 if similarity >= threshold {
-                                    return (vec![(0_usize, spectra[0].id), (0_usize, spectra[1].id)], 1);
+                                    return (
+                                        vec![(0_usize, spectra[0].id), (0_usize, spectra[1].id)],
+                                        1,
+                                    );
                                 } else {
                                     return (vec![], 0);
                                 }
@@ -602,11 +590,15 @@ impl ClusterEngine {
                 .par_chunks_exact_mut(hash_size)
                 .zip(spectra.par_iter())
                 .for_each(|(buffer_slice, spectrum)| {
-                    hasher.into_vector_native(spectrum.spectrum.peaks.as_slice(), true, buffer_slice);
+                    hasher.into_vector_native(
+                        spectrum.spectrum.peaks.as_slice(),
+                        true,
+                        buffer_slice,
+                    );
                 });
 
             let dbscan_labels: Vec<ClusterLabel>;
-            if n_spectra > LARGE_BATCH_THRESHOLD {
+            if n_spectra > self.approximate_threshold {
                 let index = BucketIndex::build(&self.spectral_buffer, hash_size, 64);
                 let edges = index.extract_edges(64, epsilon);
                 dbscan_labels = graph_dbscan(n_spectra, &edges, epsilon, MIN_NEIGHBORS);
