@@ -45,7 +45,7 @@ impl<'a> BucketIndex<'a> {
         let mut centroids = vec![0.0; n_list * dim];
         let mut rng = rand::rng();
 
-        // 1. Pick the very first centroid uniformly at random
+        // Pick the very first centroid uniformly at random
         let first_idx = rng.random_range(0..n_vectors);
         let first_offset = first_idx * dim;
         centroids[..dim].copy_from_slice(&bucket_data[first_offset..first_offset + dim]);
@@ -58,7 +58,7 @@ impl<'a> BucketIndex<'a> {
             // The centroid we just added in the previous loop iteration
             let latest_centroid = &centroids[(k - 1) * dim..k * dim];
 
-            // 2. Parallel distance update
+            // Parallel distance update
             // We iterate over the tracking array in parallel, mapping each index
             // back to its corresponding vector in the flat `bucket_data` slice.
             min_sq_distances
@@ -81,10 +81,10 @@ impl<'a> BucketIndex<'a> {
                     }
                 });
 
-            // 3. Sum the distances to establish the total probability pool
+            // Sum the distances to establish the total probability pool
             let total_weight: f32 = min_sq_distances.iter().sum();
 
-            // 4. Weighted random selection (Roulette Wheel Selection)
+            // Weighted random selection (Roulette Wheel Selection)
             // We pick a random float between 0 and the total weight.
             let target = rng.random_range(0.0..1.0) * total_weight;
             let mut cumulative_weight = 0.0;
@@ -99,7 +99,7 @@ impl<'a> BucketIndex<'a> {
                 }
             }
 
-            // 5. Copy the chosen vector into our centroids array
+            // Copy the chosen vector into our centroids array
             let next_offset = next_centroid_idx * dim;
             let dest_offset = k * dim;
             centroids[dest_offset..dest_offset + dim]

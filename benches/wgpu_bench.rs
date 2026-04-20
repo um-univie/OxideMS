@@ -1,7 +1,13 @@
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use faer::linalg::matmul::matmul;
+use faer::linalg::matmul::triangular::{BlockStructure, matmul as triangular_matmul};
+use faer::{Accum, MatMut, MatRef, Par};
+use pollster::block_on;
 use rand::{Rng, RngExt};
 use rayon::prelude::*;
+use std::num::NonZero; // cargo add pollster
 
+#[cfg(target_vendor = "apple")]
 #[link(name = "Accelerate", kind = "framework")]
 unsafe extern "C" {
     fn cblas_sgemm(
@@ -225,6 +231,104 @@ fn merge_clusters(@builtin(global_invocation_id) global_id: vec3<u32>) {
 }
 "#;
 
+// --- SHADER 4a: Upper-Triangle Packed SYRK — baseline G×G dispatch ---
+// Dispatches a full G×G grid; lower-triangle workgroups do full compute
+// but skip the write.  Baseline for comparison.
+const SHADER_UPPER_SYRK: &str = r#"
+struct Params { m: u32, k: u32, pad1: u32, pad2: u32 };
+@group(0) @binding(0) var<storage, read>       A: array<f32>;
+@group(0) @binding(1) var<storage, read_write> C: array<f32>;
+@group(0) @binding(2) var<uniform>             params: Params;
+var<workgroup> tileA: array<array<f32, 16>, 16>;
+var<workgroup> tileB: array<array<f32, 16>, 16>;
+@compute @workgroup_size(16, 16, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = gid.y; let col = gid.x; var sum = 0.0f;
+    for (var t = 0u; t < (params.k + 15u) / 16u; t++) {
+        tileA[lid.y][lid.x] = select(0.0, A[row * params.k + t*16u+lid.x], row < params.m && t*16u+lid.x < params.k);
+        tileB[lid.y][lid.x] = select(0.0, A[col * params.k + t*16u+lid.y], col < params.m && t*16u+lid.y < params.k);
+        workgroupBarrier();
+        for (var i = 0u; i < 16u; i++) { sum += tileA[lid.y][i] * tileB[i][lid.x]; }
+        workgroupBarrier();
+    }
+    if (row <= col && row < params.m && col < params.m) {
+        C[row * (2u * params.m - row - 1u) / 2u + col] = sum;
+    }
+}
+"#;
+
+// --- SHADER 4b: Upper-Triangle Packed SYRK — early-return G×G dispatch ---
+// Still dispatches G×G workgroups but entire below-diagonal blocks return
+// before entering the tile loop.  group_id is uniform across a workgroup so
+// this is valid per WGSL uniformity rules (all 256 threads agree).
+const SHADER_UPPER_SYRK_EARLYRET: &str = r#"
+struct Params { m: u32, k: u32, pad1: u32, pad2: u32 };
+@group(0) @binding(0) var<storage, read>       A: array<f32>;
+@group(0) @binding(1) var<storage, read_write> C: array<f32>;
+@group(0) @binding(2) var<uniform>             params: Params;
+var<workgroup> tileA: array<array<f32, 16>, 16>;
+var<workgroup> tileB: array<array<f32, 16>, 16>;
+@compute @workgroup_size(16, 16, 1)
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(local_invocation_id)  lid: vec3<u32>,
+    @builtin(workgroup_id)         wid: vec3<u32>,
+) {
+    // All 256 threads share wid, so this return is uniform — no barrier hazard.
+    if (wid.y > wid.x) { return; }
+    let row = gid.y; let col = gid.x; var sum = 0.0f;
+    for (var t = 0u; t < (params.k + 15u) / 16u; t++) {
+        tileA[lid.y][lid.x] = select(0.0, A[row * params.k + t*16u+lid.x], row < params.m && t*16u+lid.x < params.k);
+        tileB[lid.y][lid.x] = select(0.0, A[col * params.k + t*16u+lid.y], col < params.m && t*16u+lid.y < params.k);
+        workgroupBarrier();
+        for (var i = 0u; i < 16u; i++) { sum += tileA[lid.y][i] * tileB[i][lid.x]; }
+        workgroupBarrier();
+    }
+    // Off-diagonal blocks are entirely upper-triangle; diagonal blocks need the check.
+    let in_bounds = row < params.m && col < params.m;
+    let is_upper  = (wid.y < wid.x) || (row <= col);
+    if (in_bounds && is_upper) {
+        C[row * (2u * params.m - row - 1u) / 2u + col] = sum;
+    }
+}
+"#;
+
+// --- SHADER 4c: Upper-Triangle Packed SYRK — triangular dispatch ---
+// Dispatches only G*(G+1)/2 workgroups (one per upper-tri tile block).
+// The flat workgroup index is decoded to (group_row, group_col) using the
+// anti-diagonal enumeration: (0,0),(0,1),(1,1),(0,2),(1,2),(2,2),...
+// Formula: d = floor((√(8·flat+1)−1)/2), group_col=d, group_row=flat−d*(d+1)/2
+const SHADER_UPPER_SYRK_TRIAG: &str = r#"
+struct Params { m: u32, k: u32, pad1: u32, pad2: u32 };
+@group(0) @binding(0) var<storage, read>       A: array<f32>;
+@group(0) @binding(1) var<storage, read_write> C: array<f32>;
+@group(0) @binding(2) var<uniform>             params: Params;
+var<workgroup> tileA: array<array<f32, 16>, 16>;
+var<workgroup> tileB: array<array<f32, 16>, 16>;
+@compute @workgroup_size(16, 16, 1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    var d = u32((sqrt(f32(8u * wid.x + 1u)) - 1.0) * 0.5);
+    d += u32((d + 1u) * (d + 2u) / 2u <= wid.x);   // fix fp rounding
+    let group_col = d;
+    let group_row = wid.x - d * (d + 1u) / 2u;
+    let row = group_row * 16u + lid.y;
+    let col = group_col * 16u + lid.x;
+    var sum = 0.0f;
+    for (var t = 0u; t < (params.k + 15u) / 16u; t++) {
+        tileA[lid.y][lid.x] = select(0.0, A[row * params.k + t*16u+lid.x], row < params.m && t*16u+lid.x < params.k);
+        tileB[lid.y][lid.x] = select(0.0, A[col * params.k + t*16u+lid.y], col < params.m && t*16u+lid.y < params.k);
+        workgroupBarrier();
+        for (var i = 0u; i < 16u; i++) { sum += tileA[lid.y][i] * tileB[i][lid.x]; }
+        workgroupBarrier();
+    }
+    let in_bounds = row < params.m && col < params.m;
+    let is_upper  = (group_row < group_col) || (row <= col);
+    if (in_bounds && is_upper) {
+        C[row * (2u * params.m - row - 1u) / 2u + col] = sum;
+    }
+}
+"#;
+
 // --- WGPU Setup ---
 
 struct WgpuRunner {
@@ -255,6 +359,23 @@ struct WgpuRunner {
     buffer_labels: wgpu::Buffer,
     staging_buffer_labels: wgpu::Buffer,
     uniform_dbscan: wgpu::Buffer,
+
+    // Upper-triangle packed SYRK — three variants sharing the same buffers/bind group
+    pipeline_upper_syrk: wgpu::ComputePipeline, // 4a: baseline G×G
+    pipeline_upper_syrk_earlyret: wgpu::ComputePipeline, // 4b: early-return G×G
+    pipeline_upper_syrk_triag: wgpu::ComputePipeline, // 4c: triangular dispatch
+    bind_group_upper_syrk: wgpu::BindGroup,     // shared across all three
+    buffer_c_packed: wgpu::Buffer,
+    staging_c_packed: wgpu::Buffer,
+
+    /// Largest M that the full N×N buffers were allocated for.
+    /// Benchmarks using those buffers must skip sizes above this.
+    max_m_full: usize,
+    max_buffer_size: u64,
+    max_storage_binding: u64,
+    adapter_name: String,
+    backend: wgpu::Backend,
+    device_type: wgpu::DeviceType,
 }
 
 impl WgpuRunner {
@@ -266,6 +387,18 @@ impl WgpuRunner {
             .expect("Failed to find adapter");
 
         let hardware_limits = adapter.limits();
+        let adapter_info = adapter.get_info();
+
+        // max_buffer_size from wgpu reflects the Vulkan/Metal/DX12 reported limit,
+        // which is often 2^31-1 regardless of VRAM (e.g. RADV reports i32::MAX).
+        // max_storage_buffer_binding_size may be a tighter limit for shader bindings.
+        let max_buffer_size = hardware_limits.max_buffer_size;
+        let max_storage_binding = hardware_limits.max_storage_buffer_binding_size as u64;
+        let effective_limit = max_buffer_size.min(max_storage_binding);
+        let max_m_full = {
+            let fits = (effective_limit / 4).isqrt() as usize;
+            max_m.min(fits)
+        };
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -289,9 +422,10 @@ impl WgpuRunner {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // Full N×N output — capped at max_m_full to stay within buffer size limits.
         let buffer_c = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Matrix C (Output)"),
-            size: (max_m * max_m * 4) as u64,
+            size: (max_m_full * max_m_full * 4) as u64,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
@@ -299,7 +433,7 @@ impl WgpuRunner {
         });
         let staging_buffer_c = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Matrix C (Staging)"),
-            size: (max_m * max_m * 4) as u64,
+            size: (max_m_full * max_m_full * 4) as u64,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -551,6 +685,103 @@ impl WgpuRunner {
                 },
             ],
         });
+
+        // --- Upper-Triangle Packed SYRK ---
+        let packed_max = max_m * (max_m + 1) / 2;
+        let buffer_c_packed = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("C packed upper-tri"),
+            size: (packed_max * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging_c_packed = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("C packed staging"),
+            size: (packed_max * 4) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // All three upper-SYRK variants share the same bind group layout.
+        // Using layout:None gives each pipeline an exclusive layout that can't be
+        // shared, so we define the layout explicitly and inject it via PipelineLayout.
+        let upper_syrk_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("upper_syrk_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let upper_syrk_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("upper_syrk_pl"),
+            bind_group_layouts: &[Some(&upper_syrk_bgl)],
+            ..Default::default()
+        });
+        let mk_upper_pipeline = |src: &'static str, label: &'static str| {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(src.into()),
+            });
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&upper_syrk_pl),
+                module: &module,
+                entry_point: Some("main"),
+                cache: None,
+                compilation_options: Default::default(),
+            })
+        };
+        let pipeline_upper_syrk = mk_upper_pipeline(SHADER_UPPER_SYRK, "upper_syrk_base");
+        let pipeline_upper_syrk_earlyret =
+            mk_upper_pipeline(SHADER_UPPER_SYRK_EARLYRET, "upper_syrk_earlyret");
+        let pipeline_upper_syrk_triag =
+            mk_upper_pipeline(SHADER_UPPER_SYRK_TRIAG, "upper_syrk_triag");
+
+        let bind_group_upper_syrk = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("upper_syrk_bg"),
+            layout: &upper_syrk_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffer_a.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buffer_c_packed.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
         Self {
             device,
             queue,
@@ -573,6 +804,18 @@ impl WgpuRunner {
             buffer_labels,
             staging_buffer_labels,
             uniform_dbscan,
+            pipeline_upper_syrk,
+            pipeline_upper_syrk_earlyret,
+            pipeline_upper_syrk_triag,
+            bind_group_upper_syrk,
+            buffer_c_packed,
+            staging_c_packed,
+            max_m_full,
+            max_buffer_size,
+            max_storage_binding,
+            adapter_name: adapter_info.name,
+            backend: adapter_info.backend,
+            device_type: adapter_info.device_type,
         }
     }
 
@@ -672,6 +915,78 @@ impl WgpuRunner {
             self.staging_buffer_c.unmap();
         } else {
             panic!("Failed to map staging buffer from GPU!");
+        }
+    }
+
+    /// Run one of the three upper-SYRK variants and read back the packed result.
+    /// `variant`: 0 = baseline G×G, 1 = early-return G×G, 2 = triangular dispatch.
+    fn execute_upper_syrk_with_transfer(
+        &self,
+        m: u32,
+        k: u32,
+        variant: u8,
+        a_data: &[f32],
+        c_out: &mut [f32],
+    ) {
+        let meta = [m, k, 0u32, 0u32];
+        self.queue
+            .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&meta));
+        self.queue
+            .write_buffer(&self.buffer_a, 0, bytemuck::cast_slice(a_data));
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            let g = (m + 15) / 16;
+            match variant {
+                1 => {
+                    cpass.set_pipeline(&self.pipeline_upper_syrk_earlyret);
+                    cpass.set_bind_group(0, &self.bind_group_upper_syrk, &[]);
+                    cpass.dispatch_workgroups(g, g, 1);
+                }
+                2 => {
+                    cpass.set_pipeline(&self.pipeline_upper_syrk_triag);
+                    cpass.set_bind_group(0, &self.bind_group_upper_syrk, &[]);
+                    cpass.dispatch_workgroups(g * (g + 1) / 2, 1, 1);
+                }
+                _ => {
+                    cpass.set_pipeline(&self.pipeline_upper_syrk);
+                    cpass.set_bind_group(0, &self.bind_group_upper_syrk, &[]);
+                    cpass.dispatch_workgroups(g, g, 1);
+                }
+            }
+        }
+
+        let packed_bytes = (m as u64 * (m as u64 + 1) / 2) * 4;
+        encoder.copy_buffer_to_buffer(
+            &self.buffer_c_packed,
+            0,
+            &self.staging_c_packed,
+            0,
+            packed_bytes,
+        );
+        self.queue.submit(Some(encoder.finish()));
+
+        let buffer_slice = self.staging_c_packed.slice(0..packed_bytes);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+
+        if let Ok(Ok(())) = receiver.recv() {
+            let data = buffer_slice.get_mapped_range();
+            c_out[..bytemuck::cast_slice::<_, f32>(&data).len()]
+                .copy_from_slice(bytemuck::cast_slice(&data));
+            drop(data);
+            self.staging_c_packed.unmap();
+        } else {
+            panic!("Failed to map packed staging buffer from GPU!");
         }
     }
 
@@ -808,7 +1123,26 @@ fn bench_sgemm(c: &mut Criterion) {
     let dbscan_minpts = 10;
 
     let max_m = *m_sizes.last().unwrap();
-    let wgpu_runner = pollster::block_on(WgpuRunner::new(max_m, k));
+    // let wgpu_runner = pollster::block_on(WgpuRunner::new(max_m, k));
+    // println!(
+    //     "\n[GPU] {} ({:?} / {:?})",
+    //     wgpu_runner.adapter_name, wgpu_runner.backend, wgpu_runner.device_type,
+    // );
+    // println!(
+    //     "      max_buffer_size:              {:.3} GiB  (single allocation limit)",
+    //     wgpu_runner.max_buffer_size as f64 / (1u64 << 30) as f64,
+    // );
+    // println!(
+    //     "      max_storage_buffer_binding:   {:.3} GiB  (compute shader binding limit)",
+    //     wgpu_runner.max_storage_binding as f64 / (1u64 << 30) as f64,
+    // );
+    // println!(
+    //     "      max_m full N×N:  {} ({}×{} × 4 = {:.2} GiB)",
+    //     wgpu_runner.max_m_full,
+    //     wgpu_runner.max_m_full,
+    //     wgpu_runner.max_m_full,
+    //     wgpu_runner.max_m_full.pow(2) as f64 * 4.0 / (1u64 << 30) as f64,
+    // );
 
     for m in m_sizes {
         let mut rng = rand::rng();
@@ -817,33 +1151,36 @@ fn bench_sgemm(c: &mut Criterion) {
         let b: Vec<f32> = (0..m * k).map(|_| rng.random::<f32>()).collect();
 
         let mut c_out = vec![0.0f32; m * m];
+        let mut c_out_packed = vec![0.0f32; m * (m + 1) / 2];
         let mut labels_out = vec![0u32; m];
 
-        // 1. CPU Benchmarks
-        group.bench_with_input(
-            BenchmarkId::new("CPU (matrixmultiply) implicit transpose", m),
-            &m,
-            |b_iter, &m_val| {
-                b_iter.iter(|| unsafe {
-                    matrixmultiply::sgemm(
-                        m_val,
-                        k,
-                        m_val,
-                        1.0,
-                        a.as_ptr(),
-                        k as isize,
-                        1,
-                        a.as_ptr(),
-                        1,
-                        k as isize,
-                        0.0,
-                        c_out.as_mut_ptr(),
-                        m_val as isize,
-                        1,
-                    );
-                });
-            },
-        );
+        // // 1. CPU Benchmarks
+        // group.bench_with_input(
+        //     BenchmarkId::new("CPU (matrixmultiply) implicit transpose", m),
+        //     &m,
+        //     |b_iter, &m_val| {
+        //         b_iter.iter(|| unsafe {
+        //             matrixmultiply::sgemm(
+        //                 m_val,
+        //                 k,
+        //                 m_val,
+        //                 1.0,
+        //                 a.as_ptr(),
+        //                 k as isize,
+        //                 1,
+        //                 a.as_ptr(),
+        //                 1,
+        //                 k as isize,
+        //                 0.0,
+        //                 c_out.as_mut_ptr(),
+        //                 m_val as isize,
+        //                 1,
+        //             );
+        //         });
+        //     },
+        // );
+
+        #[cfg(target_vendor = "apple")]
         // 1. CPU Benchmarks accelerate
         group.bench_with_input(
             BenchmarkId::new("CPU (cblas_sgemm) implicit transpose", m),
@@ -870,6 +1207,7 @@ fn bench_sgemm(c: &mut Criterion) {
             },
         );
 
+        #[cfg(target_vendor = "apple")]
         // 1. CPU Benchmarks accelerate
         group.bench_with_input(
             BenchmarkId::new("CPU (cblas_ssyrk) implicit transpose", m),
@@ -893,98 +1231,219 @@ fn bench_sgemm(c: &mut Criterion) {
             },
         );
 
-        //     // 2. GPU Baseline (Just SGEMM, no transfer)
-        //     group.bench_with_input(
-        //         BenchmarkId::new("GPU (wgpu) SGEMM no transfer (implicit)", m),
-        //         &m,
-        //         |b_iter, &m_val| {
-        //             b_iter.iter(|| {
-        //                 wgpu_runner.execute_and_wait(m_val as u32, k as u32, false);
-        //             });
-        //         },
-        //     );
-        //     // 2. GPU Baseline (Just SGEMM, no transfer)
-        //     group.bench_with_input(
-        //         BenchmarkId::new("GPU (wgpu) SGEMM no transfer (explicit)", m),
-        //         &m,
-        //         |b_iter, &m_val| {
-        //             b_iter.iter(|| {
-        //                 wgpu_runner.execute_and_wait(m_val as u32, k as u32, true);
-        //             });
-        //         },
-        //     );
-        //     // 3. GPU Data Return (The heavy 1.6 GB copy)
-        //     group.bench_with_input(
-        //         BenchmarkId::new("GPU (wgpu) + Data Transfer (implicit)", m),
-        //         &m,
-        //         |b_iter, &m_val| {
-        //             b_iter.iter(|| {
-        //                 wgpu_runner.execute_and_wait_with_transfer(
-        //                     m_val as u32,
-        //                     k as u32,
-        //                     false,
-        //                     &a,
-        //                     None,
-        //                     &mut c_out,
-        //                 );
-        //             });
-        //         },
-        //     );
-        //     // 3. GPU Data Return (The heavy 1.6 GB copy)
-        //     group.bench_with_input(
-        //         BenchmarkId::new("GPU (wgpu) + Data Transfer (explicit)", m),
-        //         &m,
-        //         |b_iter, &m_val| {
-        //             b_iter.iter(|| {
-        //                 wgpu_runner.execute_and_wait_with_transfer(
-        //                     m_val as u32,
-        //                     k as u32,
-        //                     true,
-        //                     &a,
-        //                     Some(&b),
-        //                     &mut c_out,
-        //                 );
-        //             });
-        //         },
-        //     );
+        // // Inside your bench loop...
+        // group.bench_with_input(
+        //     BenchmarkId::new("CPU (faer) SGEMM (sequential)", m),
+        //     &m,
+        //     |b_iter, &m_val| {
+        //         b_iter.iter(|| {
+        //             // 1. Create lightweight, zero-copy views
+        //             let a_mat = MatRef::from_row_major_slice(&a, m_val, k);
+        //             let c_mat = MatMut::from_row_major_slice_mut(&mut c_out, m_val, m_val);
 
-        //     // 5. End-to-End: GPU SGEMM + DBSCAN + Labels Transfer (Fast 80 KB Copy)
-        //     group.bench_with_input(
-        //         BenchmarkId::new("GPU End-to-End DBSCAN + Label Transfer, (implicit)", m),
-        //         &m,
-        //         |b_iter, &m_val| {
-        //             b_iter.iter(|| {
-        //                 wgpu_runner.execute_full_dbscan(
-        //                     m_val as u32,
-        //                     k as u32,
-        //                     dbscan_eps,
-        //                     dbscan_minpts,
-        //                     false,
-        //                     &a,
-        //                     Some(&mut labels_out),
-        //                 );
-        //             });
-        //         },
-        //     );
+        //             // 2. Perform the matrix multiplication (C = A * A^T)
+        //             // faer 0.24 signature: matmul(acc, accum, lhs, rhs, alpha, par)
+        //             matmul(
+        //                 c_mat,
+        //                 Accum::Replace,    // Overwrite C entirely (beta = 0.0)
+        //                 a_mat,             // A
+        //                 a_mat.transpose(), // A^T
+        //                 1.0,               // alpha
+        //                 Par::Seq,          // Use all available Rayon threads
+        //             );
+        //         });
+        //     },
+        // );
+        // group.bench_with_input(
+        //     BenchmarkId::new("CPU (faer) SSYRK implicit transpose (sequential)", m),
+        //     &m,
+        //     |b_iter, &m_val| {
+        //         b_iter.iter(|| {
+        //             // Create lightweight, zero-copy views
+        //             let a_mat = MatRef::from_row_major_slice(&a, m_val, k);
+        //             let mut c_mat = MatMut::from_row_major_slice_mut(&mut c_out, m_val, m_val);
 
-        //     // 5. End-to-End: GPU SGEMM + DBSCAN + Labels Transfer (Fast 80 KB Copy)
-        //     group.bench_with_input(
-        //         BenchmarkId::new("GPU End-to-End DBSCAN + Label Transfer (explicit)", m),
-        //         &m,
-        //         |b_iter, &m_val| {
-        //             b_iter.iter(|| {
-        //                 wgpu_runner.execute_full_dbscan(
-        //                     m_val as u32,
-        //                     k as u32,
-        //                     dbscan_eps,
-        //                     dbscan_minpts,
-        //                     true,
-        //                     &a,
-        //                     Some(&mut labels_out),
-        //                 );
-        //             });
-        //         },
-        //     );
+        //             // Compute only the upper triangle of C = A * A^T
+        //             triangular_matmul(
+        //                 c_mat,
+        //                 BlockStructure::TriangularUpper, // Match CblasUpper
+        //                 Accum::Replace,                  // beta = 0.0
+        //                 a_mat,                           // A
+        //                 BlockStructure::Rectangular,
+        //                 a_mat.transpose(), // A^T
+        //                 BlockStructure::Rectangular,
+        //                 1.0,      // alpha
+        //                 Par::Seq, // Multithreading
+        //             );
+        //         });
+        //     },
+        // );
+
+        // // Inside your bench loop...
+        // group.bench_with_input(
+        //     BenchmarkId::new("CPU (faer) SGEMM", m),
+        //     &m,
+        //     |b_iter, &m_val| {
+        //         b_iter.iter(|| {
+        //             // 1. Create lightweight, zero-copy views
+        //             let a_mat = MatRef::from_row_major_slice(&a, m_val, k);
+        //             let c_mat = MatMut::from_row_major_slice_mut(&mut c_out, m_val, m_val);
+
+        //             // 2. Perform the matrix multiplication (C = A * A^T)
+        //             // faer 0.24 signature: matmul(acc, accum, lhs, rhs, alpha, par)
+        //             matmul(
+        //                 c_mat,
+        //                 Accum::Replace,    // Overwrite C entirely (beta = 0.0)
+        //                 a_mat,             // A
+        //                 a_mat.transpose(), // A^T
+        //                 1.0,               // alpha
+        //                 Par::rayon(0),     // Use all available Rayon threads
+        //             );
+        //         });
+        //     },
+        // );
+        group.bench_with_input(
+            BenchmarkId::new("CPU (faer) SSYRK implicit transpose", m),
+            &m,
+            |b_iter, &m_val| {
+                b_iter.iter(|| {
+                    // Create lightweight, zero-copy views
+                    let a_mat = MatRef::from_row_major_slice(&a, m_val, k);
+                    let mut c_mat = MatMut::from_row_major_slice_mut(&mut c_out, m_val, m_val);
+
+                    // Compute only the upper triangle of C = A * A^T
+                    triangular_matmul(
+                        c_mat,
+                        BlockStructure::TriangularUpper, // Match CblasUpper
+                        Accum::Replace,                  // beta = 0.0
+                        a_mat,                           // A
+                        BlockStructure::Rectangular,
+                        a_mat.transpose(), // A^T
+                        BlockStructure::Rectangular,
+                        1.0,           // alpha
+                        Par::rayon(0), // Multithreading
+                    );
+                });
+            },
+        );
+
+        //     // GPU benchmarks that use the full N×N buffer are skipped for sizes
+        //     // that would exceed the device's max_buffer_size.
+        //     if m <= wgpu_runner.max_m_full {
+        //         // 2. GPU Baseline (Just SGEMM, no transfer — pure compute time)
+        //         group.bench_with_input(
+        //             BenchmarkId::new("GPU (wgpu) SGEMM no transfer (implicit)", m),
+        //             &m,
+        //             |b_iter, &m_val| {
+        //                 b_iter.iter(|| {
+        //                     wgpu_runner.execute_and_wait(m_val as u32, k as u32, false);
+        //                 });
+        //             },
+        //         );
+        //         group.bench_with_input(
+        //             BenchmarkId::new("GPU (wgpu) SGEMM no transfer (explicit)", m),
+        //             &m,
+        //             |b_iter, &m_val| {
+        //                 b_iter.iter(|| {
+        //                     wgpu_runner.execute_and_wait(m_val as u32, k as u32, true);
+        //                 });
+        //             },
+        //         );
+
+        //         // 3. GPU full N×N SGEMM + data transfer back
+        //         group.bench_with_input(
+        //             BenchmarkId::new("GPU (wgpu) SGEMM + full N×N transfer (implicit)", m),
+        //             &m,
+        //             |b_iter, &m_val| {
+        //                 b_iter.iter(|| {
+        //                     wgpu_runner.execute_and_wait_with_transfer(
+        //                         m_val as u32,
+        //                         k as u32,
+        //                         false,
+        //                         &a,
+        //                         None,
+        //                         &mut c_out,
+        //                     );
+        //                 });
+        //             },
+        //         );
+        //         group.bench_with_input(
+        //             BenchmarkId::new("GPU (wgpu) SGEMM + full N×N transfer (explicit)", m),
+        //             &m,
+        //             |b_iter, &m_val| {
+        //                 b_iter.iter(|| {
+        //                     wgpu_runner.execute_and_wait_with_transfer(
+        //                         m_val as u32,
+        //                         k as u32,
+        //                         true,
+        //                         &a,
+        //                         Some(&b),
+        //                         &mut c_out,
+        //                     );
+        //                 });
+        //             },
+        //         );
+
+        //         // 5. End-to-End: GPU SGEMM + DBSCAN + labels transfer (only m*4 bytes back)
+        //         group.bench_with_input(
+        //             BenchmarkId::new("GPU end-to-end DBSCAN + label transfer (implicit)", m),
+        //             &m,
+        //             |b_iter, &m_val| {
+        //                 b_iter.iter(|| {
+        //                     wgpu_runner.execute_full_dbscan(
+        //                         m_val as u32,
+        //                         k as u32,
+        //                         dbscan_eps,
+        //                         dbscan_minpts,
+        //                         false,
+        //                         &a,
+        //                         Some(&mut labels_out),
+        //                     );
+        //                 });
+        //             },
+        //         );
+        //         group.bench_with_input(
+        //             BenchmarkId::new("GPU end-to-end DBSCAN + label transfer (explicit)", m),
+        //             &m,
+        //             |b_iter, &m_val| {
+        //                 b_iter.iter(|| {
+        //                     wgpu_runner.execute_full_dbscan(
+        //                         m_val as u32,
+        //                         k as u32,
+        //                         dbscan_eps,
+        //                         dbscan_minpts,
+        //                         true,
+        //                         &a,
+        //                         Some(&mut labels_out),
+        //                     );
+        //                 });
+        //             },
+        //         );
+        //     }
+
+        //     // 4a–c. Upper-triangle packed SYRK — three dispatch strategies compared.
+        //     // All run at every size including m=30K (packed buffer ≤ 1.8 GiB).
+        //     for (variant, label) in [
+        //         (0u8, "GPU upper-tri SYRK baseline G×G"),
+        //         (1u8, "GPU upper-tri SYRK early-return G×G"),
+        //         (2u8, "GPU upper-tri SYRK triangular dispatch"),
+        //     ] {
+        //         group.bench_with_input(
+        //             BenchmarkId::new(label, m),
+        //             &m,
+        //             |b_iter, &m_val| {
+        //                 b_iter.iter(|| {
+        //                     wgpu_runner.execute_upper_syrk_with_transfer(
+        //                         m_val as u32,
+        //                         k as u32,
+        //                         variant,
+        //                         &a,
+        //                         &mut c_out_packed,
+        //                     );
+        //                 });
+        //             },
+        //         );
+        //     }
     }
 
     group.finish();

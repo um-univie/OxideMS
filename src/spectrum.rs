@@ -1,4 +1,4 @@
-use crate::impl_fluent_builder_vanilla;
+use crate::{impl_fluent_builder_vanilla, workflow::MassTolerance};
 use chemistry_consts::MONOISOTOPIC_MASSES;
 use compact_str::CompactString;
 // use murmur3::murmur3_32;
@@ -435,15 +435,36 @@ impl BinnedSpectrumConfig {
 pub struct SpectrumHasher {
     pub min_mz: f64,
     pub max_mz: f64,
-    pub bin_size: f64,
+    pub tolerance: MassTolerance,
     pub hash_len: usize,
-    // Store both the bucket index and the sign (+1.0 or -1.0) together
     pub lookup_table: Vec<(usize, f32)>,
+
+    // Pre-computed fields to avoid doing logs/divisions inside the inner loop
+    bin_denominator: f64,
+    min_bin: f64,
 }
 
 impl SpectrumHasher {
-    pub fn new(min_mz: f64, max_mz: f64, bin_size: f64, hash_len: usize) -> Self {
-        let num_bins = ((max_mz - min_mz) / bin_size).ceil() as usize;
+    /// Helper to compute the absolute mathematical bin for a given m/z
+    fn calculate_abs_bin(mz: f64, tolerance: &MassTolerance, denominator: f64) -> f64 {
+        match tolerance {
+            MassTolerance::Da(_) => mz / denominator,
+            MassTolerance::Ppm(_) => mz.ln() / denominator,
+        }
+    }
+
+    pub fn new(min_mz: f64, max_mz: f64, tolerance: MassTolerance, hash_len: usize) -> Self {
+        // Pre-compute the denominator. For Da it's just the size; for PPM it's the log base.
+        let bin_denominator = match tolerance {
+            MassTolerance::Da(da) => da,
+            MassTolerance::Ppm(ppm) => (1.0 + ppm / 1_000_000.0).ln(),
+        };
+
+        // Determine the absolute bin boundaries to calculate how many buckets we need
+        let min_bin = Self::calculate_abs_bin(min_mz, &tolerance, bin_denominator);
+        let max_bin = Self::calculate_abs_bin(max_mz, &tolerance, bin_denominator);
+
+        let num_bins = (max_bin - min_bin).ceil() as usize;
         let mut lookup_table = Vec::with_capacity(num_bins);
 
         for i in 0..num_bins {
@@ -453,8 +474,7 @@ impl SpectrumHasher {
             // Use the hash to determine the bucket
             let target_idx = (hash_val as u64 % hash_len as u64) as usize;
 
-            // Use the highest bit of the hash to determine the sign (+1 or -1)
-            // This provides the "sign trick" (hashing with a second independent-ish hash)
+            // Signed hashing trick: Use a bit from the hash to decide polarity
             let sign = if (hash_val & 0x8000_0000) == 0 {
                 1.0
             } else {
@@ -467,27 +487,36 @@ impl SpectrumHasher {
         Self {
             min_mz,
             max_mz,
-            bin_size,
+            tolerance,
             hash_len,
             lookup_table,
+            bin_denominator,
+            min_bin,
         }
     }
-    pub fn recalculate_lookup_table(&mut self) {
-        // 1. Calculate the total number of possible m/z bins in our window
-        let num_bins: usize = ((self.max_mz - self.min_mz) / self.bin_size).ceil() as usize;
 
-        // 2. Resize and fill. Note: using (0, 1.0) as a safe default.
+    pub fn recalculate_lookup_table(&mut self) {
+        // Recalculate bin denominator and min_bin just in case bounds/tolerance changed
+        self.bin_denominator = match self.tolerance {
+            MassTolerance::Da(da) => da,
+            MassTolerance::Ppm(ppm) => (1.0 + ppm / 1_000_000.0).ln(),
+        };
+
+        self.min_bin = Self::calculate_abs_bin(self.min_mz, &self.tolerance, self.bin_denominator);
+        let max_bin = Self::calculate_abs_bin(self.max_mz, &self.tolerance, self.bin_denominator);
+
+        let num_bins = (max_bin - self.min_bin).ceil() as usize;
+
+        // Resize and fill
         self.lookup_table.resize(num_bins, (0, 1.0));
 
-        // 3. Precompute the hash index and sign for every bin
+        // Precompute the hash index and sign for every bin
         for i in 0..num_bins {
             let bytes = i.to_le_bytes();
             let hash_val = xxh32(&bytes, 0);
 
-            // Map to bucket index based on current hash_len
             let target_idx = (hash_val as u64 % self.hash_len as u64) as usize;
 
-            // Signed hashing trick: Use a bit from the hash to decide polarity
             let sign = if (hash_val & 0x8000_0000) == 0 {
                 1.0
             } else {
@@ -498,23 +527,59 @@ impl SpectrumHasher {
         }
     }
 
-    pub fn into_vector(&self, peaks: &[ArchivedPeak], normalize_l2: bool, buffer: &mut [f32]) {
+    pub fn into_vector_native(&self, peaks: &[Peak], normalize_l2: bool, buffer: &mut [f32]) {
+        let is_ppm = matches!(self.tolerance, MassTolerance::Ppm(_));
+
         for peak in peaks {
-            if peak.mz >= self.min_mz && peak.mz < self.max_mz {
-                let bin_idx = (((peak.mz - self.min_mz) / self.bin_size).floor() as usize)
-                    .min(self.lookup_table.len().saturating_sub(1));
-
-                // Retrieve both index and sign in one go
-                let (target_idx, sign) = self.lookup_table[bin_idx];
-
-                // Accumulate signed intensity
-                // Collision noise now has a mean of zero
-                buffer[target_idx] += f32::from(peak.intensity) * sign;
-            }
+            let mz = peak.mz;
+            let abs_bin = if is_ppm {
+                mz.ln() / self.bin_denominator
+            } else {
+                mz / self.bin_denominator
+            };
+            let bin_idx = ((abs_bin - self.min_bin).floor() as usize)
+                .min(self.lookup_table.len().saturating_sub(1));
+            let (target_idx, sign) = self.lookup_table[bin_idx];
+            buffer[target_idx] += peak.intensity * sign;
         }
 
         if normalize_l2 {
-            // L2 norm is unaffected by signs: sum(x^2) is always positive
+            let sq_sum: f32 = buffer.iter().map(|&x| x * x).sum();
+            if sq_sum > 0.0 {
+                let inv_norm = 1.0 / sq_sum.sqrt();
+                for val in buffer.iter_mut() {
+                    *val *= inv_norm;
+                }
+            }
+        }
+    }
+
+    pub fn into_vector(&self, peaks: &[ArchivedPeak], normalize_l2: bool, buffer: &mut [f32]) {
+        let is_ppm = matches!(self.tolerance, MassTolerance::Ppm(_));
+
+        for peak in peaks {
+            // Note: Assuming peak.mz is f64 or gets cast to f64 here
+            let mz = peak.mz.to_native();
+
+            // Calculate absolute bin using the precomputed denominator
+            let abs_bin = if is_ppm {
+                mz.ln() / self.bin_denominator
+            } else {
+                mz / self.bin_denominator
+            };
+
+            // Offset by min_bin to get our 0-based index for the lookup table
+            let bin_idx = ((abs_bin - self.min_bin).floor() as usize)
+                .min(self.lookup_table.len().saturating_sub(1));
+
+            // Retrieve both index and sign in one go
+            let (target_idx, sign) = self.lookup_table[bin_idx];
+
+            // Accumulate signed intensity
+            buffer[target_idx] += f32::from(peak.intensity) * sign;
+        }
+
+        if normalize_l2 {
             let sq_sum: f32 = buffer.iter().map(|&x| x * x).sum();
             if sq_sum > 0.0 {
                 let inv_norm = 1.0 / sq_sum.sqrt();
@@ -525,7 +590,6 @@ impl SpectrumHasher {
         }
     }
 }
-
 /// Configuration for spectrum preprocessing
 #[derive(Debug, Clone)]
 pub struct HashedSpectrumConfig {
@@ -1349,5 +1413,126 @@ mod tests {
         let similarity = cosine_similarity(&hashed1, &hashed2);
 
         assert!(similarity.is_none());
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Archive)]
+#[rkyv(compare(PartialEq), derive(Debug))]
+pub struct MassSpectrumSoA {
+    pub mz_bins: Vec<u32>,
+    pub intensities: Vec<f32>,
+    pub charge: i8,
+}
+
+impl MassSpectrumSoA {
+    pub fn l2_normalize(&mut self) {
+        // 1. Calculate the sum of the squares of the intensities
+        let sum_of_squares: f32 = self.intensities.iter().map(|&x| x * x).sum();
+
+        // 2. Prevent division by zero or NaN errors if the spectrum is completely empty
+        if sum_of_squares <= f32::EPSILON {
+            return;
+        }
+
+        // 3. Calculate the magnitude (L2 norm)
+        let l2_norm = sum_of_squares.sqrt();
+
+        // 4. Pre-compute the reciprocal
+        // Multiplication is significantly faster on modern CPUs than division.
+        let reciprocal = 1.0 / l2_norm;
+
+        // 5. Apply the normalization
+        for intensity in self.intensities.iter_mut() {
+            *intensity *= reciprocal;
+        }
+    }
+}
+
+impl MassSpectrum {
+    pub fn to_soa(&self, tolerance: MassTolerance) -> MassSpectrumSoA {
+        let capacity = self.peaks.len();
+        let mut mz_bins = Vec::with_capacity(capacity);
+        let mut intensities = Vec::with_capacity(capacity);
+
+        let ppm_log_base = match tolerance {
+            MassTolerance::Ppm(ppm) => (1.0 + ppm / 1_000_000.0).ln(),
+            _ => 0.0,
+        };
+
+        for peak in self.peaks.iter() {
+            let bin = match tolerance {
+                MassTolerance::Da(da) => (peak.mz / da).round() as u32,
+                MassTolerance::Ppm(_) => (peak.mz.ln() / ppm_log_base).round() as u32,
+            };
+
+            if let Some(&last_bin) = mz_bins.last() {
+                if last_bin == bin {
+                    let last_idx = intensities.len() - 1;
+                    if peak.intensity > intensities[last_idx] {
+                        intensities[last_idx] = peak.intensity;
+                    }
+                    continue;
+                }
+            }
+
+            mz_bins.push(bin);
+            intensities.push(peak.intensity);
+        }
+
+        MassSpectrumSoA {
+            mz_bins,
+            intensities,
+            charge: self.charge,
+        }
+    }
+}
+
+impl ArchivedMassSpectrum {
+    /// Converts the Array of Structs (AoS) to a Struct of Arrays (SoA)
+    /// while discretizing the m/z values into integer bins.
+    /// Assumes `self.peaks` is strictly sorted by m/z.
+    pub fn to_soa(&self, tolerance: MassTolerance) -> MassSpectrumSoA {
+        // Pre-allocate assuming no collisions to prevent reallocations
+        let capacity = self.peaks.len();
+        let mut mz_bins = Vec::with_capacity(capacity);
+        let mut intensities = Vec::with_capacity(capacity);
+
+        // Pre-compute the denominator for PPM to avoid doing logarithms inside the loop.
+        // The formula is: Bin = ln(mz) / ln(1 + ppm / 1,000,000)
+        let ppm_log_base = match tolerance {
+            MassTolerance::Ppm(ppm) => (1.0 + ppm / 1_000_000.0).ln(),
+            _ => 0.0, // Unused in Da strategy
+        };
+
+        for peak in self.peaks.iter() {
+            // 1. Calculate the integer bin
+            let bin = match tolerance {
+                MassTolerance::Da(da) => (peak.mz / da).round() as u32,
+                MassTolerance::Ppm(_) => (peak.mz.to_native().ln() / ppm_log_base).round() as u32,
+            };
+
+            // 2. Handle Intra-Spectrum Collisions (Deduplication)
+            // If this peak maps to the exact same bin as the previous peak,
+            // we keep the maximum intensity and do not push a new bin.
+            if let Some(&last_bin) = mz_bins.last() {
+                if last_bin == bin {
+                    let last_idx = intensities.len() - 1;
+                    if peak.intensity > intensities[last_idx] {
+                        intensities[last_idx] = peak.intensity.to_native();
+                    }
+                    continue; // Skip the push
+                }
+            }
+
+            // 3. Push unique bins
+            mz_bins.push(bin);
+            intensities.push(peak.intensity.to_native());
+        }
+
+        MassSpectrumSoA {
+            mz_bins,
+            intensities,
+            charge: self.charge,
+        }
     }
 }

@@ -19,13 +19,17 @@ memchr = "2.8.0"
 compact_str = "0.9.0"
 matrixmultiply = "0.3.10"
 itertools = "0.14.0"
-
-
+faer = { version = "0.24", features = ["nightly", "sparse", "rayon"], default-features = false }
 
 ndarray = {version= "0.16.1", features=["rayon"], optional = true}
 burn = {version="0.20.1", features=["train", "wgpu", "ndarray"], optional=true}
 serde_json = {version= "1.0.149", optional = true}
 serde = {version="1.0.228", optional = true}
+
+wgpu = {version="29.0.1", optional = true}
+bytemuck = {version="1.25.0", optional = true}
+pollster = {version="0.4.0", optional = true}
+# Add this crate for Matmul/Linear Algebra
 
 
 [dev-dependencies]
@@ -34,14 +38,14 @@ pollster = "0.4.0"
 wgpu = "29.0.1"
 bytemuck = "1.25.0"
 
-
 [features]
+gpu = ["dep:wgpu", "dep:bytemuck", "dep:pollster"]
 ml = ["dep:burn", "dep:serde_json", "dep:serde", "dep:ndarray"]
 # plotting = ["dep:plotters"]
 
 [profile.release]
-#debug = true
-strip=true
+# debug = true
+#strip=true
 opt-level = 3
 #codegen-units = 1
 
@@ -49,4 +53,8 @@ opt-level = 3
 
 [[bench]]
 name = "wgpu_bench"
+harness = false
+
+[[bench]]
+name = "cosine_benchmark"
 harness = false

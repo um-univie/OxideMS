@@ -456,3 +456,101 @@ impl SingleOperation for RemovePrecursor {
         });
     }
 }
+
+struct_with_new!(
+    pub struct AbsoluteIntensityFilter {
+        min_base_peak_intensity: f32,
+    }
+);
+
+impl SingleOperation for AbsoluteIntensityFilter {
+    fn operate_single(&self, spectrum: &mut MassSpectralRecord) {
+        let max_intensity = spectrum
+            .peaks()
+            .iter()
+            .map(|p| p.intensity)
+            .max_by(|a, b| a.total_cmp(b))
+            .unwrap_or(0.0);
+
+        if max_intensity < self.min_base_peak_intensity {
+            spectrum.peaks_mut().clear();
+        }
+    }
+}
+
+struct_with_new!(
+    pub struct LocalSNRFilter {
+        snr_threshold: f32,
+    }
+);
+
+impl SingleOperation for LocalSNRFilter {
+    fn operate_single(&self, spectrum: &mut MassSpectralRecord) {
+        if spectrum.peaks().is_empty() {
+            return;
+        }
+
+        // Copy intensities to find the noise floor
+        let mut intensities: Vec<f32> = spectrum.peaks().iter().map(|p| p.intensity).collect();
+        intensities.sort_by(|a, b| a.total_cmp(b));
+
+        // Estimate noise floor as the median of the bottom 50% of peaks
+        let mid = intensities.len() / 4;
+        let noise_floor = intensities[mid.max(0)];
+
+        let min_allowed = noise_floor * self.snr_threshold;
+
+        spectrum.peaks_mut().retain(|p| p.intensity >= min_allowed);
+    }
+}
+
+struct_with_new!(
+    pub struct PeakDensityFilter {
+        max_peaks_per_100_da: usize,
+    }
+);
+
+impl SingleOperation for PeakDensityFilter {
+    fn operate_single(&self, spectrum: &mut MassSpectralRecord) {
+        let peaks = spectrum.peaks();
+        if peaks.len() < self.max_peaks_per_100_da {
+            return;
+        }
+
+        let mut trash = false;
+        // Sliding window check
+        for i in 0..peaks.len() {
+            let window_start = peaks[i].mz;
+            let window_end = window_start + 100.0;
+
+            // Count how many peaks fall into this 100 Da window
+            let count = peaks[i..].iter().take_while(|p| p.mz <= window_end).count();
+
+            if count > self.max_peaks_per_100_da {
+                trash = true;
+                break;
+            }
+        }
+
+        if trash {
+            spectrum.peaks_mut().clear();
+        }
+    }
+}
+
+struct_with_new!(
+    pub struct SquareRootTransformIntensity {}
+);
+
+impl SingleOperation for SquareRootTransformIntensity {
+    fn operate_single(&self, spectrum: &mut MassSpectralRecord) {
+        if spectrum.peaks().is_empty() {
+            return;
+        }
+
+        spectrum
+            .peaks_mut()
+            .iter_mut()
+            .for_each(|p| p.intensity = p.intensity.sqrt());
+    }
+}

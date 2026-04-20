@@ -8,8 +8,14 @@ pub trait BitSetOpsMSB0 {
     /// Sets the bit at `index` to 1.
     fn set_bit(&mut self, index: usize);
 
+    /// Sets the bit at `index` to 1, without bounds checking
+    unsafe fn set_bit_unchecked(&mut self, index: usize);
+
     /// Sets the bit at `index` to 0.
     fn unset_bit(&mut self, index: usize);
+
+    /// Sets the bit at `index` to 0, without bounds checking
+    unsafe fn unset_bit_unchecked(&mut self, index: usize);
 
     fn population_count(&self) -> u32;
 
@@ -22,6 +28,8 @@ pub trait BitSetOpsMSB0 {
     /// Finds the index of the first set bit at or after `start_index`.
     fn next_set_bit(&self, start_index: usize) -> Option<usize>;
 
+    ///
+    unsafe fn next_set_bit_unchecked(&self, start_index: usize) -> Option<usize>;
     /// Performs an in-place intersection (bitwise AND) with another bitset.
     /// `self = self & other`
     fn intersect_inplace(&mut self, other: &Self);
@@ -51,6 +59,13 @@ impl BitSetOpsMSB0 for [usize] {
         }
     }
 
+    /// # Safety
+    /// `index` must be strictly less than `self.len() * usize::BITS`
+    unsafe fn set_bit_unchecked(&mut self, index: usize) {
+        let (word_idx, mask) = split_index(index);
+        *self.get_unchecked_mut(word_idx) |= mask;
+    }
+
     fn unset_bit(&mut self, index: usize) {
         let (word_idx, mask) = split_index(index);
         if let Some(word) = self.get_mut(word_idx) {
@@ -58,16 +73,20 @@ impl BitSetOpsMSB0 for [usize] {
         }
     }
 
+    /// # Safety
+    /// `index` must be strictly less than `self.len() * usize::BITS`
+    unsafe fn unset_bit_unchecked(&mut self, index: usize) {
+        let (word_idx, mask) = split_index(index);
+        *self.get_unchecked_mut(word_idx) &= !mask;
+    }
+
     fn clear(&mut self) {
         self.fill(0);
     }
 
     fn clear_words(&mut self, word_limit: usize) {
-        if word_limit <= self.len() {
-            self[..word_limit].fill(0);
-        } else {
-            self.fill(0);
-        }
+        let limit = word_limit.min(self.len());
+        self[..limit].fill(0);
     }
 
     /// Finds the first set bit starting from `start_index` (scanning Left-to-Right)
@@ -105,13 +124,50 @@ impl BitSetOpsMSB0 for [usize] {
         None
     }
 
+    /// Finds the first set bit starting from `start_index` (scanning Left-to-Right).
+    ///
+    /// # Safety
+    /// `start_index` must be strictly less than `self.len() * usize::BITS as usize`.
+    /// Calling this with an out-of-bounds index will result in Undefined Behavior.
+    unsafe fn next_set_bit_unchecked(&self, start_index: usize) -> Option<usize> {
+        // 1. Bitwise math instead of division/modulo (Compile-time constants)
+        const SHIFT: usize = usize::BITS.trailing_zeros() as usize;
+        const MASK: usize = usize::BITS as usize - 1;
+
+        let word_idx = start_index >> SHIFT;
+        let bit_offset = start_index & MASK;
+
+        // 2. Unchecked access for the first partial word
+        let word = *self.get_unchecked(word_idx);
+        let mask = (!0usize) >> bit_offset;
+        let masked_word = word & mask;
+
+        if masked_word != 0 {
+            return Some((word_idx << SHIFT) + masked_word.leading_zeros() as usize);
+        }
+
+        // 3. Unchecked slice creation for the remaining words.
+        // Since `start_index` is guaranteed valid by the safety contract,
+        // `word_idx + 1` is guaranteed to be <= `self.len()`.
+        let remaining = self.get_unchecked(word_idx + 1..self.len());
+
+        for (i, &word) in remaining.iter().enumerate() {
+            if word != 0 {
+                let found_word_idx = word_idx + 1 + i;
+                return Some((found_word_idx << SHIFT) + word.leading_zeros() as usize);
+            }
+        }
+
+        None
+    }
+
     fn print_bits(&self) {
         println!("{}", self.to_bit_string());
     }
 
     /// This function counts the number of set bits (1s) in the bit set (pun intended)
     fn population_count(&self) -> u32 {
-        self.iter().fold(0, |sum, subset| sum + subset.count_ones())
+        self.iter().map(|w| w.count_ones()).sum()
     }
 
     fn to_bit_string(&self) -> String {
@@ -146,14 +202,12 @@ impl BitSetOpsMSB0 for [usize] {
 /// Converts visual index (0 = Left/MSB) to CPU mask
 #[inline(always)]
 fn split_index(index: usize) -> (usize, usize) {
-    let word_idx = index / (usize::BITS as usize);
-    let bit_idx = index % (usize::BITS as usize);
+    const SHIFT: usize = usize::BITS.trailing_zeros() as usize;
+    const MASK: usize = usize::BITS as usize - 1;
+    const HIGH_BIT: usize = 1 << (usize::BITS as usize - 1);
 
-    // MSB-0 Logic:
-    // If we want index 0 (Leftmost), we want the High Bit (1 << 63).
-    // If we want index 63 (Rightmost), we want the Low Bit (1 << 0).
-    // Shift = (63 - index)
-    let shift = (usize::BITS as usize - 1) - bit_idx;
+    let word_idx = index >> SHIFT;
+    let bit_idx = index & MASK;
 
-    (word_idx, 1 << shift)
+    (word_idx, HIGH_BIT >> bit_idx)
 }

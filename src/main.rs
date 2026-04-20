@@ -32,7 +32,8 @@ type MyBackend = Wgpu<f32, i32>;
 type MyAutodiffBackend = Autodiff<MyBackend>;
 
 use itertools::Itertools;
-use oxidems_lib::clustering::cluster::SpectralExperiment;
+// use oxidems_lib::clustering::cluster::SpectralExperiment;
+use oxidems_lib::clustering::cluster::experiment::SpectralExperiment;
 use oxidems_lib::clustering::ms_rt::*;
 #[cfg(feature = "plotting")]
 use oxidems_lib::plotting::SpectrumPlotter;
@@ -49,12 +50,14 @@ fn main() {
     let mut parser = MgfParser::new(config);
     // let mut msn_spectra = Vec::new();
 
-    let mut spectral_experiment = SpectralExperiment::default();
+    let mut spectral_experiment = SpectralExperiment::proteomics();
+    spectral_experiment.engine.exact = true;
 
-    // let folder_name = "PXD000561";
-    let folder_name = "Astral";
+    let folder_name = "PXD000561";
+    // let folder_name = "Astral";
     let prefix = "tests/".to_string();
     // let folder_name = "PXD023047";
+    // let folder_name = "PXD021518";
     let path = prefix + folder_name;
 
     spectral_experiment.ingest_files(path.as_str());
@@ -78,7 +81,9 @@ fn main() {
     let mut n10_values = Vec::new();
     let mut average_purities = Vec::new();
     let mut run_times = Vec::new();
-    // let epsilon_values = [0.01, 0.05, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0];
+    // let epsilon_values = [0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.6, 0.8, 1.0];
+    let epsilon_values = [0.3];
+
     // let mut current: f32 = 0.004;
     // let epsilon_values = (1..9)
     //     .map(|int| {
@@ -87,7 +92,7 @@ fn main() {
     //     })
     //     .collect::<Vec<f32>>();
 
-    let epsilon_values = [0.1];
+    // let epsilon_values = [0.1];
     // let epsilon_values = [0.1];
 
     // let hash_sizes = [32, 64, 128, 256, 512, 800, 1024, 2048, 4096];
@@ -100,9 +105,19 @@ fn main() {
         let mut start_time = std::time::Instant::now();
         spectral_experiment.engine.epsilon = epsilon_value;
         spectral_experiment.engine.set_hash_size(hash_size);
+        #[cfg(feature = "gpu")]
+        spectral_experiment.engine.enable_gpu(1);
+        spectral_experiment.spectra = Vec::new();
 
         let clusters = spectral_experiment.cluster();
-        spectral_experiment.write_results(&clusters, "cluster_assignments.csv");
+        spectral_experiment.write_results(
+            &clusters,
+            format!(
+                "exact_cluster_assignments_{}_{}.csv",
+                epsilon_value, hash_size
+            )
+            .as_str(),
+        );
 
         println!(
             "Done with clustering after {:.3}s",
@@ -121,6 +136,7 @@ fn main() {
                 .map(|cluster| cluster.len())
                 .collect::<Vec<usize>>(),
         );
+
         println!(
             "Max cluster size: {}\nAvg cluster size: {}\nMin cluster size: {}\nNumber of clusters: {}\nTotal number of spectra clustered: {}",
             clusters.max_cluster_size(),
@@ -138,29 +154,29 @@ fn main() {
         let n10 = spectral_experiment.calculate_n10_value(&clusters);
         n10_values.push(n10);
         println!(
-            "Average Weighted purity {:.5}, Average purity: {:.5}",
-            avg_weighted_purity, avg_purity
+            "Average Weighted purity {:.5}, Average purity: {:.5}, N10 Value: {}",
+            avg_weighted_purity, avg_purity, n10
         );
         // println!("Run time: {}", end_time);
     }
 
     // println!("Run times: {:?}", run_times);
 
-    plot_multiple_cluster_distributions(
-        &cluster_sizes,
-        &parameters,
-        spectral_experiment.total_spectra_ingested,
-        format!("plots/spectral_comparison_{}_eps.svg", folder_name).as_str(),
-    );
+    // plot_multiple_cluster_distributions(
+    //     &cluster_sizes,
+    //     &parameters,
+    //     spectral_experiment.total_spectra_ingested,
+    //     format!("plots/spectral_comparison_{}_eps.svg", folder_name).as_str(),
+    // );
 
-    plot_purity_vs_n10(
-        &average_purities,
-        &n10_values,
-        &parameters,
-        format!("plots/purity_plot_{}_eps.svg", folder_name).as_str(),
-    );
+    // plot_purity_vs_n10(
+    //     &average_purities,
+    //     &n10_values,
+    //     &parameters,
+    //     format!("plots/purity_plot_{}_eps.svg", folder_name).as_str(),
+    // );
 
-    // let analyzer = SpectrumAnalyzer::new(&unaltered_msn_spectra);
+    // let analyzer = SpectrumAnalyzer::new(&spectral_experiment.spectra);
     // let prefix = "raw";
     // analyzer.plot_mz_kde(format!("plots/mz_kde_{}.png", prefix).as_str());
     // analyzer.plot_peak_counts(format!("plots/peak_counts_{}.png", prefix).as_str());
@@ -368,6 +384,7 @@ fn cluster_and_export(
         .zip(cluster_purities.iter())
         .map(|(x, y)| (*x, *y))
         .collect::<Vec<(usize, f64)>>();
+
     let avg_weighted_purity = calculate_average_purity(&results);
 
     /* --- Optional: Commented out original msrt benchmark plot ---
