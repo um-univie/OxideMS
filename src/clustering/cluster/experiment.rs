@@ -1,6 +1,6 @@
+use super::dbscan::ClusterLabel;
 use super::engine::{ClusterEngine, SpectrumMetadata};
 use super::flat_clusters::FlatClusters;
-use super::dbscan::ClusterLabel;
 use crate::{
     MSNSpectrum,
     io::mgf::{MGF_SPECTRA_SIZE, MgfParser, MgfParserConfig},
@@ -13,7 +13,7 @@ use std::io::Write;
 #[derive(Default)]
 pub struct SpectralExperiment {
     pub file_names: Vec<String>,
-    pub metadata: IntMap<usize, SpectrumMetadata>,
+    pub metadata: Vec<SpectrumMetadata>,
     pub workflow: WorkFlowManager,
     pub parser: MgfParser,
     pub engine: ClusterEngine,
@@ -36,7 +36,7 @@ impl SpectralExperiment {
             engine: ClusterEngine::default(),
             parser: MgfParser::default(),
             spectra: Vec::new(),
-            metadata: IntMap::default(),
+            metadata: Vec::new(),
             file_names: Vec::new(),
             total_spectra_ingested: 0,
         }
@@ -61,7 +61,7 @@ impl SpectralExperiment {
             engine: ClusterEngine::default(),
             parser: MgfParser::default(),
             spectra: Vec::new(),
-            metadata: IntMap::default(),
+            metadata: Vec::new(),
             file_names: Vec::new(),
             total_spectra_ingested: 0,
         }
@@ -82,7 +82,7 @@ impl SpectralExperiment {
             engine: ClusterEngine::default(),
             parser: MgfParser::default(),
             spectra: Vec::new(),
-            metadata: IntMap::default(),
+            metadata: Vec::new(),
             file_names: Vec::new(),
             total_spectra_ingested: 0,
         }
@@ -166,15 +166,15 @@ impl SpectralExperiment {
 
         let mut file_assignments = Vec::with_capacity(n);
         for &id in cluster_ids {
-            let f_idx = self.metadata.get(&id).unwrap().file_index;
+            let f_idx = self.metadata.get(id).unwrap().file_index;
             file_assignments.push(f_idx);
         }
 
         for i in 0..n {
             for j in i + 1..n {
                 if file_assignments[i] == file_assignments[j] {
-                    let s1 = self.metadata.get(&cluster_ids[i]).unwrap();
-                    let s2 = self.metadata.get(&cluster_ids[j]).unwrap();
+                    let s1 = self.metadata.get(cluster_ids[i]).unwrap();
+                    let s2 = self.metadata.get(cluster_ids[j]).unwrap();
 
                     let mz_diff = (s1.precursor_mz - s2.precursor_mz).abs();
                     let rt_diff =
@@ -228,10 +228,17 @@ impl SpectralExperiment {
         let start_index = self.file_names.len();
 
         self.file_names.extend(paths.iter().map(|p| {
-            p.split('/').last().unwrap().split(".mgf").next().unwrap().to_string()
+            p.split('/')
+                .last()
+                .unwrap()
+                .split(".mgf")
+                .next()
+                .unwrap()
+                .to_string()
         }));
 
-        let results: Vec<(Vec<MSNSpectrum>, Vec<(usize, SpectrumMetadata)>, usize)> = paths
+        let start_time = std::time::Instant::now();
+        let results: Vec<(Vec<MSNSpectrum>, Vec<SpectrumMetadata>, usize)> = paths
             .into_par_iter()
             .enumerate()
             .map(|(i, path)| {
@@ -240,18 +247,22 @@ impl SpectralExperiment {
             })
             .collect();
 
-        for (file_spectra, file_metadata, raw_count) in results {
+        for (mut file_spectra, mut file_metadata, raw_count) in results {
             self.total_spectra_ingested += raw_count;
-            self.metadata.extend(file_metadata);
-            self.spectra.extend(file_spectra);
+            self.metadata.append(&mut file_metadata);
+            self.spectra.append(&mut file_spectra);
         }
+        self.spectra
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(index, spectrum)| spectrum.id = index as u64);
     }
 
     fn process_single_file(
         &self,
         path: &str,
         file_index: usize,
-    ) -> (Vec<MSNSpectrum>, Vec<(usize, SpectrumMetadata)>, usize) {
+    ) -> (Vec<MSNSpectrum>, Vec<SpectrumMetadata>, usize) {
         let mut parser = MgfParser::default();
         parser.config.use_parallel_parsing = false;
         let mut spectra = parser.parse_file(path).unwrap();
@@ -272,19 +283,16 @@ impl SpectralExperiment {
                     .unwrap_or(0);
                 let mut msn = s.to_msn();
 
-                let global_id = (file_index << 32) | local_idx;
-                msn.id = global_id as u64;
+                msn.id = local_idx as u64;
 
-                local_metadata.push((
-                    global_id,
-                    SpectrumMetadata {
-                        precursor_mz: msn.precursor_mz,
-                        retention_time_in_seconds: msn.retention_time_in_seconds,
-                        charge: msn.charge(),
-                        scan_number,
-                        file_index,
-                    },
-                ));
+                local_metadata.push(SpectrumMetadata {
+                    precursor_mz: msn.precursor_mz,
+                    retention_time_in_seconds: msn.retention_time_in_seconds,
+                    charge: msn.charge(),
+                    scan_number,
+                    file_index,
+                });
+
                 msn
             })
             .collect();
@@ -365,7 +373,7 @@ impl SpectralExperiment {
         let mz_values: Vec<f64> = clusters
             .data
             .iter()
-            .map(|id| self.metadata.get(id).unwrap().precursor_mz)
+            .map(|id| self.metadata.get(*id).unwrap().precursor_mz)
             .collect();
         clusters.refine_mz_clusters(&mz_values, self.engine.mz_tolerance)
     }
@@ -388,7 +396,7 @@ impl SpectralExperiment {
         for cluster in clusters.iter() {
             counter += 1;
             for spectrum in cluster {
-                let metadata = self.metadata.get(spectrum).unwrap();
+                let metadata = self.metadata.get(*spectrum).unwrap();
                 let precursor_charge = metadata.charge;
                 let precursor_mz = metadata.precursor_mz;
                 let retention_time = metadata.retention_time_in_seconds;

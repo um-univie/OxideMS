@@ -4372,7 +4372,6 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "rawpointer",
- "rayon",
 ]
 
 [[package]]
@@ -4730,7 +4729,6 @@ dependencies = [
  "matrixmultiply",
  "memchr",
  "memmap2",
- "ndarray 0.16.1",
  "nohash-hasher",
  "plotters",
  "pollster",

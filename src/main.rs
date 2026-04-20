@@ -60,27 +60,30 @@ fn main() {
     // let folder_name = "PXD021518";
     let path = prefix + folder_name;
 
-    spectral_experiment.ingest_files(path.as_str());
+    // spectral_experiment.ingest_files(path.as_str());
+    spectral_experiment.ingest_files_parallel(path.as_str());
 
     println!(
         "Total spectra parsed: {}, after {:.3} s",
         spectral_experiment.total_spectra_ingested,
         start_time.elapsed().as_secs_f32(),
     );
+
     println!(
         "Spectra remaining after filtering: {}, after {:.3} s",
         spectral_experiment.spectra.len(),
         start_time.elapsed().as_secs_f32(),
     );
+
     let mz_tol = 0.01;
     let rt_tol = 65.0;
 
     spectral_experiment.prepare_clustering();
-    let mut cluster_sizes = Vec::new();
-    let mut parameters = Vec::new();
-    let mut n10_values = Vec::new();
-    let mut average_purities = Vec::new();
-    let mut run_times = Vec::new();
+    // let mut cluster_sizes = Vec::new();
+    // let mut parameters = Vec::new();
+    // let mut n10_values = Vec::new();
+    // let mut average_purities = Vec::new();
+    // let mut run_times = Vec::new();
     // let epsilon_values = [0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.6, 0.8, 1.0];
     let epsilon_values = [0.3];
 
@@ -119,45 +122,45 @@ fn main() {
             .as_str(),
         );
 
-        println!(
-            "Done with clustering after {:.3}s",
-            start_time.elapsed().as_secs_f32()
-        );
-        let mut end_time = start_time.elapsed().as_secs_f32();
-        run_times.push(end_time);
+        // println!(
+        //     "Done with clustering after {:.3}s",
+        //     start_time.elapsed().as_secs_f32()
+        // );
+        // let mut end_time = start_time.elapsed().as_secs_f32();
+        // run_times.push(end_time);
 
-        parameters.push(format!(
-            "Epsilon: {} Hash Size: {}",
-            epsilon_value, hash_size as f32
-        ));
-        cluster_sizes.push(
-            clusters
-                .iter()
-                .map(|cluster| cluster.len())
-                .collect::<Vec<usize>>(),
-        );
+        // parameters.push(format!(
+        //     "Epsilon: {} Hash Size: {}",
+        //     epsilon_value, hash_size as f32
+        // ));
+        // cluster_sizes.push(
+        //     clusters
+        //         .iter()
+        //         .map(|cluster| cluster.len())
+        //         .collect::<Vec<usize>>(),
+        // );
 
-        println!(
-            "Max cluster size: {}\nAvg cluster size: {}\nMin cluster size: {}\nNumber of clusters: {}\nTotal number of spectra clustered: {}",
-            clusters.max_cluster_size(),
-            clusters.avg_cluster_size(),
-            clusters.min_cluster_size(),
-            clusters.iter().count(),
-            clusters.iter().map(|cluster| cluster.len()).sum::<usize>()
-        );
+        // println!(
+        //     "Max cluster size: {}\nAvg cluster size: {}\nMin cluster size: {}\nNumber of clusters: {}\nTotal number of spectra clustered: {}",
+        //     clusters.max_cluster_size(),
+        //     clusters.avg_cluster_size(),
+        //     clusters.min_cluster_size(),
+        //     clusters.iter().count(),
+        //     clusters.iter().map(|cluster| cluster.len()).sum::<usize>()
+        // );
 
-        let avg_weighted_purity =
-            spectral_experiment.average_weighted_cluster_purity(&clusters, mz_tol, rt_tol);
-        let avg_purity = spectral_experiment.average_cluster_purity(&clusters, mz_tol, rt_tol);
-        average_purities.push(avg_purity);
+        // let avg_weighted_purity =
+        //     spectral_experiment.average_weighted_cluster_purity(&clusters, mz_tol, rt_tol);
+        // let avg_purity = spectral_experiment.average_cluster_purity(&clusters, mz_tol, rt_tol);
+        // average_purities.push(avg_purity);
 
-        let n10 = spectral_experiment.calculate_n10_value(&clusters);
-        n10_values.push(n10);
-        println!(
-            "Average Weighted purity {:.5}, Average purity: {:.5}, N10 Value: {}",
-            avg_weighted_purity, avg_purity, n10
-        );
-        // println!("Run time: {}", end_time);
+        // let n10 = spectral_experiment.calculate_n10_value(&clusters);
+        // n10_values.push(n10);
+        // println!(
+        //     "Average Weighted purity {:.5}, Average purity: {:.5}, N10 Value: {}",
+        //     avg_weighted_purity, avg_purity, n10
+        // );
+        // // println!("Run time: {}", end_time);
     }
 
     // println!("Run times: {:?}", run_times);
