@@ -18,6 +18,7 @@ pub struct SpectralExperiment {
     pub parser: MgfParser,
     pub engine: ClusterEngine,
     pub spectra: Vec<MSNSpectrum>,
+    pub filter_unknown_charge: bool,
     pub total_spectra_ingested: usize,
 }
 
@@ -33,12 +34,8 @@ impl SpectralExperiment {
 
         Self {
             workflow,
-            engine: ClusterEngine::default(),
-            parser: MgfParser::default(),
-            spectra: Vec::new(),
-            metadata: Vec::new(),
-            file_names: Vec::new(),
-            total_spectra_ingested: 0,
+            filter_unknown_charge: true,
+            ..Default::default()
         }
     }
 
@@ -60,10 +57,8 @@ impl SpectralExperiment {
             workflow,
             engine: ClusterEngine::default(),
             parser: MgfParser::default(),
-            spectra: Vec::new(),
-            metadata: Vec::new(),
-            file_names: Vec::new(),
-            total_spectra_ingested: 0,
+            filter_unknown_charge: true,
+            ..Default::default()
         }
     }
 
@@ -79,12 +74,8 @@ impl SpectralExperiment {
 
         Self {
             workflow,
-            engine: ClusterEngine::default(),
-            parser: MgfParser::default(),
-            spectra: Vec::new(),
-            metadata: Vec::new(),
-            file_names: Vec::new(),
-            total_spectra_ingested: 0,
+            filter_unknown_charge: true,
+            ..Default::default()
         }
     }
 
@@ -319,7 +310,14 @@ impl SpectralExperiment {
 
         let msn_spectra: Vec<MSNSpectrum> = spectra
             .into_iter()
-            .filter(|s| !(s.peaks().len() == 0) && s.get_charge() != 0)
+            .filter(|s| {
+                !(s.peaks().len() == 0)
+                    && if self.filter_unknown_charge {
+                        s.get_charge() != 0
+                    } else {
+                        true
+                    }
+            })
             .map(|s| {
                 (
                     s.get_metadata("SCANS")
