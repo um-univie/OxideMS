@@ -1,5 +1,5 @@
 use crate::clustering::cluster::{ClusterLabel, fast_dot_product};
-use matrixmultiply::sgemm;
+use faer::linalg::matmul;
 use rand::RngExt;
 use rayon::prelude::*;
 use std::cmp::Ordering;
@@ -133,37 +133,24 @@ impl<'a> BucketIndex<'a> {
         let rows_per_chunk = 64;
 
         for _iter in 0..10 {
-            // 1. SGEMM: Compute scores (Assignments)
-            scores_buffer
-                .par_chunks_mut(rows_per_chunk * n_list)
-                .enumerate()
-                .for_each(|(chunk_idx, c_chunk)| {
-                    let current_m = c_chunk.len() / n_list;
-                    let start_row = chunk_idx * rows_per_chunk;
 
-                    unsafe {
-                        let a_lhs_ptr = bucket_data.as_ptr().add(start_row * dim);
-                        let a_rhs_ptr = centroids.as_ptr(); // Centroids matrix
+// 1. Calculate the number of rows in bucket_data (m)
+let m = bucket_data.len() / dim;
 
-                        sgemm(
-                            current_m,
-                            dim,
-                            n_list,
-                            1.0,
-                            a_lhs_ptr,
-                            dim as isize,
-                            1, // A (batch data)
-                            a_rhs_ptr,
-                            1,
-                            dim as isize, // B (centroids, transposed via strides)
-                            0.0,
-                            c_chunk.as_mut_ptr(),
-                            n_list as isize,
-                            1, // C (scores)
-                        );
-                    }
-                });
+// 2. Create safe row-major matrix views
+let a_mat = faer::MatRef::from_row_major_slice(&bucket_data, m, dim);
+let b_mat = faer::MatRef::from_row_major_slice(&centroids, n_list, dim);
+let c_mat = faer::MatMut::from_row_major_slice_mut(&mut scores_buffer, m, n_list);
 
+// 3. Perform the matrix multiplication (Scores = BucketData * Centroids^T)
+faer::linalg::matmul::matmul(
+    c_mat,
+    faer::Accum::Replace,  // Overwrite C entirely (equivalent to beta = 0.0)
+    a_mat,                 // A (lhs: bucket data)
+    b_mat.transpose(),     // B^T (rhs: centroids, transposed)
+    1.0,                   // alpha = 1.0
+    faer::Par::rayon(0),   // Let faer handle chunking and threading via Rayon
+);
             // 2. Argmax: Find best centroid for each vector
             for i in 0..n_vectors {
                 let row_start = i * n_list;
@@ -258,27 +245,26 @@ impl<'a> BucketIndex<'a> {
         // 1. AVOID ZEROING MEMORY: sgemm (beta = 0.0) overwrites everything.
         let mut routing_scores = Vec::with_capacity(total_routing_elements);
 
-        unsafe {
-            // Safety: We immediately pass this to SGEMM which initializes all elements.
-            routing_scores.set_len(total_routing_elements);
 
-            sgemm(
-                self.n_vectors,
-                self.dim,
-                self.n_list,
-                1.0,
-                self.bucket_data.as_ptr(),
-                self.dim as isize,
-                1,
-                self.centroids.as_ptr(),
-                1,
-                self.dim as isize,
-                0.0,
-                routing_scores.as_mut_ptr(),
-                self.n_list as isize,
-                1,
-            );
+            // Safety: We immediately pass this to SGEMM which initializes all elements.
+        unsafe {
+            routing_scores.set_len(total_routing_elements);
         }
+
+// 1. Create safe row-major matrix views
+let a_mat = faer::MatRef::from_row_major_slice(&self.bucket_data, self.n_vectors, self.dim);
+let b_mat = faer::MatRef::from_row_major_slice(&self.centroids, self.n_list, self.dim);
+let c_mat = faer::MatMut::from_row_major_slice_mut(&mut routing_scores, self.n_vectors, self.n_list);
+
+// 2. Perform the matrix multiplication (Scores = BucketData * Centroids^T)
+faer::linalg::matmul::matmul(
+    c_mat,
+    faer::Accum::Replace,  // beta = 0.0
+    a_mat,                 // A
+    b_mat.transpose(),     // B^T
+    1.0,                   // alpha = 1.0
+    faer::Par::rayon(0),   // Multithreading via Rayon
+);
 
         // 2. PARALLELIZE WITH RAYON (while preserving allocation hoisting)
         // We chunk the queries so we only allocate the hot-loop buffers a few times per CPU core.

@@ -11,6 +11,8 @@ use crate::{
     workflow::MassTolerance,
 };
 use faer::linalg::matmul::triangular::{BlockStructure, matmul as triangular_matmul};
+use faer::sparse::linalg::matmul::sparse_sparse_matmul;
+use faer::sparse::{SparseRowMat, Triplet};
 use faer::{MatMut, MatRef};
 use rayon::prelude::*;
 
@@ -342,13 +344,11 @@ impl ClusterEngine {
         let mz_tolerance = self.mz_tolerance;
         let threshold = 1.0 - epsilon;
 
-        let fast_batches = std::mem::take(&mut self.fast_batches);
+        let mut fast_batches = std::mem::take(&mut self.fast_batches);
         let start_time = std::time::Instant::now();
         println!("Starting fast batch");
 
         if !fast_batches.is_empty() {
-            use faer::sparse::linalg::matmul::sparse_sparse_matmul;
-            use faer::sparse::{SparseRowMat, Triplet};
 
             let hasher = &self.hasher;
             let batch_results: Vec<_> = if self.exact {
@@ -567,7 +567,9 @@ impl ClusterEngine {
                 }
                 current_clusters_size += local_max_value;
             }
+            std::mem::take(&mut fast_batches);
         }
+
 
         println!(
             "Done with fast batch after: {}",

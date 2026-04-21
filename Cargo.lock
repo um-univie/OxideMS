@@ -4726,7 +4726,6 @@ dependencies = [
  "faer",
  "fast-float",
  "itertools 0.14.0",
- "matrixmultiply",
  "memchr",
  "memmap2",
  "nohash-hasher",

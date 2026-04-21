@@ -17,7 +17,6 @@ fast-float = "0.2.0"
 memmap2 = "0.9.10"
 memchr = "2.8.0"
 compact_str = "0.9.0"
-matrixmultiply = "0.3.10"
 itertools = "0.14.0"
 faer = { version = "0.24", features = ["nightly", "sparse", "rayon"], default-features = false }
 
