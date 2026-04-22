@@ -393,9 +393,11 @@ impl SpectralExperiment {
             return;
         }
         let mut file = std::fs::File::create(output_file_name).unwrap();
+        let prefix = 
+
         let mut writer = std::io::BufWriter::new(&mut file);
         writer
-            .write(format!("# oxidems\n# eps = {}\n# hash_len = {}\nidentifier,precursor_charge,precursor_mz,retention_time,cluster\n",  self.engine.epsilon, self.engine.hash_size()).as_bytes())
+            .write(format!("# RedshiftMS v0.1.0 {}\n# eps = {}\n# hash_len = {}\n# total_spectra_parsed = {}\nidentifier,precursor_charge,precursor_mz,retention_time,cluster\n", if self.engine.exact {"(exact)"} else {""},  self.engine.epsilon, self.engine.hash_size(), self.total_spectra_ingested).as_bytes())
             .unwrap();
         let mut counter = 0;
         for cluster in clusters.iter() {

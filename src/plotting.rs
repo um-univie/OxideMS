@@ -1,6 +1,7 @@
 use crate::HashedSpectrumConfig;
 use crate::spectrum::{MSNSpectrum, MassSpectrum, Peak};
 use plotters::prelude::*;
+use plotters::*;
 
 use std::error::Error;
 use std::path::Path;

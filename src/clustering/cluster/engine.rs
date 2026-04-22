@@ -167,18 +167,17 @@ pub struct ClusterEngine {
 
 impl Default for ClusterEngine {
     fn default() -> Self {
-        let number_of_spectra = 128;
         let hash_size = 800;
         let eps = 0.1;
         let matrix_size = number_of_spectra * number_of_spectra;
         ClusterEngine {
-            spectral_buffer: vec![0.0; number_of_spectra * hash_size],
-            similarity_matrix_buffer: vec![0.0; matrix_size],
+            spectral_buffer: Vec::new(),
+            similarity_matrix_buffer: Vec::new(),
             epsilon: eps,
             mz_tolerance: MassTolerance::Ppm(20.0),
             batch_size_threshold: FAST_BATCH_NUMBER,
             approximate_threshold: LARGE_BATCH_THRESHOLD,
-            hasher: SpectrumHasher::new(100.0, 1500.0, MassTolerance::Da(0.05), hash_size),
+            hasher: SpectrumHasher::new(100.0, 1500.0, MassTolerance::Ppm(20.0), hash_size),
             exact: false,
             min_neighbors: MIN_NEIGHBORS,
             use_gpu: false,

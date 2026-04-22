@@ -11,7 +11,14 @@ rayon = "1.11.0"
 rkyv = {version="0.8.15", features = ["pointer_width_64"]}
 rand = "0.10.0"
 rand_distr = "0.6.0"
-plotters = "0.3.7"
+plotters = { version = "0.3.7", default-features = false, features = [
+    "bitmap_backend",
+    "bitmap_encoder", # Required to actually instantiate and save the PNGs
+    "svg_backend",
+    "ab_glyph",       # Pure-Rust font rendering
+    "all_series",     # Brings back LineSeries, AreaSeries, etc.
+    "all_elements"    # Brings back Histogram, Boxplot, etc.
+] }
 xxhash-rust = {version="0.8.15", features = ["xxh32"]}
 fast-float = "0.2.0"
 memmap2 = "0.9.10"
