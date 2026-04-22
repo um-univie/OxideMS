@@ -5,6 +5,7 @@ pub mod cluster_burn;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod k_cluster_ivf;
+pub mod kde;
 pub mod ms_rt;
 pub mod similarities;
 pub mod sparse_cosine;

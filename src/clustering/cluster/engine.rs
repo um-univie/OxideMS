@@ -349,7 +349,6 @@ impl ClusterEngine {
         println!("Starting fast batch");
 
         if !fast_batches.is_empty() {
-
             let hasher = &self.hasher;
             let batch_results: Vec<_> = if self.exact {
                 fast_batches
@@ -485,6 +484,7 @@ impl ClusterEngine {
                             let n_spectra = spectra.len();
 
                             spectral_buffer.resize(n_spectra * hash_size, 0.0);
+                            // This is necessary as we will not override all values
                             spectral_buffer.fill(0.0);
 
                             spectral_buffer
@@ -569,7 +569,6 @@ impl ClusterEngine {
             }
             std::mem::take(&mut fast_batches);
         }
-
 
         println!(
             "Done with fast batch after: {}",

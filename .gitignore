@@ -6,10 +6,13 @@
 /plots
 src/sirius.rs
 src/formula_generator.rs
+src/.DS_Store
 .zed
 *.data
+*.png
 *.svg
 *.py
 *.csv
 *.bib
 *.sh
+*.DS_Store
