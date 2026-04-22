@@ -169,7 +169,6 @@ impl Default for ClusterEngine {
     fn default() -> Self {
         let hash_size = 800;
         let eps = 0.1;
-        let matrix_size = number_of_spectra * number_of_spectra;
         ClusterEngine {
             spectral_buffer: Vec::new(),
             similarity_matrix_buffer: Vec::new(),

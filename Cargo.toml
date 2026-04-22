@@ -30,7 +30,6 @@ faer = { version = "0.24", features = ["nightly", "sparse", "rayon"], default-fe
 burn = {version="0.20.1", features=["train", "wgpu"], optional=true}
 serde_json = {version= "1.0.149", optional = true}
 serde = {version="1.0.228", optional = true}
-
 wgpu = {version="29.0.1", optional = true}
 bytemuck = {version="1.25.0", optional = true}
 pollster = {version="0.4.0", optional = true}
