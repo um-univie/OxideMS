@@ -107,23 +107,18 @@ impl MassSpectrum {
 
         for peak in self.peaks() {
             if peak.intensity >= config.intensity_threshold {
-                // 1. Convert m/z to a discrete integer bin
                 let bin_index = (peak.mz / config.bin_width).round() as isize;
-                // 2. Hash the index
                 let bytes = bin_index.to_le_bytes();
                 let hash_val = xxh32(&bytes, 0) as usize;
-                // 3. Map to the fixed-size array
                 let index = (hash_val % config.hash_size) as usize;
 
-                // Use highest bit for sign
-                // to prevent bias/accumulation from hash collisions
+                // Use highest bit for sign to prevent bias/accumulation from hash collisions
                 let sign = if (hash_val as u64 >> usize::BITS - 1) == 1 {
                     -1.0
                 } else {
                     1.0
                 };
 
-                // 4. Accumulate intensity
                 features[index] += peak.intensity * sign;
             }
         }
@@ -151,18 +146,14 @@ trait SpectralHash {
 
         for peak in self.peaks() {
             if peak.intensity >= config.intensity_threshold {
-                // 1. Convert m/z to a discrete integer bin
                 let bin_index = (peak.mz / config.bin_width).round() as isize;
                 let bytes = bin_index.to_le_bytes();
                 let hash_val = xxh32(&bytes, 0) as u64;
-                // 3. Map to the fixed-size array
                 let index = (hash_val % config.hash_size as u64) as usize;
 
-                // Optional standard hashing trick: use highest bit for sign
-                // to prevent bias/accumulation from hash collisions
+                // Use highest bit for sign to prevent bias/accumulation from hash collisions
                 let sign = if (hash_val >> 63) == 1 { -1.0 } else { 1.0 };
 
-                // 4. Accumulate intensity
                 buffer[index] += peak.intensity * sign;
             }
         }
@@ -178,23 +169,18 @@ impl ArchivedMassSpectrum {
         }
 
         for peak in self.peaks.iter() {
-            // 1. Convert m/z to a discrete integer bin
             let bin_index = (peak.mz / config.bin_width).round() as isize;
-
             let bytes = bin_index.to_le_bytes();
             let hash_val = xxh32(&bytes, 0) as usize;
-            // 3. Map to the fixed-size array
             let index = (hash_val % config.hash_size) as usize;
 
-            // Optional standard hashing trick: use highest bit for sign
-            // to prevent bias/accumulation from hash collisions
+            // Use highest bit for sign to prevent bias/accumulation from hash collisions
             let sign = if (hash_val >> usize::BITS - 1) == 1 {
                 -1.0
             } else {
                 1.0
             };
 
-            // 4. Accumulate intensity
             buffer[index] += peak.intensity * sign;
         }
     }
@@ -352,86 +338,7 @@ impl BinnedSpectrumConfig {
         self
     }
 }
-// pub struct SpectrumHasher {
-//     pub min_mz: f64,
-//     pub max_mz: f64,
-//     pub bin_size: f64,
-//     pub hash_len: usize,
-//     pub lookup_table: Vec<usize>,
-// }
 
-// impl SpectrumHasher {
-//     /// Creates a new SpectrumHasher and precomputes the hash lookup table.
-//     /// This should be called once and reused for all spectra to amortize the setup cost.
-//     pub fn new(min_mz: f64, max_mz: f64, bin_size: f64, hash_len: usize) -> Self {
-//         // Calculate the total number of possible m/z bins in our window
-//         let num_bins = ((max_mz - min_mz) / bin_size).ceil() as usize;
-//         let mut lookup_table = Vec::with_capacity(num_bins);
-
-//         // Precompute the hash for every single bin index
-//         for i in 0..num_bins {
-//             let bytes = i.to_le_bytes();
-//             let hash_val = xxh32(&bytes, 0);
-
-//             // Map the hash to our fixed vector dimension
-//             lookup_table.push((hash_val as u64 % hash_len as u64) as usize);
-//         }
-
-//         Self {
-//             min_mz,
-//             max_mz,
-//             bin_size,
-//             hash_len,
-//             lookup_table,
-//         }
-//     }
-
-//     pub fn recalculate_lookup_table(&mut self)  {
-//         // Calculate the total number of possible m/z bins in our window
-//         let num_bins: usize = ((self.max_mz - self.min_mz) / self.bin_size).ceil() as usize;
-
-//         self.lookup_table.resize(num_bins, 0);
-
-//         // Precompute the hash for every single bin index
-//         for i in 0..num_bins {
-//             let bytes = i.to_le_bytes();
-//             let hash_val = xxh32(&bytes, 0);
-
-//             // Map the hash to our fixed vector dimension
-//             self.lookup_table[i] = (hash_val as u64 % self.hash_len as u64) as usize;
-//         }
-//     }
-
-//     /// Converts a slice of peaks into a dense, hashed f32 vector.
-//     pub fn into_vector(&self, peaks: &[ArchivedPeak], normalize_l2: bool, buffer: &mut [f32]) {
-//         for peak in peaks {
-//             // 1. Filter peaks outside the defined m/z window
-//             if peak.mz >= self.min_mz && peak.mz < self.max_mz {
-//                 // 2. Discretize m/z to bin index while respecting floating point imprecision
-//                 let bin_idx = (((peak.mz - self.min_mz) / self.bin_size).floor() as usize)
-//                     .min(self.lookup_table.len().saturating_sub(1));
-//                 // 3. O(1) Array Lookup for the hash bucket
-//                 let target_idx = self.lookup_table[bin_idx];
-
-//                 // 4. Accumulate intensity
-//                 buffer[target_idx] += f32::from(peak.intensity);
-//             }
-//         }
-
-//         // 5. Optional L2 Normalization (Cosine Similarity Prep)
-//         if normalize_l2 {
-//             let sq_sum: f32 = buffer.iter().map(|&x| x * x).sum();
-//             if sq_sum > 0.0 {
-//                 let norm = sq_sum.sqrt();
-//                 for val in buffer.iter_mut() {
-//                     *val /= norm;
-//                 }
-//             }
-//         }
-//     }
-// }
-//
-//
 pub struct SpectrumHasher {
     pub min_mz: f64,
     pub max_mz: f64,
@@ -558,24 +465,15 @@ impl SpectrumHasher {
         let is_ppm = matches!(self.tolerance, MassTolerance::Ppm(_));
 
         for peak in peaks {
-            // Note: Assuming peak.mz is f64 or gets cast to f64 here
             let mz = peak.mz.to_native();
-
-            // Calculate absolute bin using the precomputed denominator
             let abs_bin = if is_ppm {
                 mz.ln() / self.bin_denominator
             } else {
                 mz / self.bin_denominator
             };
-
-            // Offset by min_bin to get our 0-based index for the lookup table
             let bin_idx = ((abs_bin - self.min_bin).floor() as usize)
                 .min(self.lookup_table.len().saturating_sub(1));
-
-            // Retrieve both index and sign in one go
             let (target_idx, sign) = self.lookup_table[bin_idx];
-
-            // Accumulate signed intensity
             buffer[target_idx] += f32::from(peak.intensity) * sign;
         }
 
@@ -604,7 +502,6 @@ pub struct HashedSpectrumConfig {
     pub bin_width: f64,
 }
 
-// Usage:
 impl_fluent_builder_vanilla! {
     impl HashedSpectrumConfig {
         hash_size: usize,
@@ -632,7 +529,6 @@ impl MassSpectralRecord {
     /// # Arguments
     /// * `peaks` - Vector of Peak(s)
     pub fn new(mut peaks: Vec<Peak>, charge: i8, id: usize) -> Self {
-        // Sort peaks by m/z for efficiency
         peaks.sort_by(|a, b| a.mz.partial_cmp(&b.mz).unwrap());
 
         Self {
@@ -721,20 +617,15 @@ impl MassSpectralRecord {
             };
         }
 
-        // Find m/z range
         let data_min_mz = self.peaks().first().unwrap().mz;
         let data_max_mz = self.peaks().last().unwrap().mz;
-
-        // Calculate bin offset (default: center bins on integer values)
         let bin_offset = config.bin_offset.unwrap_or(0.0);
 
-        // Find the first and last nominal bin centers that cover the data
         let first_nominal_center =
             ((data_min_mz - bin_offset) / config.bin_width).round() * config.bin_width + bin_offset;
         let last_nominal_center =
             ((data_max_mz - bin_offset) / config.bin_width).round() * config.bin_width + bin_offset;
 
-        // Ensure we have at least one bin and cover the full range
         let adjusted_first = if first_nominal_center > data_min_mz {
             first_nominal_center - config.bin_width
         } else {
@@ -746,37 +637,28 @@ impl MassSpectralRecord {
             last_nominal_center
         };
 
-        // Calculate number of bins needed
         let num_bins = ((adjusted_last - adjusted_first) / config.bin_width).round() as usize + 1;
         let mut intensities = vec![0.0; num_bins];
-        let mut weighted_mz_sums = vec![0.0; num_bins]; // For calculating weighted averages
-
-        // Set the actual range based on bin boundaries
+        let mut weighted_mz_sums = vec![0.0; num_bins];
         let min_mz = adjusted_first - config.bin_width / 2.0;
         let max_mz = adjusted_last + config.bin_width / 2.0;
 
-        // Bin the peaks and calculate weighted averages
         for peak in self.peaks().iter() {
             if peak.intensity >= config.intensity_threshold {
-                // Find the nearest nominal bin center
                 let bin_index = ((peak.mz - adjusted_first) / config.bin_width).round() as isize;
-
                 if bin_index >= 0 && (bin_index as usize) < num_bins {
                     let idx = bin_index as usize;
                     intensities[idx] += peak.intensity;
-                    weighted_mz_sums[idx] += peak.mz * peak.intensity as f64; // Weighted sum for average calculation
+                    weighted_mz_sums[idx] += peak.mz * peak.intensity as f64;
                 }
             }
         }
 
-        // Calculate actual bin centers as weighted averages
         let mut bin_centers = Vec::with_capacity(num_bins);
         for i in 0..num_bins {
             if intensities[i] > 0.0 {
-                // Weighted average of m/z values in this bin
                 bin_centers.push(weighted_mz_sums[i] / intensities[i] as f64);
             } else {
-                // No peaks in this bin, use the nominal center
                 bin_centers.push(adjusted_first + i as f64 * config.bin_width);
             }
         }

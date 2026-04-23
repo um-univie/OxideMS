@@ -27,10 +27,6 @@ impl MassTolerance {
     }
 }
 
-// ---------------------------------------------------------
-// 1. Define the traits
-// ---------------------------------------------------------
-
 /// The core trait that the WorkFlowManager actually uses.
 pub trait Operation: Send + Sync {
     fn operate(&self, spectra: &mut [MassSpectralRecord], use_parallel: bool);
@@ -41,7 +37,6 @@ pub trait SingleOperation: Send + Sync {
     fn operate_single(&self, spectrum: &mut MassSpectralRecord);
 }
 
-// Automatically implement `Operation` for anything that implements `SingleOperation`.
 impl<T: SingleOperation + Sync> Operation for T {
     fn operate(&self, spectra: &mut [MassSpectralRecord], use_parallel: bool) {
         if use_parallel {
@@ -81,8 +76,6 @@ impl WorkFlowManager {
     }
 
     pub fn execute(&self, spectra: &mut [MassSpectralRecord]) {
-        // The manager now just passes the whole slice to every operation.
-        // The traits figure out internally whether to loop or handle the whole slice.
         for operation in self.workflow.iter() {
             operation.operate(spectra, self.use_parallel);
         }
@@ -105,7 +98,6 @@ impl SingleOperation for Normalize {
             .unwrap_or(&Peak::default())
             .intensity;
 
-        // Avoid division by zero in empty spectra
         if max > 0.0 {
             spectrum
                 .peaks_mut()
@@ -119,7 +111,6 @@ pub struct AlignSpectra {}
 
 impl Operation for AlignSpectra {
     fn operate(&self, spectra: &mut [MassSpectralRecord], use_parallel: bool) {
-        // Cross-spectrum logic goes here
         println!("Aligning {} spectra together!", spectra.len());
     }
 }
@@ -147,9 +138,7 @@ fn keep_top_n_peaks(vec: &mut Vec<Peak>, n: usize) {
     // `total_cmp` provides the strict std::cmp::Ordering required.
     vec.select_nth_unstable_by(n - 1, |a, b| b.intensity.total_cmp(&a.intensity));
 
-    // Discard everything after the top `n` elements
     vec.truncate(n);
-    // Sort vec for other operations
     vec.sort_by(|a, b| a.mz.total_cmp(&b.mz));
 }
 
@@ -212,19 +201,7 @@ struct_with_new!(
 
 impl SingleOperation for MinMZRangeFilter {
     fn operate_single(&self, spectrum: &mut MassSpectralRecord) {
-        // let min = spectrum
-        //     .peaks_mut()
-        //     .iter()
-        //     .min_by(|a, b| a.mz.total_cmp(&b.mz))
-        //     .copied()
-        //     .unwrap_or(Peak::default());
         let min = spectrum.peaks().first().map(|next| next.mz).unwrap_or(0.0);
-        // let max = spectrum
-        //     .peaks_mut()
-        //     .iter()
-        //     .max_by(|a, b| a.mz.total_cmp(&b.mz))
-        //     .copied()
-        //     .unwrap_or(Peak::default());
         let max = spectrum.peaks().last().map(|next| next.mz).unwrap_or(0.0);
 
         if max - min < self.min_mz_range {
@@ -256,28 +233,16 @@ impl SingleOperation for CentroidPeaks {
             return;
         }
 
-        // 1. Sort the peaks by m/z to ensure nearby peaks are adjacent in the slice.
-        // Not necessary anymore as we ensure sorting on MassSpectralRecord creation
-        // spectrum
-        //     .peaks_mut()
-        //     .sort_unstable_by(|a, b| a.mz.total_cmp(&b.mz));
-
-        // Pre-allocate the new vector to avoid reallocations.
-        // It will be at most the size of the original.
         let mut merged_peaks = Vec::with_capacity(spectrum.peaks_mut().len());
-
-        // Track the current grouping
         let mut group_start_mz = spectrum.peaks_mut()[0].mz;
         let mut current_mz_intensity_product = 0.0;
         let mut current_intensity_sum = 0.0;
 
         for peak in spectrum.peaks_mut() {
-            // Check if the current peak is within the tolerance window of the group's start
             if peak.mz - group_start_mz <= self.mz_tolerance {
                 current_mz_intensity_product += peak.mz * peak.intensity as f64;
                 current_intensity_sum += peak.intensity;
             } else {
-                // The peak is outside the tolerance. Finalize the previous group.
                 if current_intensity_sum > 0.0 {
                     merged_peaks.push(Peak {
                         mz: current_mz_intensity_product / current_intensity_sum as f64,
@@ -285,7 +250,6 @@ impl SingleOperation for CentroidPeaks {
                     });
                 }
 
-                // Start a new group with the current peak
                 group_start_mz = peak.mz;
                 current_mz_intensity_product = peak.mz * peak.intensity as f64;
                 current_intensity_sum = peak.intensity;
@@ -299,7 +263,6 @@ impl SingleOperation for CentroidPeaks {
             });
         }
 
-        // Overwrite the old spectrum with the cleanly merged peaks
         *spectrum.peaks_mut() = merged_peaks;
     }
 }
@@ -318,58 +281,43 @@ impl SingleOperation for Deisotope {
             return;
         }
 
-        // 1. Ensure peaks are sorted by m/z for the sweep algorithm
-        // Not necessary anymore as we ensure sorting on MassSpectralRecord creation
-        // spectrum
-        //     .peaks_mut()
-        //     .sort_unstable_by(|a, b| a.mz.total_cmp(&b.mz));
-
-        // Create a mask to track which peaks are isotopes so we can remove them later
         let mut is_isotope = vec![false; spectrum.peaks_mut().len()];
 
         for i in 0..spectrum.peaks_mut().len() {
-            // Skip if this peak was already claimed as an isotope by a lighter peak
             if is_isotope[i] {
                 continue;
             }
 
-            // Test for isotopic envelopes across all expected charge states
             for z in 1..=self.max_charge {
                 let mut current_mz = spectrum.peaks_mut()[i].mz;
                 let step = NEUTRON_MASS / (z as f64);
 
-                // Chain look-aheads (find M+1, then use M+1 to find M+2, etc.)
                 for _ in 0..self.max_isotopes {
                     let expected_mz = current_mz + step;
                     let mut found_in_this_step = false;
 
-                    // Look ahead in the spectrum
                     for j in (i + 1)..spectrum.peaks_mut().len() {
                         if is_isotope[j] {
                             continue;
                         }
                         let target_mz = spectrum.peaks_mut()[j].mz;
 
-                        // Because the array is sorted, if we exceed the window, we can stop looking
+                        // Array is sorted, so exceeding the window means we can stop
                         if target_mz > expected_mz + self.tolerance {
                             break;
                         }
 
-                        // If it falls within the tolerance window, we found an isotope!
                         if (target_mz - expected_mz).abs() <= self.tolerance {
                             is_isotope[j] = true;
-
-                            // Collapse the intensity into the parent monoisotopic peak
                             let extra_intensity = spectrum.peaks_mut()[j].intensity;
                             spectrum.peaks_mut()[i].intensity += extra_intensity;
-
-                            current_mz = target_mz; // Update current_mz to look for the next in the chain
+                            current_mz = target_mz;
                             found_in_this_step = true;
                             break;
                         }
                     }
 
-                    // If we didn't find an M+1, there's no mathematical sense in looking for M+2
+                    // No M+1 means no M+2 either
                     if !found_in_this_step {
                         break;
                     }
@@ -377,7 +325,6 @@ impl SingleOperation for Deisotope {
             }
         }
 
-        // 2. Finally, filter the spectrum, keeping only the monoisotopic peaks
         let mut iter = is_isotope.into_iter();
         spectrum.peaks_mut().retain(|_| !iter.next().unwrap());
     }
@@ -417,20 +364,17 @@ struct_with_new!(
 
 impl SingleOperation for RemovePrecursor {
     fn operate_single(&self, spectrum: &mut MassSpectralRecord) {
-        // 1. Extract Precursor MZ
         let precursor_mz = spectrum
             .get_metadata("PEPMASS")
             .and_then(|mz_str| mz_str.split_whitespace().next())
             .and_then(|s| s.parse::<f64>().ok());
 
-        // 2. Extract Precursor Charge (defaulting to 1 if not found or unparseable)
         let precursor_charge = spectrum.get_charge();
 
         let Some(mz_val) = precursor_mz else {
             return;
         };
 
-        // 3. Calculate target m/z values to remove (matching Python logic)
         let adduct_mass = 1.007825;
         let c_mass_diff = 1.003355;
         let neutral_mass = (mz_val - adduct_mass) * (precursor_charge as f64);
@@ -444,9 +388,7 @@ impl SingleOperation for RemovePrecursor {
             }
         }
 
-        // 4. Filter peaks
         spectrum.peaks_mut().retain(|peak| {
-            // Check if this peak matches ANY of our calculated removal m/zs
             !remove_mzs.iter().any(|&target_mz| match self.mode {
                 MassTolerance::Da(tolerance) => (peak.mz - target_mz).abs() <= tolerance,
                 MassTolerance::Ppm(tolerance) => {
