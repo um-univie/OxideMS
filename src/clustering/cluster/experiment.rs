@@ -335,15 +335,14 @@ impl SpectralExperiment {
                 )
             })
             .inspect(|(scan_number, msn)| {
-                self.metadata.insert(
-                    msn.id as usize,
+                self.metadata.push(
                     SpectrumMetadata {
                         precursor_mz: msn.precursor_mz,
                         retention_time_in_seconds: msn.retention_time_in_seconds,
                         charge: msn.charge(),
                         scan_number: *scan_number,
                         file_index,
-                    },
+                    }
                 );
             })
             .map(|(_, msn_spectrum)| msn_spectrum)
