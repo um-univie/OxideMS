@@ -6,7 +6,7 @@ use crate::{
     MSNSpectrum, SpectrumHasher,
     clustering::{
         bitset::{BitSetOpsMSB0, WORDSIZE},
-        k_cluster_ivf::{BucketIndex, graph_dbscan},
+        k_cluster_ivf::{BucketIndex, Edge, graph_dbscan},
     },
     workflow::MassTolerance,
 };
@@ -152,6 +152,7 @@ pub struct ClusterEngine {
     pub(super) spectral_buffer: Vec<f32>,
     pub(super) similarity_matrix_buffer: Vec<f32>,
     pub mz_tolerance: MassTolerance,
+    pub rt_tolerance: Option<f32>,
     pub epsilon: f32,
     pub batch_size_threshold: usize,
     pub approximate_threshold: usize,
@@ -174,6 +175,7 @@ impl Default for ClusterEngine {
             similarity_matrix_buffer: Vec::new(),
             epsilon: eps,
             mz_tolerance: MassTolerance::Ppm(20.0),
+            rt_tolerance: None,
             batch_size_threshold: FAST_BATCH_NUMBER,
             approximate_threshold: LARGE_BATCH_THRESHOLD,
             hasher: SpectrumHasher::new(100.0, 1500.0, MassTolerance::Ppm(20.0), hash_size),
@@ -287,7 +289,7 @@ impl ClusterEngine {
 
     pub fn split_on_mz_and_charge(
         &mut self,
-        spectra: &mut [MSNSpectrum],
+        mut spectra: Vec<MSNSpectrum>,
     ) -> Result<(), std::io::Error> {
         spectra.par_sort_unstable_by(|spectrum1, spectrum2| {
             (spectrum1.charge(), spectrum1.precursor_mz)
@@ -298,35 +300,94 @@ impl ClusterEngine {
         let mut fast_batches = Vec::new();
         let mut slow_batches = Vec::new();
 
-        for group in spectra.chunk_by(|a, b| {
-            if a.charge() != b.charge() {
-                return false;
-            }
-
-            let m_a = a.get_neutral_mass();
-            let m_b = b.get_neutral_mass();
-            let gap = (m_b - m_a).abs();
-
-            match self.mz_tolerance {
-                MassTolerance::Da(tol) => gap <= tol,
-                MassTolerance::Ppm(tol) => {
-                    let allowed_gap = m_b * (tol / 1_000_000.0);
-                    gap <= allowed_gap
+        // Read-only pass: record where each mz/charge group starts.
+        let n = spectra.len();
+        let mut boundaries: Vec<usize> = vec![0];
+        for i in 1..n {
+            let a = &spectra[i - 1];
+            let b = &spectra[i];
+            let same_group = if a.charge() != b.charge() {
+                false
+            } else {
+                let m_a = a.get_neutral_mass();
+                let m_b = b.get_neutral_mass();
+                let gap = (m_b - m_a).abs();
+                match self.mz_tolerance {
+                    MassTolerance::Da(tol) => gap <= tol,
+                    MassTolerance::Ppm(tol) => gap <= m_b * (tol / 1_000_000.0),
                 }
+            };
+            if !same_group {
+                boundaries.push(i);
             }
-        }) {
-            if group.len() > 1 {
-                let batch = MassSpectrumBatch {
-                    batch: group.to_vec(),
-                };
+        }
+        if n > 0 {
+            boundaries.push(n);
+        }
 
-                if group.len() < self.batch_size_threshold {
+        let rt_tolerance = self.rt_tolerance;
+        let batch_size_threshold = self.batch_size_threshold;
+        let mut rt_boundaries: Vec<usize> = Vec::new();
+
+        // Drain mz-groups back-to-front so earlier indices remain valid.
+        for window in boundaries.windows(2).rev() {
+            let (start, end) = (window[0], window[1]);
+            if end - start <= 1 {
+                continue;
+            }
+
+            let mut mz_group: Vec<MSNSpectrum> = spectra.drain(start..end).collect();
+
+            if let Some(rt_tol) = rt_tolerance {
+                // Sub-split by RT: sort the mz-group by RT then do a second
+                // consecutive-gap scan. Total extra work across all groups is
+                // O(k log k) per group, O(n log n) overall.
+                mz_group.sort_unstable_by(|a, b| {
+                    a.retention_time_in_seconds
+                        .partial_cmp(&b.retention_time_in_seconds)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+                let m = mz_group.len();
+                rt_boundaries.clear();
+                rt_boundaries.push(0);
+                for i in 1..m {
+                    let gap = (mz_group[i].retention_time_in_seconds
+                        - mz_group[i - 1].retention_time_in_seconds)
+                        .abs();
+                    if gap > rt_tol {
+                        rt_boundaries.push(i);
+                    }
+                }
+                rt_boundaries.push(m);
+
+                for rt_window in rt_boundaries.windows(2).rev() {
+                    let (rs, re) = (rt_window[0], rt_window[1]);
+                    if re - rs > 1 {
+                        let sub: Vec<MSNSpectrum> = mz_group.drain(rs..re).collect();
+                        let len = sub.len();
+                        let batch = MassSpectrumBatch { batch: sub };
+                        if len < batch_size_threshold {
+                            fast_batches.push(batch);
+                        } else {
+                            slow_batches.push(batch);
+                        }
+                    }
+                }
+            } else {
+                let len = mz_group.len();
+                let batch = MassSpectrumBatch { batch: mz_group };
+                if len < batch_size_threshold {
                     fast_batches.push(batch);
                 } else {
                     slow_batches.push(batch);
                 }
             }
         }
+
+        // Restore sorted order — we built lists back-to-front.
+        fast_batches.reverse();
+        slow_batches.reverse();
 
         self.fast_batches = fast_batches;
         self.slow_batches = slow_batches;
@@ -565,7 +626,6 @@ impl ClusterEngine {
                 }
                 current_clusters_size += local_max_value;
             }
-            std::mem::take(&mut fast_batches);
         }
 
         println!(
@@ -577,7 +637,7 @@ impl ClusterEngine {
         let start_time = std::time::Instant::now();
 
         let slow_batches = std::mem::take(&mut self.slow_batches);
-        for batch in &slow_batches {
+        for batch in slow_batches.into_iter() {
             let spectra = batch.batch.as_slice();
             let n_spectra = spectra.len();
 
@@ -600,6 +660,64 @@ impl ClusterEngine {
             if n_spectra > self.approximate_threshold {
                 let index = BucketIndex::build(&self.spectral_buffer, hash_size, 64);
                 let edges = index.extract_edges(64, epsilon);
+                dbscan_labels = graph_dbscan(n_spectra, &edges, epsilon, MIN_NEIGHBORS);
+            } else if self.exact {
+                let rows_data: Vec<(usize, Vec<u32>, Vec<f32>)> = spectra
+                    .par_iter()
+                    .enumerate()
+                    .map(|(row_idx, spectrum)| {
+                        let mut soa = spectrum.spectrum.to_soa(mz_tolerance);
+                        soa.l2_normalize();
+                        (row_idx, soa.mz_bins, soa.intensities)
+                    })
+                    .collect();
+
+                let mut triplets: Vec<Triplet<usize, usize, f32>> = Vec::new();
+                let mut max_mz = 0usize;
+                for (row_idx, mz_bins, intensities) in &rows_data {
+                    for (&col, &val) in mz_bins.iter().zip(intensities.iter()) {
+                        if val.abs() > 1e-6 {
+                            let col = col as usize;
+                            if col > max_mz {
+                                max_mz = col;
+                            }
+                            triplets.push(Triplet::new(*row_idx, col, val));
+                        }
+                    }
+                }
+
+                let a_mat = SparseRowMat::try_new_from_triplets(
+                    n_spectra,
+                    max_mz + 1,
+                    triplets.as_slice(),
+                )
+                .unwrap();
+                let a_col = a_mat.to_col_major().unwrap();
+                let a_ref = a_col.as_ref();
+                let a_transposed = a_mat.transpose();
+
+                let sparse_similarity =
+                    sparse_sparse_matmul(a_ref, a_transposed, 1.0, faer::Par::rayon(0)).unwrap();
+                let symbolic = sparse_similarity.symbolic();
+
+                let mut edges: Vec<Edge> = Vec::new();
+                for col in 0..n_spectra {
+                    let col_values = sparse_similarity.val_of_col(col);
+                    let row_indices = symbolic.row_idx_of_col(col);
+                    for (idx, row) in row_indices.enumerate() {
+                        if row < col {
+                            let val = col_values[idx];
+                            if val >= threshold {
+                                edges.push(Edge {
+                                    source_id: row,
+                                    target_id: col,
+                                    score: val,
+                                });
+                            }
+                        }
+                    }
+                }
+
                 dbscan_labels = graph_dbscan(n_spectra, &edges, epsilon, MIN_NEIGHBORS);
             } else {
                 dbscan_labels = self.compute_dense_dbscan(n_spectra, hash_size);

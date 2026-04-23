@@ -1536,3 +1536,13 @@ impl ArchivedMassSpectrum {
         }
     }
 }
+
+
+/// Represents a mass spectrum as a collection of peaks
+#[derive(Debug, Clone, Serialize, Deserialize, Archive)]
+#[rkyv(compare(PartialEq), derive(Debug))]
+pub struct FlatMSNSpectrum {
+    pub id: u64,
+    pub mz: Vec<f64>,
+    pub intensities: Vec<f32>,
+}

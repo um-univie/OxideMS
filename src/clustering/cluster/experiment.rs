@@ -365,11 +365,8 @@ impl SpectralExperiment {
     }
 
     pub fn prepare_clustering(&mut self) {
-        self.engine
-            .split_on_mz_and_charge(&mut self.spectra)
-            .unwrap();
-        // Drop the spectra
-        let _ = std::mem::take(&mut self.spectra);
+        let spectra = std::mem::take(&mut self.spectra);
+        self.engine.split_on_mz_and_charge(spectra).unwrap();
     }
 
     pub fn cluster(&mut self) -> FlatClusters {
