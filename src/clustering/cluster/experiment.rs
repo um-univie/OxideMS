@@ -314,6 +314,8 @@ impl SpectralExperiment {
         let mut spectra = self.parser.parse_file(file_path).unwrap();
         self.total_spectra_ingested += spectra.len();
         self.workflow.execute(&mut spectra);
+        let current_index = self.metadata.len();
+
 
         let msn_spectra: Vec<MSNSpectrum> = spectra
             .into_iter()
@@ -327,7 +329,7 @@ impl SpectralExperiment {
             })
             .enumerate()
             .map(|(index, mut s)| {
-                s.id = index as usize;
+                s.id = current_index + index;
                 (
                     s.get_metadata("SCANS")
                         .unwrap_or("0")
