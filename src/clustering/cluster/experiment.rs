@@ -345,7 +345,7 @@ impl SpectralExperiment {
                     }
                 );
             })
-            .map(|(_, msn_spectrum)| msn_spectrum)
+            .map(|(_, msn_spectrum)| {msn_spectrum.id = self.metadata.len(); msn_spectrum})
             .collect();
 
         self.spectra.extend(msn_spectra)
