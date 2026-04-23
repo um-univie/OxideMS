@@ -325,7 +325,9 @@ impl SpectralExperiment {
                         true
                     }
             })
-            .map(|s| {
+            .enumerate()
+            .map(|(index, mut s)| {
+                s.id = index as usize;
                 (
                     s.get_metadata("SCANS")
                         .unwrap_or("0")
@@ -345,8 +347,9 @@ impl SpectralExperiment {
                     }
                 );
             })
-            .map(|(_, msn_spectrum)| {msn_spectrum.id = self.metadata.len(); msn_spectrum})
+            .map(|(_, msn_spectrum)|  msn_spectrum)
             .collect();
+
 
         self.spectra.extend(msn_spectra)
     }

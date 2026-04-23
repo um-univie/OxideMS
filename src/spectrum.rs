@@ -30,7 +30,7 @@ impl Peak {
 pub struct MassSpectralRecord {
     pub metadata: Vec<(CompactString, CompactString)>,
     spectrum: MassSpectrum,
-    id: usize,
+    pub id: usize,
 }
 
 /// Represents a mass spectrum as a collection of peaks
