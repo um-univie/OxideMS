@@ -149,13 +149,13 @@ pub struct SpectrumMetadata {
 }
 
 pub struct ClusterEngine {
-    pub(super) spectral_buffer: Vec<f32>,
-    pub(super) similarity_matrix_buffer: Vec<f32>,
+    pub spectral_buffer: Vec<f32>,
+    pub similarity_matrix_buffer: Vec<f32>,
     pub mz_tolerance: MassTolerance,
     pub epsilon: f32,
     pub batch_size_threshold: usize,
     pub approximate_threshold: usize,
-    pub(super) hasher: SpectrumHasher,
+    pub hasher: SpectrumHasher,
     pub exact: bool,
     pub min_neighbors: usize,
     pub use_gpu: bool,

@@ -15,4 +15,4 @@ src/.DS_Store
 *.csv
 *.bib
 *.sh
-*.DS_Store
+.DS_Store
