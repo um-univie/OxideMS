@@ -38,7 +38,15 @@ unsafe extern "C" {
     );
 }
 
-/// In-place L2 normalization of a flattened vector of spectra.
+/// Performs in-place L2 normalization on a flattened buffer of spectral vectors.
+///
+/// Each spectrum is assumed to have a fixed length defined by `stride`. 
+/// Normalization is computed as $v_i = \frac{v_i}{\|v\|_2}$. If the norm is 
+/// less than [`f32::EPSILON`], the vector is left unchanged to avoid 
+/// division by zero.
+///
+/// This is typically a prerequisite for computing cosine similarity via 
+/// dot product.
 pub fn normalize_spectra_in_place(flat_data: &mut [f32], stride: usize) {
     for spectrum in flat_data.chunks_mut(stride) {
         let norm_sq: f32 = spectrum.iter().map(|&x| x * x).sum();
@@ -52,6 +60,15 @@ pub fn normalize_spectra_in_place(flat_data: &mut [f32], stride: usize) {
     }
 }
 
+/// Computes the dot product of two vectors using optimized linear algebra routines.
+///
+/// This function leverages the `faer` library to perform the calculation, 
+/// which may utilize SIMD instructions and other hardware-specific 
+/// optimizations.
+///
+/// # Panics
+///
+/// Panics if the lengths of `a` and `b` are not equal.
 pub fn fast_dot_product(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
 
@@ -62,7 +79,14 @@ pub fn fast_dot_product(a: &[f32], b: &[f32]) -> f32 {
     c[(0, 0)]
 }
 
-/// Computes only the upper triangle of C = A * A^T (single-threaded faer).
+/// Computes the upper triangular similarity matrix for a set of spectra.
+///
+/// This calculates $C = A \times A^T$ where $A$ is the row-major `spectral_buffer`.
+/// The computation is performed sequentially. Only the upper triangle of the 
+/// output matrix is populated to save computation time and memory.
+///
+/// The `spectral_buffer` should contain normalized vectors to ensure the 
+/// resulting matrix represents cosine similarities.
 pub(crate) fn compute_similarity_matrix(
     similarity_matrix: &mut Vec<f32>,
     spectral_buffer: &[f32],
@@ -99,7 +123,11 @@ pub(crate) fn compute_similarity_matrix(
     );
 }
 
-/// Computes only the upper triangle of C = A * A^T (parallel faer).
+/// Computes the upper triangular similarity matrix for a set of spectra in parallel.
+///
+/// Similar to [`compute_similarity_matrix`], but utilizes Rayon-backed parallelism 
+/// within the `faer` library. This is optimized for large matrices where the 
+/// overhead of thread synchronization is outweighed by the throughput gains.
 pub(crate) fn compute_similarity_matrix_parallel(
     similarity_matrix: &mut Vec<f32>,
     spectral_buffer: &[f32],
@@ -136,28 +164,58 @@ pub(crate) fn compute_similarity_matrix_parallel(
     );
 }
 
+/// A container for a batch of mass spectra that are processed together.
+///
+/// Batches are typically created based on precursor properties to localize 
+/// similarity searches and improve cache locality.
 pub struct MassSpectrumBatch {
     pub(super) batch: Vec<MSNSpectrum>,
 }
 
+/// Physical and experimental metadata associated with a mass spectrum.
 pub struct SpectrumMetadata {
+    /// The precursor mass-to-charge ratio.
     pub precursor_mz: f64,
+    /// The time at which the spectrum was acquired.
     pub retention_time_in_seconds: f32,
+    /// Index of the source file.
     pub file_index: usize,
+    /// The scan identifier within the source file.
     pub scan_number: usize,
+    /// The charge state of the precursor ion.
     pub charge: i8,
 }
 
+/// The main engine for orchestrating large-scale spectral clustering.
+///
+/// `ClusterEngine` manages memory buffers and configurations for high-performance 
+/// clustering using DBSCAN. It supports different execution paths based on batch 
+/// size and hardware availability, including:
+///
+/// - Dense similarity matrices for medium batches.
+/// - GPU acceleration via Metal/OpenCL (if enabled).
+/// - Exact sparse similarity for high-resolution refinement.
+/// - Approximate graph-based clustering for very large datasets ($> 30,000$ spectra).
 pub struct ClusterEngine {
+    /// Pre-allocated buffer for dense spectral vectors.
     pub spectral_buffer: Vec<f32>,
+    /// Pre-allocated buffer for the similarity matrix.
     pub similarity_matrix_buffer: Vec<f32>,
+    /// Tolerance for precursor m/z matching.
     pub mz_tolerance: MassTolerance,
+    /// The DBSCAN epsilon parameter ($1 - \text{similarity threshold}$).
     pub epsilon: f32,
+    /// Maximum size of a batch to be considered "fast".
     pub batch_size_threshold: usize,
+    /// Threshold for switching to approximate graph-based clustering.
     pub approximate_threshold: usize,
+    /// Component used to vectorize sparse peaks.
     pub hasher: SpectrumHasher,
+    /// Whether to use exact peak alignment instead of binning.
     pub exact: bool,
+    /// Minimum neighbors for a DBSCAN core point.
     pub min_neighbors: usize,
+    /// Enable/disable GPU offloading.
     pub use_gpu: bool,
     pub(super) fast_batches: Vec<MassSpectrumBatch>,
     pub(super) slow_batches: Vec<MassSpectrumBatch>,
@@ -167,18 +225,16 @@ pub struct ClusterEngine {
 
 impl Default for ClusterEngine {
     fn default() -> Self {
-        let number_of_spectra = 128;
         let hash_size = 800;
         let eps = 0.1;
-        let matrix_size = number_of_spectra * number_of_spectra;
         ClusterEngine {
-            spectral_buffer: vec![0.0; number_of_spectra * hash_size],
-            similarity_matrix_buffer: vec![0.0; matrix_size],
+            spectral_buffer: Vec::new(),
+            similarity_matrix_buffer: Vec::new(),
             epsilon: eps,
             mz_tolerance: MassTolerance::Ppm(20.0),
             batch_size_threshold: FAST_BATCH_NUMBER,
             approximate_threshold: LARGE_BATCH_THRESHOLD,
-            hasher: SpectrumHasher::new(100.0, 1500.0, MassTolerance::Da(0.05), hash_size),
+            hasher: SpectrumHasher::new(101.0, 1500.0, MassTolerance::Da(0.05), hash_size),
             exact: false,
             min_neighbors: MIN_NEIGHBORS,
             use_gpu: false,
@@ -191,6 +247,12 @@ impl Default for ClusterEngine {
 }
 
 impl ClusterEngine {
+    /// Configures the engine to use GPU acceleration if a compatible device is found.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_batch` - The maximum batch size the GPU buffer should allocate for. 
+    ///   Passing `0` will use [`LARGE_BATCH_THRESHOLD`].
     #[cfg(feature = "gpu")]
     pub fn enable_gpu(&mut self, max_batch: usize) {
         let max_m = if max_batch == 0 {
@@ -204,15 +266,26 @@ impl ClusterEngine {
         }
     }
 
+    /// Returns the length of the vectorized hash produced by the internal hasher.
     pub fn hash_size(&self) -> usize {
         self.hasher.hash_len
     }
 
+    /// Updates the hash size and re-initializes the internal lookup tables.
     pub fn set_hash_size(&mut self, hash_len: usize) {
         self.hasher.hash_len = hash_len;
         self.hasher.recalculate_lookup_table();
     }
 
+    /// Partitions and refines a set of spectra into manageable batches for clustering.
+    ///
+    /// This method performs two main steps:
+    /// 1. Coarse grouping by charge and precursor m/z within `mz_tolerance`.
+    /// 2. Refinement of groups into chains where every spectrum is within tolerance 
+    ///     of at least one other.
+    ///
+    /// The resulting batches are sorted into `fast_batches` or `slow_batches` 
+    /// based on their size.
     pub fn split_and_refine_clusters(
         &mut self,
         spectra: &mut [MSNSpectrum],
@@ -287,6 +360,10 @@ impl ClusterEngine {
         Ok(())
     }
 
+    /// Partitions spectra into batches based strictly on charge and precursor m/z tolerance.
+    ///
+    /// This is a simpler alternative to [`split_and_refine_clusters`] that does 
+    /// not perform transitive refinement.
     pub fn split_on_mz_and_charge(
         &mut self,
         spectra: &mut [MSNSpectrum],
@@ -335,6 +412,15 @@ impl ClusterEngine {
         Ok(())
     }
 
+    /// Executes the full clustering workflow on the prepared batches.
+    ///
+    /// This method processes all queued `fast_batches` in parallel and then 
+    /// processes `slow_batches` sequentially, using the best available 
+    /// algorithm for each (Dense DBSCAN, Graph DBSCAN, or GPU-accelerated).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`std::io::Error`] if any internal processing fails.
     pub fn cluster(&mut self) -> Result<FlatClusters, std::io::Error> {
         let mut cluster_assignments: Vec<(usize, u64)> = Vec::new();
         let mut current_clusters_size: usize = 0;
@@ -642,6 +728,10 @@ impl ClusterEngine {
         Ok(FlatClusters { data, offsets })
     }
 
+    /// Internal method to compute DBSCAN labels using a dense similarity matrix.
+    ///
+    /// This method abstracts over different hardware-accelerated backends 
+    /// (Apple BLAS, Generic Parallel BLAS, or GPU).
     fn compute_dense_dbscan(&mut self, n_spectra: usize, hash_size: usize) -> Vec<ClusterLabel> {
         let min_sim = 1.0 - self.epsilon;
 
@@ -705,6 +795,7 @@ impl ClusterEngine {
         }
     }
 
+    /// Computes the similarity matrix for the data currently in the internal `spectral_buffer`.
     fn compute_similarity_matrix_self(&mut self) {
         let hash_size = self.hash_size();
         compute_similarity_matrix(
@@ -714,6 +805,7 @@ impl ClusterEngine {
         );
     }
 
+    /// Computes the similarity matrix for the data in the internal `spectral_buffer` in parallel.
     pub fn compute_similarity_matrix_parallel(&mut self) {
         let hash_size = self.hash_size();
         compute_similarity_matrix_parallel(

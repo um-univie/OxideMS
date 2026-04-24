@@ -1,6 +1,7 @@
+use crate::clustering::cluster::blacklist::{NEG_CONTAMINANTS, POS_CONTAMINANTS};
 use crate::spectrum::{MassSpectralRecord, Peak};
 use crate::struct_with_new;
-use chemistry_consts::NEUTRON_MASS;
+use chemistry_consts::NEUTRON_MASS_AMU as NEUTRON_MASS;
 use rayon::prelude::*;
 
 #[derive(Clone, Copy, Debug)]
@@ -552,5 +553,77 @@ impl SingleOperation for SquareRootTransformIntensity {
             .peaks_mut()
             .iter_mut()
             .for_each(|p| p.intensity = p.intensity.sqrt());
+    }
+}
+
+struct_with_new!(
+    pub struct RemoveCommonContaminants {
+        tolerance: MassTolerance,
+    }
+);
+
+impl SingleOperation for RemoveCommonContaminants {
+    fn operate_single(&self, spectrum: &mut MassSpectralRecord) {
+        if spectrum.peaks().is_empty() {
+            return;
+        }
+
+        let common_contaminants = if spectrum.get_charge() < 0 {
+            NEG_CONTAMINANTS.as_slice()
+        } else if spectrum.get_charge() > 0 {
+            POS_CONTAMINANTS.as_slice()
+        } else {
+            &[]
+        };
+
+        if common_contaminants.is_empty() {
+            return;
+        }
+
+        let mut contaminant_pointer = 0;
+        let mut spectrum_pointer = 0;
+
+        let peaks = spectrum.peaks_mut();
+
+        for read_pointer in 0..peaks.len() {
+            let mz = peaks[read_pointer].mz;
+
+            let (lower_bound, upper_bound) = match self.tolerance {
+                MassTolerance::Da(da) => (mz - da, mz + da),
+                MassTolerance::Ppm(ppm) => {
+                    let delta = mz * (ppm / 1_000_000.0);
+                    (mz - delta, mz + delta)
+                }
+            };
+
+            while contaminant_pointer < common_contaminants.len()
+                && common_contaminants[contaminant_pointer] < lower_bound
+            {
+                contaminant_pointer += 1;
+            }
+
+            let mut is_contaminant = false;
+            let mut search_pointer = contaminant_pointer;
+
+            // Check if any contaminants fall within the tolerance window
+            while search_pointer < common_contaminants.len() {
+                let c_mz = common_contaminants[search_pointer];
+
+                if c_mz <= upper_bound {
+                    is_contaminant = true;
+                    break;
+                } else {
+                    break;
+                }
+            }
+
+            if !is_contaminant {
+                peaks.swap(spectrum_pointer, read_pointer);
+                spectrum_pointer += 1;
+            }
+        }
+
+        peaks.truncate(spectrum_pointer);
+        peaks.sort_by(|peak1, peak2| peak1.mz.total_cmp(&peak2.mz));
     }
 }

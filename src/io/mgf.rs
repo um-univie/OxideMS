@@ -1,3 +1,8 @@
+//! This module provides high-performance parsing and writing of Mascot Generic Format (MGF) files.
+//!
+//! MGF is a plain-text format commonly used in mass spectrometry to store peak lists.
+//! This implementation utilizes memory-mapping and parallel processing for maximum throughput.
+
 use crate::spectrum::{MassSpectralRecord, Peak};
 use compact_str::CompactString;
 use fast_float::parse;
@@ -10,8 +15,11 @@ use std::{
     io::{self, BufWriter, Write},
 };
 
+/// An estimate of the average size (in bytes) of a single MGF spectrum.
+/// Used to pre-allocate memory when memory-mapping files.
 pub const MGF_SPECTRA_SIZE: usize = 5_000;
 
+/// Configuration options for the [`MgfParser`].
 #[derive(Debug, Clone)]
 pub struct MgfParserConfig {
     /// Whether to parse and store `KEY=VALUE` metadata.
@@ -34,12 +42,19 @@ impl Default for MgfParserConfig {
     }
 }
 
+/// A high-performance parser for MGF files.
+///
+/// Uses memory-mapping and optional parallel processing via Rayon to parse mass spectra
+/// quickly and efficiently, minimizing unnecessary allocations.
 pub struct MgfParser {
+    /// The configuration settings used by this parser.
     pub config: MgfParserConfig,
+    /// Tracks the current global spectrum ID across multiple parse calls.
     current_id: usize,
 }
 
 impl Default for MgfParser {
+    /// Creates a new `MgfParser` with default configuration settings.
     fn default() -> Self {
         Self {
             config: MgfParserConfig::default(),
@@ -49,6 +64,11 @@ impl Default for MgfParser {
     }
 }
 impl MgfParser {
+    /// Creates a new `MgfParser` with the specified configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - The parser configuration settings.
     pub fn new(config: MgfParserConfig) -> Self {
         Self {
             config,
@@ -205,7 +225,19 @@ impl MgfParser {
 
     //     Ok(all_spectra)
     // }
-    /// The Memory-Mapped parsing logic
+    /// Parses an MGF file and returns a vector of `MassSpectralRecord`s.
+    ///
+    /// This method uses memory-mapping to map the file into virtual memory,
+    /// identifies block boundaries, and then parses them (potentially in parallel,
+    /// depending on the parser configuration).
+    ///
+    /// # Arguments
+    ///
+    /// * `file_name` - The path to the MGF file.
+    ///
+    /// # Returns
+    ///
+    /// An `io::Result` containing a vector of parsed `MassSpectralRecord`s.
     pub fn parse_file(&mut self, file_name: &str) -> io::Result<Vec<MassSpectralRecord>> {
         let file = File::open(file_name)?;
 
@@ -244,15 +276,21 @@ impl MgfParser {
     }
 }
 
+/// A high-performance writer for MGF files.
+///
+/// Supports both sequential and parallel writing of mass spectra,
+/// serializing them into standard MGF plain-text blocks.
 pub struct MgfWriter;
 
 impl Default for MgfWriter {
+    /// Creates a new `MgfWriter` using default settings.
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl MgfWriter {
+    /// Creates a new `MgfWriter`.
     pub fn new() -> Self {
         Self
     }
@@ -322,6 +360,12 @@ impl MgfWriter {
         Ok(())
     }
 
+    /// Writes a list of spectra to a file in parallel.
+    ///
+    /// # Arguments
+    ///
+    /// * `file_name` - The destination path for the MGF file.
+    /// * `spectra` - A slice of `MassSpectralRecord`s to write.
     pub fn write_parallel_to_file(
         &self,
         file_name: &str,

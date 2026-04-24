@@ -44,6 +44,7 @@ impl SpectralExperiment {
         let min_mz = 200.0;
         workflow.add_operation(FilterMZ::new(min_mz, 1500.0));
         workflow.add_operation(RemovePrecursor::new(MassTolerance::Da(1.5), 0));
+        workflow.add_operation(RemoveCommonContaminants::new(MassTolerance::Ppm(20.0)));
         workflow.add_operation(FilterIntensityRelative::new(0.01));
         workflow.add_operation(SquareRootTransformIntensity::new());
         workflow.add_operation(KeepTopNPeaks::new(50));

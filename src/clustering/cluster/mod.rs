@@ -1,3 +1,4 @@
+pub mod blacklist;
 pub mod dbscan;
 pub mod engine;
 pub mod experiment;
@@ -8,8 +9,8 @@ pub use dbscan::{
     dbscan_upper_triangular, dbscan_upper_triangular_packed, packed_upper_idx,
 };
 pub use engine::{
-    ClusterEngine, MassSpectrumBatch, SpectrumMetadata,
-    fast_dot_product, normalize_spectra_in_place,
+    ClusterEngine, MassSpectrumBatch, SpectrumMetadata, fast_dot_product,
+    normalize_spectra_in_place,
 };
 pub use experiment::{SpectralExperiment, calculate_cluster_recall};
 pub use flat_clusters::{ClusterIter, FlatClusters};
