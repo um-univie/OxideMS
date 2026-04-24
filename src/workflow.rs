@@ -1,7 +1,3 @@
-use crate::clustering::cluster::blacklist::{NEG_CONTAMINANTS, POS_CONTAMINANTS};
-use crate::spectrum::{MassSpectralRecord, Peak};
-use crate::struct_with_new;
-use chemistry_consts::NEUTRON_MASS_AMU as NEUTRON_MASS;
 //! Composable spectrum-processing pipeline.
 //!
 //! Build a [`WorkFlowManager`], push [`Operation`]s onto it in order, then
@@ -29,10 +25,11 @@ use chemistry_consts::NEUTRON_MASS_AMU as NEUTRON_MASS;
 //! assert!((spectra[0].peaks()[0].intensity - 1.0).abs() < 1e-6);
 //! ```
 
+use crate::clustering::cluster::blacklist::{NEG_CONTAMINANTS, POS_CONTAMINANTS};
 use crate::spectrum::{MassSpectralRecord, Peak};
 use crate::struct_with_new;
 use chemistry_consts::ISOTOPES;
-
+use chemistry_consts::NEUTRON_MASS_AMU as NEUTRON_MASS;
 // C13-C12 monoisotopic mass difference: the expected m/z spacing between isotope peaks
 // for organic molecules at charge state z=1. Derived from IUPAC isotope masses.
 const C13_MASS_DIFF: f64 = ISOTOPES[6][1].unwrap().mass - ISOTOPES[6][0].unwrap().mass;

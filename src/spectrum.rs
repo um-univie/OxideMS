@@ -1,7 +1,6 @@
 use crate::{impl_fluent_builder_vanilla, workflow::MassTolerance};
 use chemistry_consts::MONOISOTOPIC_MASSES;
 use compact_str::CompactString;
-// use murmur3::murmur3_32;
 use rkyv::{Archive, Deserialize, Serialize};
 use similarity::{cosine_similarity, euclidean_distance};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -1418,7 +1417,6 @@ impl ArchivedMassSpectrum {
         }
     }
 }
-
 
 /// Represents a mass spectrum as a collection of peaks
 #[derive(Debug, Clone, Serialize, Deserialize, Archive)]
