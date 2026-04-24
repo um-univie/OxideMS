@@ -16,3 +16,4 @@ src/.DS_Store
 *.bib
 *.sh
 .DS_Store
+Cargo.lock

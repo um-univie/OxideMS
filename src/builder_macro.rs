@@ -8,7 +8,6 @@ macro_rules! impl_fluent_builder_vanilla {
     ) => {
         impl $struct_name {
             $(
-                // The method name is exactly the field name
                 pub fn $field(mut self, value: $ftype) -> Self {
                     self.$field = value;
                     self
@@ -31,7 +30,6 @@ macro_rules! struct_with_new {
             ),* $(,)? // Allow an optional trailing comma
         }
     ) => {
-        // 1. Output the exact struct definition as it was passed in
         $(#[$meta])*
         $struct_vis struct $name {
             $(
@@ -39,7 +37,6 @@ macro_rules! struct_with_new {
             )*
         }
 
-        // 2. Generate the `impl` block with the `new` function
         impl $name {
             pub fn new($($field_name : $field_type),*) -> Box<Self> {
                 Box::new(Self {

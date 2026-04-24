@@ -315,6 +315,8 @@ impl SpectralExperiment {
         let mut spectra = self.parser.parse_file(file_path).unwrap();
         self.total_spectra_ingested += spectra.len();
         self.workflow.execute(&mut spectra);
+        let current_index = self.metadata.len();
+
 
         let msn_spectra: Vec<MSNSpectrum> = spectra
             .into_iter()
@@ -326,7 +328,9 @@ impl SpectralExperiment {
                         true
                     }
             })
-            .map(|s| {
+            .enumerate()
+            .map(|(index, mut s)| {
+                s.id = current_index + index;
                 (
                     s.get_metadata("SCANS")
                         .unwrap_or("0")
@@ -336,19 +340,19 @@ impl SpectralExperiment {
                 )
             })
             .inspect(|(scan_number, msn)| {
-                self.metadata.insert(
-                    msn.id as usize,
+                self.metadata.push(
                     SpectrumMetadata {
                         precursor_mz: msn.precursor_mz,
                         retention_time_in_seconds: msn.retention_time_in_seconds,
                         charge: msn.charge(),
                         scan_number: *scan_number,
                         file_index,
-                    },
+                    }
                 );
             })
-            .map(|(_, msn_spectrum)| msn_spectrum)
+            .map(|(_, msn_spectrum)|  msn_spectrum)
             .collect();
+
 
         self.spectra.extend(msn_spectra)
     }
@@ -366,11 +370,8 @@ impl SpectralExperiment {
     }
 
     pub fn prepare_clustering(&mut self) {
-        self.engine
-            .split_on_mz_and_charge(&mut self.spectra)
-            .unwrap();
-        // Drop the spectra
-        let _ = std::mem::take(&mut self.spectra);
+        let spectra = std::mem::take(&mut self.spectra);
+        self.engine.split_on_mz_and_charge(spectra).unwrap();
     }
 
     pub fn cluster(&mut self) -> FlatClusters {
@@ -395,8 +396,7 @@ impl SpectralExperiment {
         }
         let mut file = std::fs::File::create(output_file_name).unwrap();
         let mut writer = std::io::BufWriter::new(&mut file);
-        writer
-            .write(format!("# oxidems\n# eps = {}\n# hash_len = {}\nidentifier,precursor_charge,precursor_mz,retention_time,cluster\n",  self.engine.epsilon, self.engine.hash_size()).as_bytes())
+        writer.write(format!("# RedshiftMS v0.1.0 {}\n# eps = {}\n# hash_len = {}\n# total_spectra_parsed = {}\nidentifier,precursor_charge,precursor_mz,retention_time,cluster\n", if self.engine.exact {"(exact)"} else {""},  self.engine.epsilon, self.engine.hash_size(), self.total_spectra_ingested).as_bytes())
             .unwrap();
         let mut counter = 0;
         for cluster in clusters.iter() {

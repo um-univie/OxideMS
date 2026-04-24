@@ -1,6 +1,6 @@
 [package]
 name = "oxidems_lib"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [dependencies]
@@ -10,7 +10,14 @@ chemistry_consts = "0.2.0"
 rayon = "1.11.0"
 rand = "0.10.0"
 rand_distr = "0.6.0"
-plotters = "0.3.7"
+plotters = { version = "0.3.7", default-features = false, features = [
+    "bitmap_backend",
+    "bitmap_encoder",
+    "svg_backend",
+    "ab_glyph",
+    "all_series",
+    "all_elements"
+] }
 xxhash-rust = {version="0.8.15", features = ["xxh32"]}
 fast-float = "0.2.0"
 memmap2 = "0.9.10"
@@ -22,12 +29,10 @@ faer = { version = "0.24", features = ["nightly", "sparse", "rayon"], default-fe
 burn = {version="0.20.1", features=["train", "wgpu"], optional=true}
 serde_json = {version= "1.0.149", optional = true}
 serde = {version="1.0.228", optional = true}
-
 wgpu = {version="29.0.1", optional = true}
 bytemuck = {version="1.25.0", optional = true}
 pollster = {version="0.4.0", optional = true}
 rkyv = "0.8.16"
-# Add this crate for Matmul/Linear Algebra
 
 
 [dev-dependencies]

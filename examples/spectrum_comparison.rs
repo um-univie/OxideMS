@@ -1,0 +1,78 @@
+use oxidems_lib::{BinnedSpectrumConfig, MassSpectralRecord, SpectrumComparison};
+
+fn main() {
+    let peaks1: Vec<(f32, f32)> = vec![
+        (100.0, 1000.0),
+        (150.0, 500.0),
+        (200.0, 800.0),
+        (250.0, 300.0),
+    ];
+    let peaks2: Vec<(f32, f32)> = vec![
+        (100.2, 950.0),
+        (150.1, 480.0),
+        (200.3, 750.0),
+        (250.1, 280.0),
+    ];
+    let peaks3: Vec<(f32, f32)> = vec![
+        (300.0, 1000.0),
+        (350.0, 600.0),
+        (400.0, 400.0),
+    ];
+
+    let spectrum1 = MassSpectralRecord::from_tuples(&peaks1);
+    let spectrum2 = MassSpectralRecord::from_tuples(&peaks2);
+    let spectrum3 = MassSpectralRecord::from_tuples(&peaks3);
+
+    let fast_config = BinnedSpectrumConfig::fast();
+    let similarity_1_2 =
+        SpectrumComparison::fast_cosine_similarity(&spectrum1, &spectrum2, &fast_config).unwrap();
+    let similarity_1_3 =
+        SpectrumComparison::fast_cosine_similarity(&spectrum1, &spectrum3, &fast_config).unwrap();
+
+    println!("=== Spectrum Comparison ===");
+    println!(
+        "Fast cosine similarity (spectrum1 vs spectrum2): {:.4}",
+        similarity_1_2
+    );
+    println!(
+        "Fast cosine similarity (spectrum1 vs spectrum3): {:.4}",
+        similarity_1_3
+    );
+
+    let precise_similarity_1_2 =
+        SpectrumComparison::precise_peak_similarity(&spectrum1, &spectrum2, 0.5);
+    let precise_similarity_1_3 =
+        SpectrumComparison::precise_peak_similarity(&spectrum1, &spectrum3, 0.5);
+
+    println!(
+        "Precise peak similarity (spectrum1 vs spectrum2): {:.4}",
+        precise_similarity_1_2
+    );
+    println!(
+        "Precise peak similarity (spectrum1 vs spectrum3): {:.4}",
+        precise_similarity_1_3
+    );
+
+    println!("\n=== Speed vs Precision Comparison ===");
+    let precise_config = BinnedSpectrumConfig::precise();
+    let similarity_precise =
+        SpectrumComparison::fast_cosine_similarity(&spectrum1, &spectrum2, &precise_config)
+            .unwrap();
+
+    println!("Fast config similarity:    {:.6}", similarity_1_2);
+    println!("Precise config similarity: {:.6}", similarity_precise);
+    println!("Fast config bin width:    {} Da", fast_config.bin_width);
+    println!("Precise config bin width: {} Da", precise_config.bin_width);
+
+    println!("\n=== Bin Centering Demonstration ===");
+    let default_config = BinnedSpectrumConfig::default();
+    let mixed_peaks: Vec<(f32, f32)> = vec![(100.2, 300.0), (100.3, 700.0)];
+    let mixed_spectrum = MassSpectralRecord::from_tuples(&mixed_peaks);
+    let binned_mixed = mixed_spectrum.to_binned(&default_config);
+
+    let weighted_center = binned_mixed.bin_center(0);
+    let expected_weighted = (100.2 * 300.0 + 100.3 * 700.0) / (300.0 + 700.0);
+    println!("Weighted bin center: {:.3} Da", weighted_center);
+    println!("Expected average:    {:.3} Da", expected_weighted);
+    println!("Total intensity:     {:.0}", binned_mixed.intensities()[0]);
+}
