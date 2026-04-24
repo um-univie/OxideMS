@@ -27,6 +27,7 @@ impl SpectralExperiment {
         let mut workflow = WorkFlowManager::default();
         workflow.add_operation(FilterMZ::new(101.0, 1500.0));
         workflow.add_operation(RemovePrecursor::new(MassTolerance::Da(1.5), 0));
+        workflow.add_operation(RemoveCommonContaminants::new(MassTolerance::Ppm(20.0)));
         workflow.add_operation(FilterIntensityRelative::new(0.01));
         workflow.add_operation(KeepTopNPeaks::new(50));
         workflow.add_operation(MinNumberOfPeaks::new(5));
@@ -46,7 +47,6 @@ impl SpectralExperiment {
         workflow.add_operation(RemovePrecursor::new(MassTolerance::Da(1.5), 0));
         workflow.add_operation(RemoveCommonContaminants::new(MassTolerance::Ppm(20.0)));
         workflow.add_operation(FilterIntensityRelative::new(0.01));
-        workflow.add_operation(SquareRootTransformIntensity::new());
         workflow.add_operation(KeepTopNPeaks::new(50));
         workflow.add_operation(MinNumberOfPeaks::new(5));
         workflow.add_operation(MinMZRangeFilter::new(250.0));
@@ -317,7 +317,6 @@ impl SpectralExperiment {
         self.workflow.execute(&mut spectra);
         let current_index = self.metadata.len();
 
-
         let msn_spectra: Vec<MSNSpectrum> = spectra
             .into_iter()
             .filter(|s| {
@@ -340,19 +339,16 @@ impl SpectralExperiment {
                 )
             })
             .inspect(|(scan_number, msn)| {
-                self.metadata.push(
-                    SpectrumMetadata {
-                        precursor_mz: msn.precursor_mz,
-                        retention_time_in_seconds: msn.retention_time_in_seconds,
-                        charge: msn.charge(),
-                        scan_number: *scan_number,
-                        file_index,
-                    }
-                );
+                self.metadata.push(SpectrumMetadata {
+                    precursor_mz: msn.precursor_mz,
+                    retention_time_in_seconds: msn.retention_time_in_seconds,
+                    charge: msn.charge(),
+                    scan_number: *scan_number,
+                    file_index,
+                });
             })
-            .map(|(_, msn_spectrum)|  msn_spectrum)
+            .map(|(_, msn_spectrum)| msn_spectrum)
             .collect();
-
 
         self.spectra.extend(msn_spectra)
     }
