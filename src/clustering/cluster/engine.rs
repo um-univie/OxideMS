@@ -488,7 +488,7 @@ impl ClusterEngine {
 
         let hash_size = self.hash_size();
         let epsilon = self.epsilon;
-        let mz_tolerance = self.mz_tolerance;
+        let mz_tolerance = self.hasher.tolerance;
         let threshold = 1.0 - epsilon;
 
         let mut fast_batches = std::mem::take(&mut self.fast_batches);
@@ -511,9 +511,11 @@ impl ClusterEngine {
                             let n_spectra = spectra.len();
 
                             if n_spectra == 2 && self.min_neighbors == 2 {
-                                let mut spectrum1 = spectra[0].spectrum.to_soa(mz_tolerance);
+                                let mut spectrum1 =
+                                    spectra[0].spectrum.to_soa(self.hasher.tolerance);
                                 spectrum1.l2_normalize();
-                                let mut spectrum2 = spectra[1].spectrum.to_soa(mz_tolerance);
+                                let mut spectrum2 =
+                                    spectra[1].spectrum.to_soa(self.hasher.tolerance);
                                 spectrum2.l2_normalize();
 
                                 let similarity =
@@ -543,7 +545,7 @@ impl ClusterEngine {
                             bit_matrix_buffer.resize(n_spectra * words_per_vertex, 0);
 
                             for (row_idx, spectrum) in spectra.iter().enumerate() {
-                                let mut soa = spectrum.spectrum.to_soa(mz_tolerance);
+                                let mut soa = spectrum.spectrum.to_soa(self.hasher.tolerance);
                                 soa.l2_normalize();
 
                                 if let Some(&last) = soa.mz_bins.last() {

@@ -49,18 +49,20 @@ use oxidems_lib::{
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let prefix = "tests/".to_string();
-    let folder_name = "PXD023047";
-    // let folder_name = "PXD021518";
+    // let folder_name = "PXD021047";
+    let folder_name = "PXD021518";
     let path = prefix + folder_name;
 
-    let mut spectral_experiment = SpectralExperiment::proteomics();
+    let mut spectral_experiment = SpectralExperiment::default();
     spectral_experiment.engine.exact = true;
 
-    //spectral_experiment.ingest_files_parallel(path.as_str());
-    spectral_experiment.ingest_files(path.as_str());
+    spectral_experiment.ingest_files_parallel(path.as_str());
+    // spectral_experiment.ingest_files(path.as_str());
     spectral_experiment.prepare_clustering();
 
     let clusters = spectral_experiment.cluster();
+
+    spectral_experiment.write_results(&clusters, "redshift.csv");
 
     let mut data: Vec<f64> = clusters
         .iter()
@@ -154,9 +156,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED));
 
     chart
-        .draw_series(data.iter().map(|&x| {
-            PathElement::new(vec![(x, 0.0), (x, 0.02)], &BLACK)
-        }))?
+        .draw_series(
+            data.iter()
+                .map(|&x| PathElement::new(vec![(x, 0.0), (x, 0.02)], &BLACK)),
+        )?
         .label("Data Points")
         .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLACK));
 
