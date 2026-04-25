@@ -41,6 +41,7 @@ use oxidems_lib::clustering::ms_rt::*;
 #[cfg(feature = "plotting")]
 use oxidems_lib::plotting::SpectrumPlotter;
 use oxidems_lib::{
+    set_global_thread_limit,
     BinnedSpectrumConfig, MSNSpectrum, MassSpectralRecord, MassSpectrum, SpectrumComparison,
     clustering::{cluster::ClusterEngine, ms_rt::*},
     io::mgf::{MgfParser, MgfParserConfig},
@@ -51,6 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let prefix = "tests/".to_string();
     // let folder_name = "PXD021047";
     // let folder_name = "PXD021518";
+    set_global_thread_limit(12);
     let folder_name = "PXD000561";
     let path = prefix + folder_name;
 

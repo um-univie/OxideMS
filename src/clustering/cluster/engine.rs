@@ -68,6 +68,7 @@ fn collect_and_refine(
     let mut cluster_count = 0usize;
     let mut sub_data: Vec<usize> = Vec::new();
     let mut sub_offsets: Vec<usize> = Vec::new();
+    let mut cluster_mzs: Vec<f64> = Vec::new();
 
     for group in groups {
         if group.len() <= 1 {
@@ -77,10 +78,8 @@ fn collect_and_refine(
         sub_offsets.clear();
         sub_offsets.push(0);
 
-        let cluster_mzs: Vec<f64> = group
-            .iter()
-            .map(|&i| spectra[i].precursor_mz)
-            .collect();
+        cluster_mzs.clear();
+        cluster_mzs.extend(group.iter().map(|&i| spectra[i].precursor_mz));
 
         FlatClusters::refine_single_cluster(
             &group,
