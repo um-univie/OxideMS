@@ -735,19 +735,19 @@ impl ClusterEngine {
             self.spectral_buffer.fill(0.0);
 
             let hasher = &self.hasher;
-            self.spectral_buffer
-                .par_chunks_exact_mut(hash_size)
-                .zip(spectra.par_iter())
-                .for_each(|(buffer_slice, spectrum)| {
-                    hasher.into_vector_native(
-                        spectrum.spectrum.peaks.as_slice(),
-                        true,
-                        buffer_slice,
-                    );
-                });
-
             let dbscan_labels: Vec<ClusterLabel>;
             if n_spectra > self.approximate_threshold {
+                self.spectral_buffer
+                    .par_chunks_exact_mut(hash_size)
+                    .zip(spectra.par_iter())
+                    .for_each(|(buffer_slice, spectrum)| {
+                        hasher.into_vector_native(
+                            spectrum.spectrum.peaks.as_slice(),
+                            true,
+                            buffer_slice,
+                        );
+                    });
+
                 let index = BucketIndex::build(&self.spectral_buffer, hash_size, 64);
                 let edges = index.extract_edges(64, epsilon);
                 dbscan_labels = graph_dbscan(n_spectra, &edges, epsilon, MIN_NEIGHBORS);
@@ -807,6 +807,16 @@ impl ClusterEngine {
 
                 dbscan_labels = graph_dbscan(n_spectra, &edges, epsilon, MIN_NEIGHBORS);
             } else {
+                self.spectral_buffer
+                    .par_chunks_exact_mut(hash_size)
+                    .zip(spectra.par_iter())
+                    .for_each(|(buffer_slice, spectrum)| {
+                        hasher.into_vector_native(
+                            spectrum.spectrum.peaks.as_slice(),
+                            true,
+                            buffer_slice,
+                        );
+                    });
                 dbscan_labels = self.compute_dense_dbscan(n_spectra, hash_size);
             }
 

@@ -51,6 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let prefix = "tests/".to_string();
     // let folder_name = "PXD021047";
     let folder_name = "PXD021518";
+    // let folder_name = "PXD000561";
     let path = prefix + folder_name;
 
     let mut spectral_experiment = SpectralExperiment::default();
