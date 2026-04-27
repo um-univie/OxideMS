@@ -373,12 +373,13 @@ impl SpectralExperiment {
     pub fn cluster(&mut self) -> FlatClusters {
         let clusters = self.engine.cluster().unwrap();
 
-        let mz_values: Vec<f64> = clusters
-            .data
-            .iter()
-            .map(|id| self.metadata.get(*id).unwrap().precursor_mz)
-            .collect();
-        clusters.refine_mz_clusters(&mz_values, self.engine.mz_tolerance)
+        clusters
+        // let mz_values: Vec<f64> = clusters
+        //     .data
+        //     .iter()
+        //     .map(|id| self.metadata.get(*id).unwrap().precursor_mz)
+        //     .collect();
+        // clusters.refine_mz_clusters(&mz_values, self.engine.mz_tolerance)
     }
 
     pub fn cluster_spectra(&mut self) -> FlatClusters {

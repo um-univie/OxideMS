@@ -38,6 +38,68 @@ unsafe extern "C" {
     );
 }
 
+/// Groups DBSCAN labels by cluster id, refines each group by precursor m/z, and
+/// returns a flat assignment list together with the number of refined clusters produced.
+fn collect_and_refine(
+    dbscan_labels: Vec<ClusterLabel>,
+    spectra: &[MSNSpectrum],
+    mz_tolerance: MassTolerance,
+) -> (Vec<(usize, u64)>, usize) {
+    let max_label = dbscan_labels
+        .iter()
+        .filter_map(|l| {
+            if let ClusterLabel::Cluster(n) = l {
+                Some(n + 1)
+            } else {
+                None
+            }
+        })
+        .max()
+        .unwrap_or(0);
+
+    let mut groups: Vec<Vec<usize>> = vec![Vec::new(); max_label];
+    for (idx, label) in dbscan_labels.into_iter().enumerate() {
+        if let ClusterLabel::Cluster(n) = label {
+            groups[n].push(idx);
+        }
+    }
+
+    let mut assignments: Vec<(usize, u64)> = Vec::new();
+    let mut cluster_count = 0usize;
+    let mut sub_data: Vec<usize> = Vec::new();
+    let mut sub_offsets: Vec<usize> = Vec::new();
+    let mut cluster_mzs: Vec<f64> = Vec::new();
+
+    for group in groups {
+        if group.len() <= 1 {
+            continue;
+        }
+        sub_data.clear();
+        sub_offsets.clear();
+        sub_offsets.push(0);
+
+        cluster_mzs.clear();
+        cluster_mzs.extend(group.iter().map(|&i| spectra[i].precursor_mz));
+
+        FlatClusters::refine_single_cluster(
+            &group,
+            &cluster_mzs,
+            mz_tolerance,
+            &mut sub_data,
+            &mut sub_offsets,
+        );
+
+        for window in sub_offsets.windows(2) {
+            for &batch_idx in &sub_data[window[0]..window[1]] {
+                assignments.push((cluster_count, spectra[batch_idx].id));
+            }
+            cluster_count += 1;
+        }
+    }
+
+    (assignments, cluster_count)
+}
+
 /// Performs in-place L2 normalization on a flattened buffer of spectral vectors.
 ///
 /// Each spectrum is assumed to have a fixed length defined by `stride`.
@@ -489,6 +551,7 @@ impl ClusterEngine {
         let hash_size = self.hash_size();
         let epsilon = self.epsilon;
         let mz_tolerance = self.hasher.tolerance;
+        let precursor_mz_tolerance = self.mz_tolerance;
         let threshold = 1.0 - epsilon;
 
         let mut fast_batches = std::mem::take(&mut self.fast_batches);
@@ -604,18 +667,7 @@ impl ClusterEngine {
                                 words_per_vertex,
                             );
 
-                            let mut local_cluster_assignments = Vec::new();
-                            let mut max_value = 0;
-
-                            for (index, cluster_assignment) in dbscan_labels.into_iter().enumerate()
-                            {
-                                if let ClusterLabel::Cluster(n) = cluster_assignment {
-                                    max_value = max_value.max(n + 1);
-                                    local_cluster_assignments.push((n, spectra[index].id));
-                                }
-                            }
-
-                            (local_cluster_assignments, max_value)
+                            collect_and_refine(dbscan_labels, spectra, precursor_mz_tolerance)
                         },
                     )
                     .collect()
@@ -692,18 +744,7 @@ impl ClusterEngine {
                                 );
                             }
 
-                            let mut local_cluster_assignments = Vec::new();
-                            let mut max_value = 0;
-
-                            for (index, cluster_assignment) in dbscan_labels.into_iter().enumerate()
-                            {
-                                if let ClusterLabel::Cluster(n) = cluster_assignment {
-                                    max_value = max_value.max(n + 1);
-                                    local_cluster_assignments.push((n, spectra[index].id));
-                                }
-                            }
-
-                            (local_cluster_assignments, max_value)
+                            collect_and_refine(dbscan_labels, spectra, precursor_mz_tolerance)
                         },
                     )
                     .collect()
@@ -731,12 +772,12 @@ impl ClusterEngine {
             let spectra = batch.batch.as_slice();
             let n_spectra = spectra.len();
 
-            self.spectral_buffer.resize(n_spectra * hash_size, 0.0);
-            self.spectral_buffer.fill(0.0);
 
             let hasher = &self.hasher;
             let dbscan_labels: Vec<ClusterLabel>;
             if n_spectra > self.approximate_threshold {
+                self.spectral_buffer.resize(n_spectra * hash_size, 0.0);
+                self.spectral_buffer.fill(0.0);
                 self.spectral_buffer
                     .par_chunks_exact_mut(hash_size)
                     .zip(spectra.par_iter())
@@ -747,11 +788,12 @@ impl ClusterEngine {
                             buffer_slice,
                         );
                     });
-
                 let index = BucketIndex::build(&self.spectral_buffer, hash_size, 64);
                 let edges = index.extract_edges(64, epsilon);
                 dbscan_labels = graph_dbscan(n_spectra, &edges, epsilon, MIN_NEIGHBORS);
             } else if self.exact {
+                let start_time = std::time::Instant::now();
+
                 let rows_data: Vec<(usize, Vec<u32>, Vec<f32>)> = spectra
                     .par_iter()
                     .enumerate()
@@ -761,52 +803,84 @@ impl ClusterEngine {
                         (row_idx, soa.mz_bins, soa.intensities)
                     })
                     .collect();
+// 1. Find max_mz to size our inverted index
+let max_mz = rows_data
+    .iter()
+    .flat_map(|(_, mz_bins, _)| mz_bins.iter().copied())
+    .max()
+    .unwrap_or(0) as usize;
 
-                let mut triplets: Vec<Triplet<usize, usize, f32>> = Vec::new();
-                let mut max_mz = 0usize;
-                for (row_idx, mz_bins, intensities) in &rows_data {
-                    for (&col, &val) in mz_bins.iter().zip(intensities.iter()) {
-                        if val.abs() > 1e-6 {
-                            let col = col as usize;
-                            if col > max_mz {
-                                max_mz = col;
+// 2. Build an inverted index: mz_bin -> Vec<(spectrum_idx, intensity)>
+// This is very fast to do sequentially and acts as our "transposed matrix"
+let mut inverted_index: Vec<Vec<(usize, f32)>> = vec![Vec::new(); max_mz + 1];
+for (row_idx, mz_bins, intensities) in &rows_data {
+    for (&mz, &int) in mz_bins.iter().zip(intensities.iter()) {
+        if int.abs() > 1e-6 {
+            inverted_index[mz as usize].push((*row_idx, int));
+        }
+    }
+}
+
+
+let edges: Vec<Edge> = rows_data
+    .par_iter()
+    // map_init gives each Rayon thread its own reusable workspace
+    .map_init(
+        || {
+            // Workspace per thread: 
+            // 1. A dense array to accumulate scores (size = n_spectra)
+            // 2. A list to track which indices we touched so we can reset them quickly
+            (vec![0.0f32; n_spectra], Vec::with_capacity(1024))
+        },
+        |(scores, touched_indices), (row_i, mz_i, int_i)| {
+            
+            // 1. Scatter & Accumulate
+            for (&mz, &int) in mz_i.iter().zip(int_i.iter()) {
+                if int.abs() > 1e-6 {
+                    if let Some(matches) = inverted_index.get(mz as usize) {
+                        for &(row_j, int_j) in matches {
+                            if row_j > *row_i {
+                                if scores[row_j] == 0.0 {
+                                    touched_indices.push(row_j);
+                                }
+                                scores[row_j] += int * int_j;
                             }
-                            triplets.push(Triplet::new(*row_idx, col, val));
                         }
                     }
                 }
+            }
 
-                let a_mat =
-                    SparseRowMat::try_new_from_triplets(n_spectra, max_mz + 1, triplets.as_slice())
-                        .unwrap();
-                let a_col = a_mat.to_col_major().unwrap();
-                let a_ref = a_col.as_ref();
-                let a_transposed = a_mat.transpose();
+            let mut local_edges = Vec::new();
 
-                let sparse_similarity =
-                    sparse_sparse_matmul(a_ref, a_transposed, 1.0, faer::Par::rayon(0)).unwrap();
-                let symbolic = sparse_similarity.symbolic();
-
-                let mut edges: Vec<Edge> = Vec::new();
-                for col in 0..n_spectra {
-                    let col_values = sparse_similarity.val_of_col(col);
-                    let row_indices = symbolic.row_idx_of_col(col);
-                    for (idx, row) in row_indices.enumerate() {
-                        if row < col {
-                            let val = col_values[idx];
-                            if val >= threshold {
-                                edges.push(Edge {
-                                    source_id: row,
-                                    target_id: col,
-                                    score: val,
-                                });
-                            }
-                        }
-                    }
+            // 2. Gather & Reset
+            // We only iterate over the exact indices we modified, 
+            // extracting the results and resetting the array to 0.0 for the next row.
+            for &row_j in touched_indices.iter() {
+                let score = scores[row_j];
+                
+                if score >= threshold {
+                    local_edges.push(Edge {
+                        source_id: *row_i,
+                        target_id: row_j,
+                        score,
+                    });
                 }
+                
+                // Crucial: Reset the dense array back to zero for the next iteration
+                scores[row_j] = 0.0; 
+            }
+            touched_indices.clear(); // Reset the tracker
+
+            local_edges
+        },
+    )
+    .flatten() // Flattens the Vec<Vec<Edge>> from all threads into a single Vec<Edge>
+    .collect();
 
                 dbscan_labels = graph_dbscan(n_spectra, &edges, epsilon, MIN_NEIGHBORS);
             } else {
+                self.spectral_buffer.resize(n_spectra * hash_size, 0.0);
+                self.spectral_buffer.fill(0.0);
                 self.spectral_buffer
                     .par_chunks_exact_mut(hash_size)
                     .zip(spectra.par_iter())
@@ -820,14 +894,13 @@ impl ClusterEngine {
                 dbscan_labels = self.compute_dense_dbscan(n_spectra, hash_size);
             }
 
-            let mut max_value = 0;
-            for (index, cluster_assignment) in dbscan_labels.into_iter().enumerate() {
-                if let ClusterLabel::Cluster(n) = cluster_assignment {
-                    max_value = max_value.max(n + 1);
-                    cluster_assignments.push((current_clusters_size + n, spectra[index].id));
-                }
+            let (local_assignments, local_max) =
+                collect_and_refine(dbscan_labels, spectra, precursor_mz_tolerance);
+            for mut assignment in local_assignments {
+                assignment.0 += current_clusters_size;
+                cluster_assignments.push(assignment);
             }
-            current_clusters_size += max_value;
+            current_clusters_size += local_max;
         }
 
         println!(
