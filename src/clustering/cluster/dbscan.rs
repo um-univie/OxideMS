@@ -83,6 +83,14 @@ impl DSU {
     }
 }
 
+/// Standard DBSCAN clustering on a full (dense) similarity matrix.
+///
+/// Points with fewer than `min_pts` neighbors (similarity ≥ `min_similarity`) are
+/// labelled `Noise`. Remaining unvisited points are seeded as new clusters and expanded
+/// via BFS-like seed-set growth.
+///
+/// Complexity: O(n²) — suitable for small spectra sets. For large datasets use
+/// [`dbscan_bitmatrix`] (bitset version) or [`graph_dbscan`] (index-based version).
 pub fn dbscan(
     similarity_matrix: &[f32],
     num_points: usize,
@@ -149,6 +157,13 @@ pub fn dbscan(
     labels
 }
 
+/// DBSCAN on a full (square) similarity matrix.
+///
+/// Like [`dbscan`] but reads similarities from a row-major square matrix
+/// (`similarity_matrix[p * num_points + q]`). Cluster IDs start at 0.
+///
+/// Use when the matrix was computed as a full `n×n` layout rather than
+/// packed upper-triangular.
 pub fn dbscan_full(
     similarity_matrix: &[f32],
     num_points: usize,
@@ -217,6 +232,14 @@ pub fn dbscan_full(
     labels
 }
 
+/// Single-linkage clustering on an upper-triangular similarity matrix.
+///
+/// No `min_pts` threshold — any pair with similarity ≥ `min_similarity` is merged into
+/// the same cluster via union-find. Singletons (no qualifying neighbor) are labelled
+/// [`ClusterLabel::Noise`].
+///
+/// Reads from a row-major square matrix where only the upper triangle is populated
+/// (`similarity_matrix[i * num_points + j]` for `j ≥ i`).
 pub fn dbscan_single_linkage_upper_triangular(
     similarity_matrix: &[f32],
     num_points: usize,
@@ -280,6 +303,13 @@ pub fn dbscan_single_linkage_upper_triangular(
     labels
 }
 
+/// DBSCAN on an upper-triangular similarity matrix via bitset acceleration.
+///
+/// Converts the float matrix to a parallel bitmatrix (each row stores neighbors as
+/// set bits) then delegates to [`dbscan_bitmatrix`]. Faster than [`dbscan_full`] for
+/// larger point sets because neighbor lookup becomes a bitset iteration.
+///
+/// Reads from a row-major square matrix where only the upper triangle is populated.
 pub fn dbscan_upper_triangular(
     similarity_matrix: &[f32],
     num_points: usize,
@@ -304,6 +334,15 @@ pub fn dbscan_upper_triangular(
     dbscan_bitmatrix(&bit_matrix, num_points, min_pts, words_per_vertex)
 }
 
+/// Core DBSCAN on a precomputed bitmatrix.
+///
+/// `bit_matrix` is a flat array of `num_points * words_per_vertex` words where row `p`
+/// occupies `[p*words_per_vertex .. (p+1)*words_per_vertex]` and bit `q` is set iff
+/// the similarity between `p` and `q` met the threshold.
+///
+/// Neighbor counts use `population_count`; neighbor iteration uses `next_set_bit`.
+/// Called by [`dbscan_upper_triangular`] and [`dbscan_upper_triangular_packed`] after
+/// they build the bitmatrix.
 pub(crate) fn dbscan_bitmatrix(
     bit_matrix: &[usize],
     num_points: usize,

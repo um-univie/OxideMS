@@ -71,7 +71,7 @@ impl SpectralExperiment {
         workflow.add_operation(SquareRootTransformIntensity::new());
         workflow.add_operation(KeepTopNPeaks::new(50));
         workflow.add_operation(MinNumberOfPeaks::new(5));
-        workflow.add_operation(MinMZRangeFilter::new(250.0));
+        workflow.add_operation(MinMZRangeFilter::new(100.0));
 
         Self {
             workflow,

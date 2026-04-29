@@ -1,23 +1,31 @@
+use oxidems_lib::clustering::cluster::SpectralExperiment;
+use oxidems_lib::io::mgf::MgfParser;
+use oxidems_lib::workflow::WorkFlowManager;
 use oxidems_lib::{BinnedSpectrumConfig, MassSpectralRecord, SpectrumComparison};
 
+use oxidems_lib::plotting::SpectrumPlotter;
+
 fn main() {
-    let peaks1: Vec<(f32, f32)> = vec![
+    let mut peaks1: Vec<(f32, f32)> = vec![
+        (75.0, 100.0),
         (100.0, 1000.0),
+        (130.0, 500.0),
         (150.0, 500.0),
         (200.0, 800.0),
         (250.0, 300.0),
     ];
-    let peaks2: Vec<(f32, f32)> = vec![
-        (100.2, 950.0),
+    let mut peaks2: Vec<(f32, f32)> = vec![
+        (100.2, 1000.0),
         (150.1, 480.0),
         (200.3, 750.0),
         (250.1, 280.0),
+        (350.1, 360.0),
     ];
-    let peaks3: Vec<(f32, f32)> = vec![
-        (300.0, 1000.0),
-        (350.0, 600.0),
-        (400.0, 400.0),
-    ];
+
+    peaks1.iter_mut().for_each(|peak| peak.1 /= 1000.0);
+    peaks2.iter_mut().for_each(|peak| peak.1 /= 1000.0);
+
+    let peaks3: Vec<(f32, f32)> = vec![(300.0, 1000.0), (350.0, 600.0), (400.0, 400.0)];
 
     let spectrum1 = MassSpectralRecord::from_tuples(&peaks1);
     let spectrum2 = MassSpectralRecord::from_tuples(&peaks2);
@@ -28,6 +36,19 @@ fn main() {
         SpectrumComparison::fast_cosine_similarity(&spectrum1, &spectrum2, &fast_config).unwrap();
     let similarity_1_3 =
         SpectrumComparison::fast_cosine_similarity(&spectrum1, &spectrum3, &fast_config).unwrap();
+
+    let plotter = SpectrumPlotter::new()
+        .dimensions(1200, 600)
+        .match_tolerance(0.5)
+        .title("Mirror Plot");
+
+    plotter
+        .plot_mirror(
+            &spectrum1.to_mass_spectrum(),
+            &spectrum2.to_mass_spectrum(),
+            "mirror.png",
+        )
+        .unwrap();
 
     println!("=== Spectrum Comparison ===");
     println!(
@@ -75,4 +96,27 @@ fn main() {
     println!("Weighted bin center: {:.3} Da", weighted_center);
     println!("Expected average:    {:.3} Da", expected_weighted);
     println!("Total intensity:     {:.0}", binned_mixed.intensities()[0]);
+
+    let mut experiment = SpectralExperiment::metabolomics();
+    let mut parser = MgfParser::default();
+    let spectra = parser
+        .parse_file("tests/Astral/029_Sa04_Methanol_POS.mgf")
+        .unwrap();
+    let max_spectrum = spectra
+        .into_iter()
+        .max_by(|a, b| a.peaks().len().cmp(&b.peaks().len()))
+        .unwrap();
+
+    let spectrum2 = max_spectrum.clone();
+    let mut spectral_vec = vec![max_spectrum];
+    experiment.workflow.workflow.remove(3);
+    experiment.workflow.workflow.pop();
+    experiment.workflow.execute(&mut spectral_vec);
+    plotter
+        .plot_mirror(
+            &spectral_vec[0].to_mass_spectrum(),
+            &spectrum2.to_mass_spectrum(),
+            "cleanup_mirror.png",
+        )
+        .unwrap();
 }

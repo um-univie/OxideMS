@@ -149,7 +149,7 @@ impl<T: SingleOperation + Sync> Operation for T {
 /// ```
 pub struct WorkFlowManager {
     // Rust requires trait objects to be boxed so their size is known at compile time.
-    workflow: Vec<Box<dyn Operation>>,
+    pub workflow: Vec<Box<dyn Operation>>,
     pub use_parallel: bool,
 }
 

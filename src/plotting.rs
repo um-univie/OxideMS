@@ -65,6 +65,7 @@ pub struct SpectrumPlotter {
     height: u32,
     title: Option<String>,
     show_statistics: bool,
+    normalize: bool,
     match_tolerance: Option<f64>,
     line_width: u32,
 }
@@ -75,6 +76,7 @@ impl Default for SpectrumPlotter {
             width: 1024,
             height: 768,
             line_width: 4,
+            normalize: true,
             title: None,
             show_statistics: false,
             match_tolerance: None,
@@ -171,8 +173,8 @@ impl SpectrumPlotter {
         if ext == "svg" {
             let root = SVGBackend::new(output_path, (self.width, self.height)).into_drawing_area();
             self.draw_mirror_internal(
-                spec_bottom,
                 spec_top,
+                spec_bottom,
                 max_mz,
                 max_int_top,
                 max_int_bot,
@@ -182,8 +184,8 @@ impl SpectrumPlotter {
             let root =
                 BitMapBackend::new(output_path, (self.width, self.height)).into_drawing_area();
             self.draw_mirror_internal(
-                spec_bottom,
                 spec_top,
+                spec_bottom,
                 max_mz,
                 max_int_top,
                 max_int_bot,
@@ -433,7 +435,13 @@ impl SpectrumPlotter {
 
             let similarity = spectrum_bottom
                 .hashed_cosine_similarity(spectrum_top, &DEFAULT_HASHED_CONFIG)
-                .unwrap();
+                .unwrap_or(0.0);
+            area.draw(&Text::new(
+                format!("Cosine sim: {:.3}", similarity),
+                (start_x, start_y + step_y * 4),
+                text_style,
+            ))
+            .map_err(map_err_to_box)?;
         }
 
         chart_area.present().map_err(map_err_to_box)?;
