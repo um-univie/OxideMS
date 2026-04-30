@@ -1,6 +1,6 @@
 use oxidems_lib::clustering::cluster::SpectralExperiment;
 use oxidems_lib::io::mgf::MgfParser;
-use oxidems_lib::workflow::WorkFlowManager;
+use oxidems_lib::workflow::{FilterIntensityRelative, MinMZRangeFilter, WorkFlowManager};
 use oxidems_lib::{BinnedSpectrumConfig, MassSpectralRecord, SpectrumComparison};
 
 use oxidems_lib::plotting::SpectrumPlotter;
@@ -109,8 +109,8 @@ fn main() {
 
     let spectrum2 = max_spectrum.clone();
     let mut spectral_vec = vec![max_spectrum];
-    experiment.workflow.workflow.remove(3);
-    experiment.workflow.workflow.pop();
+    experiment.workflow.remove_operation::<FilterIntensityRelative>();
+    experiment.workflow.remove_operation::<MinMZRangeFilter>();
     experiment.workflow.execute(&mut spectral_vec);
     plotter
         .plot_mirror(

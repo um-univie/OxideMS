@@ -30,6 +30,7 @@ use crate::spectrum::{MassSpectralRecord, Peak};
 use crate::struct_with_new;
 use chemistry_consts::ISOTOPES;
 use chemistry_consts::NEUTRON_MASS_AMU as NEUTRON_MASS;
+use std::any::TypeId;
 // C13-C12 monoisotopic mass difference: the expected m/z spacing between isotope peaks
 // for organic molecules at charge state z=1. Derived from IUPAC isotope masses.
 const C13_MASS_DIFF: f64 = ISOTOPES[6][1].unwrap().mass - ISOTOPES[6][0].unwrap().mass;
@@ -148,8 +149,7 @@ impl<T: SingleOperation + Sync> Operation for T {
 /// assert!((max_intensity - 1.0).abs() < 1e-6);
 /// ```
 pub struct WorkFlowManager {
-    // Rust requires trait objects to be boxed so their size is known at compile time.
-    pub workflow: Vec<Box<dyn Operation>>,
+    workflow: Vec<(TypeId, Box<dyn Operation>)>,
     pub use_parallel: bool,
 }
 
@@ -168,14 +168,54 @@ impl WorkFlowManager {
     }
 
     /// Appends an operation to the end of the pipeline.
-    pub fn add_operation(&mut self, op: Box<dyn Operation>) {
-        self.workflow.push(op);
+    ///
+    /// The concrete type `T` is captured so that [`replace_operation`] and
+    /// [`remove_operation`] can locate the step later by type.
+    pub fn add_operation<T: Operation + 'static>(&mut self, op: Box<T>) {
+        self.workflow.push((TypeId::of::<T>(), op));
+    }
+
+    /// Replaces the step of type `T` with `op`, preserving its position.
+    ///
+    /// Returns `true` if found and replaced, `false` if `T` is not in the pipeline.
+    pub fn replace_operation<T: Operation + 'static>(&mut self, op: Box<T>) -> bool {
+        let target = TypeId::of::<T>();
+        if let Some((_, slot)) = self.workflow.iter_mut().find(|(id, _)| *id == target) {
+            *slot = op;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Removes the step of type `T` from the pipeline.
+    ///
+    /// Returns `true` if found and removed, `false` if `T` is not present.
+    pub fn remove_operation<T: Operation + 'static>(&mut self) -> bool {
+        let target = TypeId::of::<T>();
+        if let Some(i) = self.workflow.iter().position(|(id, _)| *id == target) {
+            self.workflow.remove(i);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns `true` if the pipeline contains a step of type `T`.
+    pub fn has_operation<T: Operation + 'static>(&self) -> bool {
+        let target = TypeId::of::<T>();
+        self.workflow.iter().any(|(id, _)| *id == target)
+    }
+
+    /// Iterates over all operations in pipeline order.
+    pub fn operations(&self) -> impl Iterator<Item = &dyn Operation> {
+        self.workflow.iter().map(|(_, op)| op.as_ref())
     }
 
     /// Runs every operation in the pipeline over `spectra` in order.
     pub fn execute(&self, spectra: &mut [MassSpectralRecord]) {
-        for operation in self.workflow.iter() {
-            operation.operate(spectra, self.use_parallel);
+        for (_, op) in &self.workflow {
+            op.operate(spectra, self.use_parallel);
         }
     }
 }

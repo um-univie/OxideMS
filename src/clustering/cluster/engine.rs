@@ -549,365 +549,330 @@ impl ClusterEngine {
     /// Returns an [`std::io::Error`] if any internal processing fails.
     pub fn cluster(&mut self) -> Result<FlatClusters, std::io::Error> {
         let mut cluster_assignments: Vec<(usize, u64)> = Vec::new();
-        let mut current_clusters_size: usize = 0;
+        let mut cluster_offset = 0usize;
 
-        let hash_size = self.hash_size();
-        let epsilon = self.epsilon;
-        let mz_tolerance = self.hasher.tolerance;
-        let precursor_mz_tolerance = self.mz_tolerance;
-        let threshold = 1.0 - epsilon;
-
-        let mut fast_batches = std::mem::take(&mut self.fast_batches);
-        let start_time = std::time::Instant::now();
+        let start = std::time::Instant::now();
         if self.verbose { println!("Starting fast batch"); }
 
-        if !fast_batches.is_empty() {
-            let hasher = &self.hasher;
-            let batch_results: Vec<_> = if self.exact {
-                fast_batches
-                    .par_iter()
-                    .map_init(
-                        || {
-                            let triplets_buffer: Vec<Triplet<usize, usize, f32>> = Vec::new();
-                            let bit_matrix_buffer: Vec<usize> = Vec::new();
-                            (triplets_buffer, bit_matrix_buffer)
-                        },
-                        |(triplets_buffer, bit_matrix_buffer), batch| {
-                            let spectra = batch.batch.as_slice();
-                            let n_spectra = spectra.len();
+        let fast_batches = std::mem::take(&mut self.fast_batches);
+        let (fast_assignments, fast_count) = self.process_fast_batches(fast_batches);
+        for mut a in fast_assignments {
+            a.0 += cluster_offset;
+            cluster_assignments.push(a);
+        }
+        cluster_offset += fast_count;
 
-                            if n_spectra == 2 && self.min_neighbors == 2 {
-                                let mut spectrum1 =
-                                    spectra[0].spectrum.to_soa(self.hasher.tolerance);
-                                spectrum1.l2_normalize();
-                                let mut spectrum2 =
-                                    spectra[1].spectrum.to_soa(self.hasher.tolerance);
-                                spectrum2.l2_normalize();
+        if self.verbose {
+            println!("Done with fast batch after: {}", start.elapsed().as_secs_f32());
+            println!("Starting slow batch");
+        }
+        let start = std::time::Instant::now();
 
-                                let similarity =
-                                    crate::clustering::similarities::branching_cosine_sim(
-                                        &spectrum1.mz_bins,
-                                        &spectrum1.intensities,
-                                        &spectrum2.mz_bins,
-                                        &spectrum2.intensities,
-                                    );
-                                if similarity >= threshold {
-                                    return (
-                                        vec![(0_usize, spectra[0].id), (0_usize, spectra[1].id)],
-                                        1,
-                                    );
-                                } else {
-                                    return (vec![], 0);
-                                }
-                            }
-
-                            let words_per_vertex = (n_spectra + WORDSIZE - 1) / WORDSIZE;
-
-                            triplets_buffer.clear();
-                            triplets_buffer.reserve(n_spectra * 50);
-                            bit_matrix_buffer.clear();
-                            let mut max_mz = 0;
-
-                            bit_matrix_buffer.resize(n_spectra * words_per_vertex, 0);
-
-                            for (row_idx, spectrum) in spectra.iter().enumerate() {
-                                let mut soa = spectrum.spectrum.to_soa(self.hasher.tolerance);
-                                soa.l2_normalize();
-
-                                if let Some(&last) = soa.mz_bins.last() {
-                                    if last > max_mz {
-                                        max_mz = last;
-                                    }
-                                }
-
-                                triplets_buffer.extend(
-                                    soa.mz_bins
-                                        .iter()
-                                        .zip(&soa.intensities)
-                                        .filter(|(_, v)| v.abs() > 1e-6)
-                                        .map(|(&col, &val)| {
-                                            Triplet::new(row_idx, col as usize, val)
-                                        }),
-                                );
-                            }
-
-                            let a_mat = SparseRowMat::try_new_from_triplets(
-                                n_spectra,
-                                max_mz as usize + 1,
-                                triplets_buffer.as_slice(),
-                            )
-                            .unwrap();
-
-                            let a_col = a_mat.to_col_major().unwrap();
-                            let a_ref = a_col.as_ref();
-                            let a_transposed = a_mat.transpose();
-
-                            let sparse_similarity =
-                                sparse_sparse_matmul(a_ref, a_transposed, 1.0, faer::Par::Seq)
-                                    .unwrap();
-                            let symbolic = sparse_similarity.symbolic();
-
-                            for col in 0..n_spectra {
-                                let col_values = sparse_similarity.val_of_col(col);
-                                let row_indices = symbolic.row_idx_of_col(col);
-                                for (idx, row) in row_indices.enumerate() {
-                                    let val = col_values[idx];
-                                    if val >= threshold {
-                                        bit_matrix_buffer
-                                            [row * words_per_vertex..(row + 1) * words_per_vertex]
-                                            .set_bit(col);
-                                        bit_matrix_buffer
-                                            [col * words_per_vertex..(col + 1) * words_per_vertex]
-                                            .set_bit(row);
-                                    }
-                                }
-                            }
-
-                            let dbscan_labels = dbscan_bitmatrix(
-                                &bit_matrix_buffer,
-                                n_spectra,
-                                MIN_NEIGHBORS,
-                                words_per_vertex,
-                            );
-
-                            collect_and_refine(dbscan_labels, spectra, precursor_mz_tolerance)
-                        },
-                    )
-                    .collect()
-            } else {
-                fast_batches
-                    .par_iter()
-                    .map_init(
-                        || {
-                            let spectral_buffer: Vec<f32> = Vec::new();
-                            let similarity_matrix_buffer: Vec<f32> = Vec::new();
-                            (spectral_buffer, similarity_matrix_buffer)
-                        },
-                        |(spectral_buffer, similarity_matrix_buffer), batch| {
-                            let spectra = batch.batch.as_slice();
-                            let n_spectra = spectra.len();
-
-                            spectral_buffer.resize(n_spectra * hash_size, 0.0);
-                            // This is necessary as we will not override all values
-                            spectral_buffer.fill(0.0);
-
-                            spectral_buffer
-                                .chunks_mut(hash_size)
-                                .zip(spectra.iter())
-                                .for_each(|(buffer_slice, spectrum)| {
-                                    hasher.into_vector_native(
-                                        spectrum.spectrum.peaks.as_slice(),
-                                        true,
-                                        buffer_slice,
-                                    );
-                                });
-
-                            let mut dbscan_labels;
-
-                            #[cfg(all(target_vendor = "apple"))]
-                            {
-                                unsafe {
-                                    similarity_matrix_buffer.resize(n_spectra * n_spectra, 0.0);
-                                    cblas_ssyrk(
-                                        101,
-                                        121,
-                                        111,
-                                        n_spectra as i32,
-                                        hash_size as i32,
-                                        1.0,
-                                        spectral_buffer.as_ptr(),
-                                        hash_size as i32,
-                                        0.0,
-                                        similarity_matrix_buffer.as_mut_ptr(),
-                                        n_spectra as i32,
-                                    );
-                                }
-
-                                dbscan_labels = dbscan_upper_triangular(
-                                    similarity_matrix_buffer,
-                                    n_spectra,
-                                    threshold,
-                                    MIN_NEIGHBORS,
-                                );
-                            }
-
-                            #[cfg(not(all(target_vendor = "apple")))]
-                            {
-                                compute_similarity_matrix(
-                                    similarity_matrix_buffer,
-                                    spectral_buffer,
-                                    hash_size,
-                                );
-
-                                dbscan_labels = dbscan_upper_triangular(
-                                    similarity_matrix_buffer,
-                                    n_spectra,
-                                    threshold,
-                                    MIN_NEIGHBORS,
-                                );
-                            }
-
-                            collect_and_refine(dbscan_labels, spectra, precursor_mz_tolerance)
-                        },
-                    )
-                    .collect()
-            };
-
-            for (local_cluster_assignments, local_max_value) in batch_results {
-                for mut assignment in local_cluster_assignments {
-                    assignment.0 += current_clusters_size;
-                    cluster_assignments.push(assignment);
-                }
-                current_clusters_size += local_max_value;
+        for batch in std::mem::take(&mut self.slow_batches) {
+            let spectra = batch.batch;
+            let (local_assignments, local_max) = self.cluster_slow_batch(&spectra);
+            for mut a in local_assignments {
+                a.0 += cluster_offset;
+                cluster_assignments.push(a);
             }
+            cluster_offset += local_max;
         }
 
         if self.verbose {
-            println!("Done with fast batch after: {}", start_time.elapsed().as_secs_f32());
-            println!("Starting slow batch");
+            println!("Done with slow batch after: {}", start.elapsed().as_secs_f32());
         }
-        let start_time = std::time::Instant::now();
 
-        let slow_batches = std::mem::take(&mut self.slow_batches);
-        for batch in slow_batches.into_iter() {
-            let spectra = batch.batch.as_slice();
-            let n_spectra = spectra.len();
-
-
-            let hasher = &self.hasher;
-            let dbscan_labels: Vec<ClusterLabel>;
-            if n_spectra > self.approximate_threshold {
-                self.spectral_buffer.resize(n_spectra * hash_size, 0.0);
-                self.spectral_buffer.fill(0.0);
-                self.spectral_buffer
-                    .par_chunks_exact_mut(hash_size)
-                    .zip(spectra.par_iter())
-                    .for_each(|(buffer_slice, spectrum)| {
-                        hasher.into_vector_native(
-                            spectrum.spectrum.peaks.as_slice(),
-                            true,
-                            buffer_slice,
-                        );
-                    });
-                let index = BucketIndex::build(&self.spectral_buffer, hash_size, 64);
-                let edges = index.extract_edges(64, epsilon);
-                dbscan_labels = graph_dbscan(n_spectra, &edges, epsilon, MIN_NEIGHBORS);
-            } else if self.exact {
-                let start_time = std::time::Instant::now();
-
-                let rows_data: Vec<(usize, Vec<u32>, Vec<f32>)> = spectra
-                    .par_iter()
-                    .enumerate()
-                    .map(|(row_idx, spectrum)| {
-                        let mut soa = spectrum.spectrum.to_soa(mz_tolerance);
-                        soa.l2_normalize();
-                        (row_idx, soa.mz_bins, soa.intensities)
-                    })
-                    .collect();
-// 1. Find max_mz to size our inverted index
-let max_mz = rows_data
-    .iter()
-    .flat_map(|(_, mz_bins, _)| mz_bins.iter().copied())
-    .max()
-    .unwrap_or(0) as usize;
-
-// 2. Build an inverted index: mz_bin -> Vec<(spectrum_idx, intensity)>
-// This is very fast to do sequentially and acts as our "transposed matrix"
-let mut inverted_index: Vec<Vec<(usize, f32)>> = vec![Vec::new(); max_mz + 1];
-for (row_idx, mz_bins, intensities) in &rows_data {
-    for (&mz, &int) in mz_bins.iter().zip(intensities.iter()) {
-        if int.abs() > 1e-6 {
-            inverted_index[mz as usize].push((*row_idx, int));
-        }
+        Ok(Self::build_flat_clusters(cluster_assignments))
     }
-}
 
+    /// Processes all fast batches in parallel, returning aggregated assignments and cluster count.
+    fn process_fast_batches(
+        &self,
+        batches: Vec<MassSpectrumBatch>,
+    ) -> (Vec<(usize, u64)>, usize) {
+        if batches.is_empty() {
+            return (Vec::new(), 0);
+        }
 
-let edges: Vec<Edge> = rows_data
-    .par_iter()
-    // map_init gives each Rayon thread its own reusable workspace
-    .map_init(
-        || {
-            // Workspace per thread: 
-            // 1. A dense array to accumulate scores (size = n_spectra)
-            // 2. A list to track which indices we touched so we can reset them quickly
-            (vec![0.0f32; n_spectra], Vec::with_capacity(1024))
-        },
-        |(scores, touched_indices), (row_i, mz_i, int_i)| {
-            
-            // 1. Scatter & Accumulate
-            for (&mz, &int) in mz_i.iter().zip(int_i.iter()) {
-                if int.abs() > 1e-6 {
-                    if let Some(matches) = inverted_index.get(mz as usize) {
-                        for &(row_j, int_j) in matches {
-                            if row_j > *row_i {
-                                if scores[row_j] == 0.0 {
-                                    touched_indices.push(row_j);
+        let hash_size = self.hash_size();
+        let threshold = 1.0 - self.epsilon;
+        let precursor_mz_tolerance = self.mz_tolerance;
+        let min_neighbors = self.min_neighbors;
+        let hasher = &self.hasher;
+
+        let batch_results: Vec<_> = if self.exact {
+            batches
+                .par_iter()
+                .map_init(
+                    || (Vec::<Triplet<usize, usize, f32>>::new(), Vec::<usize>::new()),
+                    |(triplets_buffer, bit_matrix_buffer), batch| {
+                        let spectra = batch.batch.as_slice();
+                        let n_spectra = spectra.len();
+
+                        if n_spectra == 2 && min_neighbors == 2 {
+                            let mut s0 = spectra[0].spectrum.to_soa(hasher.tolerance);
+                            s0.l2_normalize();
+                            let mut s1 = spectra[1].spectrum.to_soa(hasher.tolerance);
+                            s1.l2_normalize();
+                            let sim = crate::clustering::similarities::branching_cosine_sim(
+                                &s0.mz_bins, &s0.intensities, &s1.mz_bins, &s1.intensities,
+                            );
+                            return if sim >= threshold {
+                                (vec![(0_usize, spectra[0].id), (0_usize, spectra[1].id)], 1)
+                            } else {
+                                (vec![], 0)
+                            };
+                        }
+
+                        let words_per_vertex = (n_spectra + WORDSIZE - 1) / WORDSIZE;
+                        triplets_buffer.clear();
+                        triplets_buffer.reserve(n_spectra * 50);
+                        bit_matrix_buffer.clear();
+                        bit_matrix_buffer.resize(n_spectra * words_per_vertex, 0);
+
+                        let mut max_mz = 0u32;
+                        for (row_idx, spectrum) in spectra.iter().enumerate() {
+                            let mut soa = spectrum.spectrum.to_soa(hasher.tolerance);
+                            soa.l2_normalize();
+                            if let Some(&last) = soa.mz_bins.last() {
+                                max_mz = max_mz.max(last);
+                            }
+                            triplets_buffer.extend(
+                                soa.mz_bins
+                                    .iter()
+                                    .zip(&soa.intensities)
+                                    .filter(|(_, v)| v.abs() > 1e-6)
+                                    .map(|(&col, &val)| Triplet::new(row_idx, col as usize, val)),
+                            );
+                        }
+
+                        let a_mat = SparseRowMat::try_new_from_triplets(
+                            n_spectra,
+                            max_mz as usize + 1,
+                            triplets_buffer.as_slice(),
+                        )
+                        .unwrap();
+                        let a_col = a_mat.to_col_major().unwrap();
+                        let sparse_sim =
+                            sparse_sparse_matmul(a_col.as_ref(), a_mat.transpose(), 1.0, faer::Par::Seq)
+                                .unwrap();
+                        let symbolic = sparse_sim.symbolic();
+
+                        for col in 0..n_spectra {
+                            for (idx, row) in symbolic.row_idx_of_col(col).enumerate() {
+                                if sparse_sim.val_of_col(col)[idx] >= threshold {
+                                    bit_matrix_buffer
+                                        [row * words_per_vertex..(row + 1) * words_per_vertex]
+                                        .set_bit(col);
+                                    bit_matrix_buffer
+                                        [col * words_per_vertex..(col + 1) * words_per_vertex]
+                                        .set_bit(row);
                                 }
-                                scores[row_j] += int * int_j;
+                            }
+                        }
+
+                        let labels = dbscan_bitmatrix(
+                            &bit_matrix_buffer, n_spectra, MIN_NEIGHBORS, words_per_vertex,
+                        );
+                        collect_and_refine(labels, spectra, precursor_mz_tolerance)
+                    },
+                )
+                .collect()
+        } else {
+            batches
+                .par_iter()
+                .map_init(
+                    || (Vec::<f32>::new(), Vec::<f32>::new()),
+                    |(spectral_buffer, similarity_matrix_buffer), batch| {
+                        let spectra = batch.batch.as_slice();
+                        let n_spectra = spectra.len();
+
+                        spectral_buffer.resize(n_spectra * hash_size, 0.0);
+                        spectral_buffer.fill(0.0);
+                        spectral_buffer
+                            .chunks_mut(hash_size)
+                            .zip(spectra.iter())
+                            .for_each(|(buf, spectrum)| {
+                                hasher.into_vector_native(
+                                    spectrum.spectrum.peaks.as_slice(),
+                                    true,
+                                    buf,
+                                );
+                            });
+
+                        #[cfg(target_vendor = "apple")]
+                        let labels = {
+                            unsafe {
+                                similarity_matrix_buffer.resize(n_spectra * n_spectra, 0.0);
+                                cblas_ssyrk(
+                                    101, 121, 111,
+                                    n_spectra as i32, hash_size as i32,
+                                    1.0, spectral_buffer.as_ptr(), hash_size as i32,
+                                    0.0, similarity_matrix_buffer.as_mut_ptr(), n_spectra as i32,
+                                );
+                            }
+                            dbscan_upper_triangular(
+                                similarity_matrix_buffer, n_spectra, threshold, MIN_NEIGHBORS,
+                            )
+                        };
+
+                        #[cfg(not(target_vendor = "apple"))]
+                        let labels = {
+                            compute_similarity_matrix(
+                                similarity_matrix_buffer, spectral_buffer, hash_size,
+                            );
+                            dbscan_upper_triangular(
+                                similarity_matrix_buffer, n_spectra, threshold, MIN_NEIGHBORS,
+                            )
+                        };
+
+                        collect_and_refine(labels, spectra, precursor_mz_tolerance)
+                    },
+                )
+                .collect()
+        };
+
+        let mut all_assignments = Vec::new();
+        let mut total_count = 0usize;
+        for (local_assignments, local_max) in batch_results {
+            for mut a in local_assignments {
+                a.0 += total_count;
+                all_assignments.push(a);
+            }
+            total_count += local_max;
+        }
+        (all_assignments, total_count)
+    }
+
+    /// Dispatches a single slow batch to the appropriate algorithm and returns
+    /// cluster assignments with the number of clusters produced.
+    fn cluster_slow_batch(
+        &mut self,
+        spectra: &[MSNSpectrum],
+    ) -> (Vec<(usize, u64)>, usize) {
+        let n_spectra = spectra.len();
+        let hash_size = self.hash_size();
+        let epsilon = self.epsilon;
+        let precursor_mz_tolerance = self.mz_tolerance;
+
+        let dbscan_labels = if n_spectra > self.approximate_threshold {
+            self.cluster_approx_graph(spectra, hash_size, epsilon)
+        } else if self.exact {
+            self.cluster_exact_sparse(spectra)
+        } else {
+            let hasher = &self.hasher;
+            self.spectral_buffer.resize(n_spectra * hash_size, 0.0);
+            self.spectral_buffer.fill(0.0);
+            self.spectral_buffer
+                .par_chunks_exact_mut(hash_size)
+                .zip(spectra.par_iter())
+                .for_each(|(buf, spectrum)| {
+                    hasher.into_vector_native(spectrum.spectrum.peaks.as_slice(), true, buf);
+                });
+            self.compute_dense_dbscan(n_spectra, hash_size)
+        };
+
+        collect_and_refine(dbscan_labels, spectra, precursor_mz_tolerance)
+    }
+
+    /// Clusters a large batch using approximate graph-based DBSCAN (BucketIndex).
+    fn cluster_approx_graph(
+        &mut self,
+        spectra: &[MSNSpectrum],
+        hash_size: usize,
+        epsilon: f32,
+    ) -> Vec<ClusterLabel> {
+        let n_spectra = spectra.len();
+        let hasher = &self.hasher;
+        self.spectral_buffer.resize(n_spectra * hash_size, 0.0);
+        self.spectral_buffer.fill(0.0);
+        self.spectral_buffer
+            .par_chunks_exact_mut(hash_size)
+            .zip(spectra.par_iter())
+            .for_each(|(buf, spectrum)| {
+                hasher.into_vector_native(spectrum.spectrum.peaks.as_slice(), true, buf);
+            });
+        let index = BucketIndex::build(&self.spectral_buffer, hash_size, 64);
+        let edges = index.extract_edges(64, epsilon);
+        graph_dbscan(n_spectra, &edges, epsilon, MIN_NEIGHBORS)
+    }
+
+    /// Clusters a batch using exact sparse cosine similarity via an inverted index.
+    fn cluster_exact_sparse(&self, spectra: &[MSNSpectrum]) -> Vec<ClusterLabel> {
+        let n_spectra = spectra.len();
+        let mz_tolerance = self.hasher.tolerance;
+        let threshold = 1.0 - self.epsilon;
+        let epsilon = self.epsilon;
+
+        let rows_data: Vec<(usize, Vec<u32>, Vec<f32>)> = spectra
+            .par_iter()
+            .enumerate()
+            .map(|(row_idx, spectrum)| {
+                let mut soa = spectrum.spectrum.to_soa(mz_tolerance);
+                soa.l2_normalize();
+                (row_idx, soa.mz_bins, soa.intensities)
+            })
+            .collect();
+
+        let max_mz = rows_data
+            .iter()
+            .flat_map(|(_, mz_bins, _)| mz_bins.iter().copied())
+            .max()
+            .unwrap_or(0) as usize;
+
+        let mut inverted_index: Vec<Vec<(usize, f32)>> = vec![Vec::new(); max_mz + 1];
+        for (row_idx, mz_bins, intensities) in &rows_data {
+            for (&mz, &int) in mz_bins.iter().zip(intensities.iter()) {
+                if int.abs() > 1e-6 {
+                    inverted_index[mz as usize].push((*row_idx, int));
+                }
+            }
+        }
+
+        let edges: Vec<Edge> = rows_data
+            .par_iter()
+            .map_init(
+                || (vec![0.0f32; n_spectra], Vec::with_capacity(1024)),
+                |(scores, touched_indices), (row_i, mz_i, int_i)| {
+                    for (&mz, &int) in mz_i.iter().zip(int_i.iter()) {
+                        if int.abs() > 1e-6 {
+                            if let Some(matches) = inverted_index.get(mz as usize) {
+                                for &(row_j, int_j) in matches {
+                                    if row_j > *row_i {
+                                        if scores[row_j] == 0.0 {
+                                            touched_indices.push(row_j);
+                                        }
+                                        scores[row_j] += int * int_j;
+                                    }
+                                }
                             }
                         }
                     }
-                }
-            }
 
-            let mut local_edges = Vec::new();
+                    let local_edges: Vec<Edge> = touched_indices
+                        .iter()
+                        .filter_map(|&row_j| {
+                            let score = scores[row_j];
+                            scores[row_j] = 0.0;
+                            (score >= threshold).then_some(Edge {
+                                source_id: *row_i,
+                                target_id: row_j,
+                                score,
+                            })
+                        })
+                        .collect();
+                    touched_indices.clear();
+                    local_edges
+                },
+            )
+            .flatten()
+            .collect();
 
-            // 2. Gather & Reset
-            // We only iterate over the exact indices we modified, 
-            // extracting the results and resetting the array to 0.0 for the next row.
-            for &row_j in touched_indices.iter() {
-                let score = scores[row_j];
-                
-                if score >= threshold {
-                    local_edges.push(Edge {
-                        source_id: *row_i,
-                        target_id: row_j,
-                        score,
-                    });
-                }
-                
-                // Crucial: Reset the dense array back to zero for the next iteration
-                scores[row_j] = 0.0; 
-            }
-            touched_indices.clear(); // Reset the tracker
+        graph_dbscan(n_spectra, &edges, epsilon, MIN_NEIGHBORS)
+    }
 
-            local_edges
-        },
-    )
-    .flatten() // Flattens the Vec<Vec<Edge>> from all threads into a single Vec<Edge>
-    .collect();
-
-                dbscan_labels = graph_dbscan(n_spectra, &edges, epsilon, MIN_NEIGHBORS);
-            } else {
-                self.spectral_buffer.resize(n_spectra * hash_size, 0.0);
-                self.spectral_buffer.fill(0.0);
-                self.spectral_buffer
-                    .par_chunks_exact_mut(hash_size)
-                    .zip(spectra.par_iter())
-                    .for_each(|(buffer_slice, spectrum)| {
-                        hasher.into_vector_native(
-                            spectrum.spectrum.peaks.as_slice(),
-                            true,
-                            buffer_slice,
-                        );
-                    });
-                dbscan_labels = self.compute_dense_dbscan(n_spectra, hash_size);
-            }
-
-            let (local_assignments, local_max) =
-                collect_and_refine(dbscan_labels, spectra, precursor_mz_tolerance);
-            for mut assignment in local_assignments {
-                assignment.0 += current_clusters_size;
-                cluster_assignments.push(assignment);
-            }
-            current_clusters_size += local_max;
-        }
-
-        if self.verbose {
-            println!("Done with slow batch after: {}", start_time.elapsed().as_secs_f32());
-        }
-
+    /// Sorts cluster assignments and packs them into a [`FlatClusters`].
+    fn build_flat_clusters(mut cluster_assignments: Vec<(usize, u64)>) -> FlatClusters {
         cluster_assignments.par_sort_unstable_by_key(|p| p.0);
         let mut data = Vec::with_capacity(cluster_assignments.len());
         let mut offsets = Vec::with_capacity(cluster_assignments.len() / 5);
@@ -915,7 +880,6 @@ let edges: Vec<Edge> = rows_data
         if !cluster_assignments.is_empty() {
             let mut current_cluster = cluster_assignments[0].0;
             offsets.push(0);
-
             for (cluster_id, spectrum_id) in cluster_assignments {
                 if cluster_id != current_cluster {
                     offsets.push(data.len());
@@ -925,7 +889,7 @@ let edges: Vec<Edge> = rows_data
             }
         }
 
-        Ok(FlatClusters { data, offsets })
+        FlatClusters { data, offsets }
     }
 
     /// Internal method to compute DBSCAN labels using a dense similarity matrix.
