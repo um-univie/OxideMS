@@ -280,6 +280,8 @@ pub struct ClusterEngine {
     pub min_neighbors: usize,
     /// Enable/disable GPU offloading.
     pub use_gpu: bool,
+    /// Print timing and progress information to stdout.
+    pub verbose: bool,
     pub(super) fast_batches: Vec<MassSpectrumBatch>,
     pub(super) slow_batches: Vec<MassSpectrumBatch>,
     #[cfg(feature = "gpu")]
@@ -302,6 +304,7 @@ impl Default for ClusterEngine {
             exact: false,
             min_neighbors: MIN_NEIGHBORS,
             use_gpu: false,
+            verbose: false,
             fast_batches: Vec::new(),
             slow_batches: Vec::new(),
             #[cfg(feature = "gpu")]
@@ -556,7 +559,7 @@ impl ClusterEngine {
 
         let mut fast_batches = std::mem::take(&mut self.fast_batches);
         let start_time = std::time::Instant::now();
-        println!("Starting fast batch");
+        if self.verbose { println!("Starting fast batch"); }
 
         if !fast_batches.is_empty() {
             let hasher = &self.hasher;
@@ -759,12 +762,10 @@ impl ClusterEngine {
             }
         }
 
-        println!(
-            "Done with fast batch after: {}",
-            start_time.elapsed().as_secs_f32()
-        );
-
-        println!("Starting slow batch");
+        if self.verbose {
+            println!("Done with fast batch after: {}", start_time.elapsed().as_secs_f32());
+            println!("Starting slow batch");
+        }
         let start_time = std::time::Instant::now();
 
         let slow_batches = std::mem::take(&mut self.slow_batches);
@@ -903,10 +904,9 @@ let edges: Vec<Edge> = rows_data
             current_clusters_size += local_max;
         }
 
-        println!(
-            "Done with slow batch after: {}",
-            start_time.elapsed().as_secs_f32()
-        );
+        if self.verbose {
+            println!("Done with slow batch after: {}", start_time.elapsed().as_secs_f32());
+        }
 
         cluster_assignments.par_sort_unstable_by_key(|p| p.0);
         let mut data = Vec::with_capacity(cluster_assignments.len());

@@ -34,10 +34,6 @@ pub trait BitSetOpsMSB0 {
     /// `self = self & other`
     fn intersect_inplace(&mut self, other: &Self);
 
-    /// Prints the bitset to stdout as a continuous string of '1's and '0's.
-    /// Includes a visual separator (_) between words (every 64 bits on 64-bit systems).
-    fn print_bits(&self);
-
     fn to_bit_string(&self) -> String;
 }
 
@@ -159,10 +155,6 @@ impl BitSetOpsMSB0 for [usize] {
         }
 
         None
-    }
-
-    fn print_bits(&self) {
-        println!("{}", self.to_bit_string());
     }
 
     /// This function counts the number of set bits (1s) in the bit set (pun intended)

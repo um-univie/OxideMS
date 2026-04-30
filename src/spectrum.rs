@@ -1094,16 +1094,6 @@ mod tests {
         // Expected weighted average: (100.2 * 500 + 100.8 * 1000) / (500 + 1000) = 151900 / 1500 = 100.6
         let expected_weighted = (100.2 * 500.0 + 100.4 * 1000.0) / (500.0 + 1000.0);
 
-        // Debug: check how many bins have intensity
-        let non_empty_bins: Vec<(usize, f32, f64)> = binned_multi
-            .intensities()
-            .iter()
-            .enumerate()
-            .filter(|&(_, intensity)| *intensity > 0.0)
-            .map(|(i, intensity)| (i, *intensity, binned_multi.bin_center(i)))
-            .collect();
-        println!("Debug: non-empty bins: {:?}", non_empty_bins);
-
         assert!(
             (weighted_center_multi - expected_weighted).abs() < 0.001,
             "Weighted center {} should equal calculated average {}",

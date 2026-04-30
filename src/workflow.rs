@@ -221,14 +221,6 @@ impl SingleOperation for Normalize {
     }
 }
 
-/// Cross-spectrum alignment (stub — not yet implemented).
-pub struct AlignSpectra {}
-
-impl Operation for AlignSpectra {
-    fn operate(&self, spectra: &mut [MassSpectralRecord], _use_parallel: bool) {
-        println!("Aligning {} spectra together!", spectra.len());
-    }
-}
 
 struct_with_new!(
     /// Retains only the `n` most intense peaks, then re-sorts the survivors by m/z.
