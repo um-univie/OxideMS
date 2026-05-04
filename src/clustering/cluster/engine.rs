@@ -344,6 +344,16 @@ impl ClusterEngine {
         self.hasher.recalculate_lookup_table();
     }
 
+    /// Updates the hasher m/z range and re-initializes the internal lookup tables.
+    ///
+    /// Must match the `FilterMZ` bounds in the workflow — peaks outside this range
+    /// are clamped to edge bins and will produce incorrect similarity scores.
+    pub fn set_mz_range(&mut self, min_mz: f64, max_mz: f64) {
+        self.hasher.min_mz = min_mz;
+        self.hasher.max_mz = max_mz;
+        self.hasher.recalculate_lookup_table();
+    }
+
     /// Partitions and refines a set of spectra into manageable batches for clustering.
     ///
     /// This method performs two main steps:
@@ -552,7 +562,9 @@ impl ClusterEngine {
         let mut cluster_offset = 0usize;
 
         let start = std::time::Instant::now();
-        if self.verbose { println!("Starting fast batch"); }
+        if self.verbose {
+            println!("Starting fast batch");
+        }
 
         let fast_batches = std::mem::take(&mut self.fast_batches);
         let (fast_assignments, fast_count) = self.process_fast_batches(fast_batches);
@@ -563,7 +575,10 @@ impl ClusterEngine {
         cluster_offset += fast_count;
 
         if self.verbose {
-            println!("Done with fast batch after: {}", start.elapsed().as_secs_f32());
+            println!(
+                "Done with fast batch after: {}",
+                start.elapsed().as_secs_f32()
+            );
             println!("Starting slow batch");
         }
         let start = std::time::Instant::now();
@@ -579,17 +594,17 @@ impl ClusterEngine {
         }
 
         if self.verbose {
-            println!("Done with slow batch after: {}", start.elapsed().as_secs_f32());
+            println!(
+                "Done with slow batch after: {}",
+                start.elapsed().as_secs_f32()
+            );
         }
 
         Ok(Self::build_flat_clusters(cluster_assignments))
     }
 
     /// Processes all fast batches in parallel, returning aggregated assignments and cluster count.
-    fn process_fast_batches(
-        &self,
-        batches: Vec<MassSpectrumBatch>,
-    ) -> (Vec<(usize, u64)>, usize) {
+    fn process_fast_batches(&self, batches: Vec<MassSpectrumBatch>) -> (Vec<(usize, u64)>, usize) {
         if batches.is_empty() {
             return (Vec::new(), 0);
         }
@@ -604,7 +619,12 @@ impl ClusterEngine {
             batches
                 .par_iter()
                 .map_init(
-                    || (Vec::<Triplet<usize, usize, f32>>::new(), Vec::<usize>::new()),
+                    || {
+                        (
+                            Vec::<Triplet<usize, usize, f32>>::new(),
+                            Vec::<usize>::new(),
+                        )
+                    },
                     |(triplets_buffer, bit_matrix_buffer), batch| {
                         let spectra = batch.batch.as_slice();
                         let n_spectra = spectra.len();
@@ -615,7 +635,10 @@ impl ClusterEngine {
                             let mut s1 = spectra[1].spectrum.to_soa(hasher.tolerance);
                             s1.l2_normalize();
                             let sim = crate::clustering::similarities::branching_cosine_sim(
-                                &s0.mz_bins, &s0.intensities, &s1.mz_bins, &s1.intensities,
+                                &s0.mz_bins,
+                                &s0.intensities,
+                                &s1.mz_bins,
+                                &s1.intensities,
                             );
                             return if sim >= threshold {
                                 (vec![(0_usize, spectra[0].id), (0_usize, spectra[1].id)], 1)
@@ -653,9 +676,13 @@ impl ClusterEngine {
                         )
                         .unwrap();
                         let a_col = a_mat.to_col_major().unwrap();
-                        let sparse_sim =
-                            sparse_sparse_matmul(a_col.as_ref(), a_mat.transpose(), 1.0, faer::Par::Seq)
-                                .unwrap();
+                        let sparse_sim = sparse_sparse_matmul(
+                            a_col.as_ref(),
+                            a_mat.transpose(),
+                            1.0,
+                            faer::Par::Seq,
+                        )
+                        .unwrap();
                         let symbolic = sparse_sim.symbolic();
 
                         for col in 0..n_spectra {
@@ -672,7 +699,10 @@ impl ClusterEngine {
                         }
 
                         let labels = dbscan_bitmatrix(
-                            &bit_matrix_buffer, n_spectra, MIN_NEIGHBORS, words_per_vertex,
+                            &bit_matrix_buffer,
+                            n_spectra,
+                            MIN_NEIGHBORS,
+                            words_per_vertex,
                         );
                         collect_and_refine(labels, spectra, precursor_mz_tolerance)
                     },
@@ -705,24 +735,39 @@ impl ClusterEngine {
                             unsafe {
                                 similarity_matrix_buffer.resize(n_spectra * n_spectra, 0.0);
                                 cblas_ssyrk(
-                                    101, 121, 111,
-                                    n_spectra as i32, hash_size as i32,
-                                    1.0, spectral_buffer.as_ptr(), hash_size as i32,
-                                    0.0, similarity_matrix_buffer.as_mut_ptr(), n_spectra as i32,
+                                    101,
+                                    121,
+                                    111,
+                                    n_spectra as i32,
+                                    hash_size as i32,
+                                    1.0,
+                                    spectral_buffer.as_ptr(),
+                                    hash_size as i32,
+                                    0.0,
+                                    similarity_matrix_buffer.as_mut_ptr(),
+                                    n_spectra as i32,
                                 );
                             }
                             dbscan_upper_triangular(
-                                similarity_matrix_buffer, n_spectra, threshold, MIN_NEIGHBORS,
+                                similarity_matrix_buffer,
+                                n_spectra,
+                                threshold,
+                                MIN_NEIGHBORS,
                             )
                         };
 
                         #[cfg(not(target_vendor = "apple"))]
                         let labels = {
                             compute_similarity_matrix(
-                                similarity_matrix_buffer, spectral_buffer, hash_size,
+                                similarity_matrix_buffer,
+                                spectral_buffer,
+                                hash_size,
                             );
                             dbscan_upper_triangular(
-                                similarity_matrix_buffer, n_spectra, threshold, MIN_NEIGHBORS,
+                                similarity_matrix_buffer,
+                                n_spectra,
+                                threshold,
+                                MIN_NEIGHBORS,
                             )
                         };
 
@@ -746,10 +791,7 @@ impl ClusterEngine {
 
     /// Dispatches a single slow batch to the appropriate algorithm and returns
     /// cluster assignments with the number of clusters produced.
-    fn cluster_slow_batch(
-        &mut self,
-        spectra: &[MSNSpectrum],
-    ) -> (Vec<(usize, u64)>, usize) {
+    fn cluster_slow_batch(&mut self, spectra: &[MSNSpectrum]) -> (Vec<(usize, u64)>, usize) {
         let n_spectra = spectra.len();
         let hash_size = self.hash_size();
         let epsilon = self.epsilon;
@@ -887,6 +929,7 @@ impl ClusterEngine {
                 }
                 data.push(spectrum_id as usize);
             }
+            offsets.push(data.len());
         }
 
         FlatClusters { data, offsets }

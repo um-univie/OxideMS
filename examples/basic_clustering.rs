@@ -2,9 +2,7 @@ use oxidems_lib::clustering::cluster::experiment::SpectralExperiment;
 use oxidems_lib::set_global_thread_limit;
 
 fn main() {
-    set_global_thread_limit(12);
-
-    let path = "tests/PXD000561";
+    let path = "tests/Astral";
     let mut spectral_experiment = SpectralExperiment::default();
     spectral_experiment.engine.exact = true;
 

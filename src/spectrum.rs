@@ -30,6 +30,12 @@ pub struct MassSpectralRecord {
     pub metadata: Vec<(CompactString, CompactString)>,
     spectrum: MassSpectrum,
     pub id: usize,
+    /// Byte offset in the source file where this spectrum's block starts.
+    /// Only meaningful when parsed from a file; zero otherwise.
+    pub source_byte_start: u64,
+    /// Byte offset in the source file where this spectrum's block ends.
+    /// Only meaningful when parsed from a file; zero otherwise.
+    pub source_byte_end: u64,
 }
 
 /// Represents a mass spectrum as a collection of peaks
@@ -215,7 +221,9 @@ impl MSNSpectrum {
         self.spectrum.charge
     }
     pub fn get_neutral_mass(&self) -> f64 {
-        (self.precursor_mz - HYDROGEN_MASS) * self.charge() as f64
+        let z = self.charge() as f64;
+
+        (self.precursor_mz * z.abs().max(1.0)) - (HYDROGEN_MASS * z)
     }
 }
 
@@ -534,6 +542,8 @@ impl MassSpectralRecord {
             id,
             spectrum: MassSpectrum { peaks, charge },
             metadata: Vec::new(),
+            source_byte_start: 0,
+            source_byte_end: 0,
         }
     }
 
@@ -547,6 +557,8 @@ impl MassSpectralRecord {
             id: 0,
             spectrum,
             metadata: Vec::new(),
+            source_byte_start: 0,
+            source_byte_end: 0,
         }
     }
 

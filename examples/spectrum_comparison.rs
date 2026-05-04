@@ -109,7 +109,9 @@ fn main() {
 
     let spectrum2 = max_spectrum.clone();
     let mut spectral_vec = vec![max_spectrum];
-    experiment.workflow.remove_operation::<FilterIntensityRelative>();
+    experiment
+        .workflow
+        .remove_operation::<FilterIntensityRelative>();
     experiment.workflow.remove_operation::<MinMZRangeFilter>();
     experiment.workflow.execute(&mut spectral_vec);
     plotter

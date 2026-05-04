@@ -2,6 +2,7 @@ use crate::HashedSpectrumConfig;
 use crate::spectrum::{MSNSpectrum, MassSpectrum, Peak};
 use plotters::prelude::*;
 use plotters::*;
+use std::f64::consts::PI;
 
 use std::error::Error;
 use std::path::Path;
@@ -512,34 +513,94 @@ impl<'a> SpectrumAnalyzer<'a> {
         Ok(())
     }
 
-    /// KDE Plot with dynamic Y-axis
+    // --- Helper Functions for Statistical Analysis ---
+
+    fn calculate_standard_deviation(data: &[f64], mean: f64) -> f64 {
+        let variance = data
+            .iter()
+            .map(|&x| {
+                let diff = x - mean;
+                diff * diff
+            })
+            .sum::<f64>()
+            / (data.len() - 1) as f64;
+        variance.sqrt()
+    }
+
+    fn calculate_silverman_bandwidth(data: &[f64]) -> f64 {
+        let n = data.len() as f64;
+        let mean = data.iter().sum::<f64>() / n;
+        let std_dev = Self::calculate_standard_deviation(data, mean);
+
+        let mut sorted_data = data.to_vec();
+        sorted_data.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+
+        let q1 = sorted_data[data.len() / 4];
+        let q3 = sorted_data[data.len() * 3 / 4];
+        let iqr = q3 - q1;
+
+        // Protection against division by zero or extreme uniformity
+        let min_dispersion = f64::min(std_dev, iqr / 1.34);
+        let a = if min_dispersion > 0.0 {
+            min_dispersion
+        } else {
+            std_dev
+        };
+
+        0.9 * a * n.powf(-0.2)
+    }
+
+    // --- Kernel Functions ---
+
+    fn gaussian_kernel(u: f64) -> f64 {
+        (-0.5 * u * u).exp() / (2.0 * PI).sqrt()
+    }
+
+    fn epanechnikov_kernel(u: f64) -> f64 {
+        if u.abs() <= 1.0 {
+            0.75 * (1.0 - u * u)
+        } else {
+            0.0
+        }
+    }
+
+    // --- Your Plot Function ---
+
     pub fn plot_mz_kde(&self, out_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         let root = BitMapBackend::new(out_path, (1024, 768)).into_drawing_area();
         root.fill(&WHITE)?;
 
         let mzs: Vec<f64> = self.data.iter().map(|s| s.precursor_mz).collect();
-        if mzs.is_empty() {
-            return Ok(());
+        if mzs.len() < 2 {
+            return Ok(()); // Need at least 2 points for density
         }
 
         let min_mz = *mzs.iter().min_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
         let max_mz = *mzs.iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
 
-        let bandwidth = (max_mz - min_mz) / 40.0;
+        // 1. Calculate dynamic bandwidth
+        let bandwidth = Self::calculate_silverman_bandwidth(&mzs);
+        let n_f64 = mzs.len() as f64;
+
         let steps = 400;
         let mut max_density = 0.0;
+
+        // 2. Select your kernel (you can swap this to epanechnikov_kernel)
+        let kernel = Self::epanechnikov_kernel;
 
         let kde_points: Vec<(f64, f64)> = (0..steps)
             .map(|i| {
                 let x = min_mz + (max_mz - min_mz) * (i as f64 / steps as f64);
+
+                // 3. Apply the general KDE formula
                 let density = mzs
                     .iter()
                     .map(|&m| {
-                        let diff = (x - m) / bandwidth;
-                        (-0.5 * diff * diff).exp()
+                        let u = (x - m) / bandwidth;
+                        kernel(u)
                     })
                     .sum::<f64>()
-                    / (mzs.len() as f64 * bandwidth * (2.0 * std::f64::consts::PI).sqrt());
+                    / (n_f64 * bandwidth);
 
                 if density > max_density {
                     max_density = density;

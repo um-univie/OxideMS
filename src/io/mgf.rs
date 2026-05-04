@@ -268,6 +268,11 @@ impl MgfParser {
 
                 let raw_block = &mmap[start_idx..end_idx];
                 self.parse_block_slice(raw_block, record_index as u64 + self.current_id as u64)
+                    .map(|mut s| {
+                        s.source_byte_start = start_idx as u64;
+                        s.source_byte_end = end_idx as u64;
+                        s
+                    })
             })
             .collect();
         self.current_id += spectra.len();

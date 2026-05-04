@@ -939,6 +939,40 @@ impl SingleOperation for SquareRootTransformIntensity {
 }
 
 struct_with_new!(
+    /// Applies a natural-log transform `ln(1 + x)` to all peak intensities.
+    ///
+    /// Compresses dynamic range more aggressively than square-root while avoiding
+    /// `ln(0)` singularities. Useful when intensity distributions are highly skewed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oxidems_lib::MassSpectralRecord;
+    /// use oxidems_lib::workflow::{SingleOperation, LogTransformIntensity};
+    ///
+    /// let mut s = MassSpectralRecord::from_tuples(&[(100.0f32, 0.0), (200.0, (std::f32::consts::E - 1.0))]);
+    /// LogTransformIntensity::new().operate_single(&mut s);
+    ///
+    /// assert!((s.peaks()[0].intensity - 0.0).abs() < 1e-4);
+    /// assert!((s.peaks()[1].intensity - 1.0).abs() < 1e-4);
+    /// ```
+    pub struct LogTransformIntensity {}
+);
+
+impl SingleOperation for LogTransformIntensity {
+    fn operate_single(&self, spectrum: &mut MassSpectralRecord) {
+        if spectrum.peaks().is_empty() {
+            return;
+        }
+
+        spectrum
+            .peaks_mut()
+            .iter_mut()
+            .for_each(|p| p.intensity = (1.0 + p.intensity).ln());
+    }
+}
+
+struct_with_new!(
     pub struct RemoveCommonContaminants {
         tolerance: MassTolerance,
     }

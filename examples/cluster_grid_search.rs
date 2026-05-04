@@ -6,7 +6,7 @@ fn main() {
     let mut spectral_experiment = SpectralExperiment::proteomics();
     spectral_experiment.engine.exact = true;
 
-    let path = "tests/PXD000561";
+    let path = "tests/Astral";
 
     spectral_experiment.ingest_files_parallel(path);
 

@@ -27,7 +27,7 @@ impl SpectralExperiment {
         let mut workflow = WorkFlowManager::default();
         workflow.add_operation(FilterMZ::new(101.0, 1500.0));
         workflow.add_operation(RemovePrecursor::new(MassTolerance::Da(1.5), 0));
-        workflow.add_operation(RemoveCommonContaminants::new(MassTolerance::Ppm(20.0)));
+        // workflow.add_operation(RemoveCommonContaminants::new(MassTolerance::Ppm(20.0)));
         workflow.add_operation(FilterIntensityRelative::new(0.01));
         workflow.add_operation(KeepTopNPeaks::new(50));
         workflow.add_operation(MinNumberOfPeaks::new(5));
@@ -43,7 +43,8 @@ impl SpectralExperiment {
     pub fn proteomics() -> Self {
         let mut workflow = WorkFlowManager::default();
         let min_mz = 200.0;
-        workflow.add_operation(FilterMZ::new(min_mz, 1500.0));
+        let max_mz = 1500.0;
+        workflow.add_operation(FilterMZ::new(min_mz, max_mz));
         workflow.add_operation(RemovePrecursor::new(MassTolerance::Da(1.5), 0));
         workflow.add_operation(RemoveCommonContaminants::new(MassTolerance::Ppm(20.0)));
         workflow.add_operation(FilterIntensityRelative::new(0.01));
@@ -52,11 +53,11 @@ impl SpectralExperiment {
         workflow.add_operation(MinMZRangeFilter::new(250.0));
 
         let mut engine = ClusterEngine::default();
-        engine.hasher.min_mz = min_mz;
+        engine.set_mz_range(min_mz, max_mz);
 
         Self {
             workflow,
-            engine: ClusterEngine::default(),
+            engine,
             parser: MgfParser::default(),
             filter_unknown_charge: true,
             ..Default::default()
@@ -65,7 +66,9 @@ impl SpectralExperiment {
 
     pub fn metabolomics() -> Self {
         let mut workflow = WorkFlowManager::default();
-        workflow.add_operation(FilterMZ::new(50.0, 1500.0));
+        let min_mz = 50.0;
+        let max_mz = 1500.0;
+        workflow.add_operation(FilterMZ::new(min_mz, max_mz));
         workflow.add_operation(RemovePrecursor::new(MassTolerance::Da(1.5), 0));
         workflow.add_operation(FilterIntensityRelative::new(0.01));
         workflow.add_operation(SquareRootTransformIntensity::new());
@@ -73,8 +76,12 @@ impl SpectralExperiment {
         workflow.add_operation(MinNumberOfPeaks::new(5));
         workflow.add_operation(MinMZRangeFilter::new(100.0));
 
+        let mut engine = ClusterEngine::default();
+        engine.set_mz_range(min_mz, max_mz);
+
         Self {
             workflow,
+            engine,
             filter_unknown_charge: true,
             ..Default::default()
         }
@@ -384,6 +391,24 @@ impl SpectralExperiment {
 
     pub fn cluster_spectra(&mut self) -> FlatClusters {
         self.prepare_clustering();
+        println!(
+            "Largest clusters: {:?}",
+            self.engine
+                .fast_batches
+                .iter()
+                .map(|batch| batch.batch.len())
+                .max()
+                .unwrap()
+        );
+        println!(
+            "Largest clusters: {:?}",
+            self.engine
+                .slow_batches
+                .iter()
+                .map(|batch| batch.batch.len())
+                .max()
+                .unwrap()
+        );
         self.cluster()
     }
 
