@@ -162,6 +162,8 @@ fn run_config(
                 .unwrap_or("0")
                 .parse::<usize>()
                 .unwrap_or(0);
+            let source_byte_start = s.source_byte_start;
+            let source_byte_end = s.source_byte_end;
             let msn = s.to_msn();
             all_metadata.push(SpectrumMetadata {
                 precursor_mz: msn.precursor_mz,
@@ -169,6 +171,8 @@ fn run_config(
                 charge: msn.charge(),
                 scan_number,
                 file_index: file_idx,
+                source_byte_start,
+                source_byte_end,
             });
             all_spectra.push(msn);
         }
@@ -200,6 +204,7 @@ fn run_config(
         spectra: all_spectra,
         filter_unknown_charge: false,
         total_spectra_ingested: total_raw,
+        ..Default::default()
     };
 
     let clusters = exp.cluster_spectra();
