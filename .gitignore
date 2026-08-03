@@ -18,3 +18,15 @@ src/.DS_Store
 .DS_Store
 ._*
 Cargo.lock
+
+# publication/ is source, not a build byproduct -- keep its bib/figures
+# despite the blanket *.bib/*.png/*.svg ignores above, but not LaTeX's own
+# generated build junk (.aux/.bcf/.log/.out/.pdf)
+!publication/sources.bib
+!publication/figures/
+!publication/figures/*
+publication/*.aux
+publication/*.bcf
+publication/*.log
+publication/*.out
+publication/*.pdf
