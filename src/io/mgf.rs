@@ -3,13 +3,17 @@
 //! MGF is a plain-text format commonly used in mass spectrometry to store peak lists.
 //! This implementation utilizes memory-mapping and parallel processing for maximum throughput.
 
-use crate::spectrum::{MassSpectralRecord, Peak};
+use crate::spectrum::{MSNSpectrum, MassSpectralRecord, Peak};
+use crate::workflow::WorkFlowManager;
+use rkyv::{Archive, Deserialize, Serialize};
 use compact_str::CompactString;
 use fast_float::parse;
 use memchr::memmem;
 use memmap2::Mmap;
 use rayon::prelude::*;
 use std::fmt::Write as FmtWrite;
+use std::path::Path;
+use std::sync::Mutex;
 use std::{
     fs::File,
     io::{self, BufWriter, Write},
@@ -18,6 +22,36 @@ use std::{
 /// An estimate of the average size (in bytes) of a single MGF spectrum.
 /// Used to pre-allocate memory when memory-mapping files.
 pub const MGF_SPECTRA_SIZE: usize = 5_000;
+
+/// Width (Da) of each mass bucket in [`parse_file_low_mem`](MgfParser::parse_file_low_mem)'s
+/// shard pool. Always 1 Da — many multiples of a typical `mz_tolerance` (20
+/// ppm ~= 0.03 Da at 1500 Da) so a clustering partition's narrow mass window
+/// almost always falls inside a single bucket/shard file, instead of
+/// scattering across every shard the way round-robin-by-parse-order
+/// assignment did. The bucket *range* (min/max Da) is not a fixed constant:
+/// it's passed in per call, derived from the caller's configured mz range
+/// (e.g. `ClusterEngine::hasher`'s `min_mz`/`max_mz` for whichever preset is
+/// in use) — spectra outside that range are filtered out before ingestion
+/// anyway, so sizing the pool past it would only create dead buckets.
+pub const MASS_BUCKET_WIDTH_DA: f64 = 1.0;
+
+/// Number of shards in the mass-bucketed pool for a given `[min_da, max_da)`
+/// range (fixed regardless of corpus size or thread count).
+fn num_mass_buckets(min_da: f64, max_da: f64) -> usize {
+    ((max_da - min_da) / MASS_BUCKET_WIDTH_DA).ceil().max(1.0) as usize
+}
+
+/// Maps a neutral mass to its shard index in the mass-bucketed pool, clamping
+/// out-of-range (including non-finite) masses into the first/last bucket
+/// rather than panicking or growing the pool.
+fn mass_bucket_index(neutral_mass: f64, min_da: f64, max_da: f64) -> usize {
+    let n = num_mass_buckets(min_da, max_da);
+    if !neutral_mass.is_finite() {
+        return n - 1;
+    }
+    let clamped = neutral_mass.clamp(min_da, max_da);
+    (((clamped - min_da) / MASS_BUCKET_WIDTH_DA) as usize).min(n - 1)
+}
 
 /// Configuration options for the [`MgfParser`].
 #[derive(Debug, Clone)]
@@ -42,6 +76,15 @@ impl Default for MgfParserConfig {
     }
 }
 
+/// One persistent shard file in a [`MgfParser`]'s low-mem shard pool: an open,
+/// append-only writer plus the running byte offset new records get appended
+/// at (tracked here rather than via `writer.stream_position()` since writes
+/// go through a `BufWriter`).
+struct ShardSlot {
+    writer: BufWriter<File>,
+    offset: u64,
+}
+
 /// A high-performance parser for MGF files.
 ///
 /// Uses memory-mapping and optional parallel processing via Rayon to parse mass spectra
@@ -51,6 +94,14 @@ pub struct MgfParser {
     pub config: MgfParserConfig,
     /// Tracks the current global spectrum ID across multiple parse calls.
     current_id: usize,
+    /// Session-wide, mass-bucketed shard pool used by
+    /// [`parse_file_low_mem`](Self::parse_file_low_mem), opened lazily on
+    /// first use and reused (appended to) across every subsequent call for
+    /// the life of this parser. Each slot is behind its own `Mutex` since,
+    /// unlike a round-robin pool, which bucket a given spectrum lands in
+    /// depends on its mass, not which parallel task is processing it — two
+    /// tasks can and do target the same bucket concurrently.
+    shard_pool: Option<Vec<Mutex<ShardSlot>>>,
 }
 
 impl Default for MgfParser {
@@ -60,6 +111,7 @@ impl Default for MgfParser {
             config: MgfParserConfig::default(),
 
             current_id: 0,
+            shard_pool: None,
         }
     }
 }
@@ -73,11 +125,16 @@ impl MgfParser {
         Self {
             config,
             current_id: 0,
+            shard_pool: None,
         }
     }
 
     /// Parses a block directly from a string slice. No intermediate allocations.
-    fn parse_block_slice(&self, raw_block: &[u8], index: u64) -> Option<MassSpectralRecord> {
+    ///
+    /// Takes `parse_metadata` explicitly (rather than reading `self.config`) so
+    /// this can be called from contexts that already hold a disjoint mutable
+    /// borrow of another `MgfParser` field (see `parse_file_low_mem`'s shard pool).
+    pub(crate) fn parse_block_slice(raw_block: &[u8], index: u64, parse_metadata: bool) -> Option<MassSpectralRecord> {
         let mut peaks = Vec::with_capacity(100);
         let mut metadata = Vec::with_capacity(10);
         let mut charge = 0;
@@ -108,7 +165,7 @@ impl MgfParser {
                         val_str.parse::<i8>().unwrap()
                     };
 
-                    if self.config.parse_metadata {
+                    if parse_metadata {
                         metadata.push((
                             CompactString::new("CHARGE"),
                             CompactString::new(charge.to_string()),
@@ -117,7 +174,7 @@ impl MgfParser {
                     continue;
                 }
 
-                if self.config.parse_metadata {
+                if parse_metadata {
                     // Only do UTF-8 unchecked conversion when we actually need a String
                     let key_str = unsafe { std::str::from_utf8_unchecked(key) };
                     let val_str = unsafe { std::str::from_utf8_unchecked(val) };
@@ -145,7 +202,7 @@ impl MgfParser {
         } else {
             peaks.shrink_to_fit();
             let mut spec = MassSpectralRecord::new(peaks, charge, index as usize);
-            if self.config.parse_metadata {
+            if parse_metadata {
                 metadata.shrink_to_fit();
                 *spec.metadata_mut() = metadata;
             }
@@ -255,6 +312,8 @@ impl MgfParser {
         }
 
         // 2. Process blocks in parallel
+        let parse_metadata = self.config.parse_metadata;
+        let base_id = self.current_id as u64;
         let spectra: Vec<MassSpectralRecord> = start_indices
             .par_iter()
             .enumerate()
@@ -267,7 +326,7 @@ impl MgfParser {
                     .unwrap_or(mmap.len());
 
                 let raw_block = &mmap[start_idx..end_idx];
-                self.parse_block_slice(raw_block, record_index as u64 + self.current_id as u64)
+                Self::parse_block_slice(raw_block, record_index as u64 + base_id, parse_metadata)
                     .map(|mut s| {
                         s.source_byte_start = start_idx as u64;
                         s.source_byte_end = end_idx as u64;
@@ -279,6 +338,271 @@ impl MgfParser {
 
         Ok(spectra)
     }
+
+    /// Streaming, low-memory variant of [`parse_file`](Self::parse_file).
+    ///
+    /// Instead of collecting every parsed spectrum into one big in-memory
+    /// `Vec` (the normal path's peak RSS, dominated by that `Vec`, scales
+    /// with total dataset size), each parallel worker filters and converts
+    /// its own block to an [`MSNSpectrum`] and immediately serializes it
+    /// (rkyv) to its own shard file under `spill_dir`, retaining only a
+    /// small [`SpillKey`] per spectrum. Peak RSS during parsing is bounded
+    /// by shard count and per-block working memory, not dataset size.
+    ///
+    /// `workflow` and `filter_unknown_charge` are applied per-spectrum here
+    /// (mirroring what [`SpectralExperiment::ingest_file`] does in a batch
+    /// pass after the full parse) so the set of spectra that end up spilled
+    /// matches what normal ingestion would have kept.
+    ///
+    /// Returns `(keys for kept spectra, total blocks that parsed into a
+    /// record before workflow/charge filtering)`. The second element mirrors
+    /// `total_spectra_ingested`'s existing meaning from
+    /// [`SpectralExperiment::ingest_file`] — "how many spectra did we
+    /// attempt", not "how many survived" — matching what `parse_file` would
+    /// have returned via `.len()` before any workflow filtering ran.
+    ///
+    /// Spectrum ids are assigned from parse order (like
+    /// [`parse_file`](Self::parse_file)'s records), *not* renumbered densely
+    /// over kept spectra the way `SpectralExperiment::ingest_file` renumbers
+    /// `MSNSpectrum::id`. `file_index` is stamped into each spilled
+    /// [`LowMemRecord`] instead, so output written from a partition later
+    /// can still resolve which input file a spectrum came from.
+    ///
+    /// `mass_bucket_min_da`/`mass_bucket_max_da` bound the shard pool's mass
+    /// range (bucket width is always [`MASS_BUCKET_WIDTH_DA`]) — pass the
+    /// caller's configured mz range (e.g. `ClusterEngine::hasher`'s
+    /// `min_mz`/`max_mz`) so the pool doesn't allocate shards for mass
+    /// ranges the workflow's own filters would never let through anyway.
+    ///
+    /// [`SpectralExperiment::ingest_file`]: crate::clustering::cluster::experiment::SpectralExperiment::ingest_file
+    pub fn parse_file_low_mem(
+        &mut self,
+        file_name: &str,
+        file_index: usize,
+        spill_dir: &Path,
+        workflow: &WorkFlowManager,
+        filter_unknown_charge: bool,
+        mass_bucket_min_da: f64,
+        mass_bucket_max_da: f64,
+    ) -> io::Result<(Vec<SpillKey>, usize)> {
+        let file = File::open(file_name)?;
+
+        // Map the file into virtual memory
+        let mmap = unsafe { Mmap::map(&file)? };
+
+        let estimated_spectra = mmap.len() / MGF_SPECTRA_SIZE;
+        let mut start_indices = Vec::with_capacity(estimated_spectra);
+
+        let begin_marker = b"BEGIN IONS";
+        for index in memmem::find_iter(&mmap, begin_marker) {
+            start_indices.push(index);
+        }
+
+        std::fs::create_dir_all(spill_dir)?;
+
+        let base_id = self.current_id as u64;
+        let n = start_indices.len();
+        self.current_id += n;
+
+        if self.shard_pool.is_none() {
+            self.shard_pool = Some(Self::open_shard_pool(
+                spill_dir,
+                mass_bucket_min_da,
+                mass_bucket_max_da,
+            )?);
+        }
+        let pool = self.shard_pool.as_ref().unwrap();
+        let parse_metadata = self.config.parse_metadata;
+
+        // Chunking here is purely for parallel load-balancing: unlike the old
+        // round-robin pool, which mass bucket a spectrum lands in has nothing
+        // to do with which chunk it's parsed in, so chunk count is decoupled
+        // from shard count.
+        let num_chunks = (rayon::current_num_threads() * 4).max(1);
+        let chunk_size = n.div_ceil(num_chunks).max(1);
+
+        let shard_results: Vec<io::Result<(Vec<SpillKey>, usize)>> = start_indices
+            .par_chunks(chunk_size)
+            .enumerate()
+            .map(|(chunk_idx, chunk)| -> io::Result<(Vec<SpillKey>, usize)> {
+                let mut shard_keys = Vec::with_capacity(chunk.len());
+                let mut parsed_ok = 0usize;
+                let chunk_start = chunk_idx * chunk_size;
+
+                for (local_i, &start_idx) in chunk.iter().enumerate() {
+                    let global_i = chunk_start + local_i;
+                    let end_idx = start_indices
+                        .get(global_i + 1)
+                        .copied()
+                        .unwrap_or(mmap.len());
+                    let raw_block = &mmap[start_idx..end_idx];
+                    let record_id = base_id + global_i as u64;
+
+                    let Some(mut record) = Self::parse_block_slice(raw_block, record_id, parse_metadata)
+                    else {
+                        continue;
+                    };
+                    // Matches parse_file/ingest_file: total_spectra_ingested
+                    // counts blocks that parsed into a record (>= 1 peak
+                    // line), before workflow/charge filtering runs.
+                    parsed_ok += 1;
+
+                    for op in workflow.operations() {
+                        op.operate(std::slice::from_mut(&mut record), false);
+                    }
+                    if record.peaks().is_empty() {
+                        continue;
+                    }
+                    if filter_unknown_charge && record.get_charge() == 0 {
+                        continue;
+                    }
+
+                    // SCANS is sometimes a range/list (e.g. MSn-to-pseudo-MS2
+                    // spectra merged from several underlying scans, "185-238,
+                    // 737-739,..."), which doesn't parse as a plain integer.
+                    // Falling back to a constant would collapse every such
+                    // spectrum in the file onto the same scan_number, and
+                    // since the output `identifier` column is keyed on
+                    // (file, scan_number), that breaks its per-spectrum
+                    // uniqueness. record_id is already unique per parsed
+                    // block, so it's a safe fallback.
+                    let scan_number = record
+                        .get_metadata("SCANS")
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(record_id as usize);
+                    let msn = record.to_msn();
+                    let neutral_mass = msn.get_neutral_mass();
+                    let low_mem_record = LowMemRecord {
+                        msn,
+                        scan_number,
+                        file_index,
+                    };
+                    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&low_mem_record)
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+                    let shard_idx =
+                        mass_bucket_index(neutral_mass, mass_bucket_min_da, mass_bucket_max_da);
+                    let offset = {
+                        let mut slot = pool[shard_idx].lock().unwrap();
+                        slot.writer.write_all(&(bytes.len() as u32).to_le_bytes())?;
+                        slot.writer.write_all(&bytes)?;
+                        let offset = slot.offset;
+                        slot.offset += 4 + bytes.len() as u64;
+                        offset
+                    };
+
+                    shard_keys.push(SpillKey {
+                        id: low_mem_record.msn.id,
+                        charge: low_mem_record.msn.charge(),
+                        precursor_mz: low_mem_record.msn.precursor_mz,
+                        neutral_mass,
+                        shard: shard_idx as u32,
+                        offset,
+                        len: bytes.len() as u32,
+                    });
+                }
+                Ok((shard_keys, parsed_ok))
+            })
+            .collect();
+
+        // Every bucket's BufWriter must be flushed before finalize_low_mem_partitions
+        // reopens shard files for reading — flush is cheap (userspace buffer
+        // -> OS page cache only), so doing it for the whole pool after every
+        // input file is negligible next to the actual parse/write work.
+        for slot in pool.iter() {
+            slot.lock().unwrap().writer.flush()?;
+        }
+
+        let mut keys = Vec::with_capacity(n);
+        let mut total_parsed = 0usize;
+        for shard_result in shard_results {
+            let (shard_keys, parsed_ok) = shard_result?;
+            keys.extend(shard_keys);
+            total_parsed += parsed_ok;
+        }
+        Ok((keys, total_parsed))
+    }
+
+    /// Opens this parser's low-mem shard pool: a small, fixed number of
+    /// `shard_{idx:06}.bin` files under `spill_dir`, created once and then
+    /// reused (appended to) by every subsequent [`parse_file_low_mem`](Self::parse_file_low_mem)
+    /// call for the life of this parser.
+    ///
+    /// Shard count first scaled with `rayon::current_num_threads() * 4`
+    /// *per file*, with a globally-incrementing id so no two files ever
+    /// shared a shard — total shard files scaled with the number of input
+    /// files (a 3,721-file corpus produced ~315,000 shard files, almost all
+    /// tiny). A fixed session-wide pool with round-robin-by-parse-order
+    /// assignment fixed that (shard count constant regardless of corpus
+    /// size), but left every shard's contents an unbiased sample of the
+    /// whole mass range — so `finalize_low_mem_partitions`, which reads
+    /// records back out sorted by mass, still had to touch nearly every
+    /// shard for nearly every partition once shard count dropped from
+    /// hundreds of thousands to a few dozen. On an HDD (seek-dominated
+    /// random reads) this stalled at corpus scale even though it looked fine
+    /// on a page-cache-sized subset.
+    ///
+    /// This pool instead assigns each spectrum to a shard by its
+    /// [`mass_bucket_index`] (a fixed-width, 1 Da mass bucket — see
+    /// [`MASS_BUCKET_WIDTH_DA`]), so a clustering partition's narrow mass
+    /// window almost always maps to a single shard instead of all of them.
+    /// `min_da`/`max_da` bound the range (see `parse_file_low_mem`'s docs) —
+    /// independent of both corpus size and thread count, and small as long as
+    /// the caller's mz range is reasonably tight, which keeps total shard
+    /// count bounded while still giving each partition read locality.
+    /// Because bucket assignment depends on a spectrum's mass rather than
+    /// which parallel chunk parsed it, two threads can target the same shard
+    /// concurrently, so each slot is individually `Mutex`-guarded rather than
+    /// exclusively owned per task.
+    fn open_shard_pool(spill_dir: &Path, min_da: f64, max_da: f64) -> io::Result<Vec<Mutex<ShardSlot>>> {
+        let num_shards = num_mass_buckets(min_da, max_da);
+        (0..num_shards)
+            .map(|shard_idx| -> io::Result<Mutex<ShardSlot>> {
+                let shard_path = spill_dir.join(format!("shard_{shard_idx:06}.bin"));
+                Ok(Mutex::new(ShardSlot {
+                    writer: BufWriter::new(File::create(&shard_path)?),
+                    offset: 0,
+                }))
+            })
+            .collect()
+    }
+}
+
+/// A lightweight per-spectrum key produced by [`MgfParser::parse_file_low_mem`]:
+/// enough to decide m/z/charge partition membership (via
+/// [`crate::clustering::cluster::mz_partition::mz_charge_boundaries`])
+/// without needing the spectrum's peak data resident in memory. The full
+/// record lives in `spill_dir/shard_{shard:06}.bin`, as a `u32` little-endian
+/// length prefix followed by that many bytes of rkyv-serialized
+/// [`LowMemRecord`], starting at byte `offset` in that file. `shard` indexes
+/// a small, fixed, session-wide, mass-bucketed pool (see
+/// `MgfParser::open_shard_pool`) that every ingested file appends its
+/// records into — unlike a per-file shard id, the same `shard` value is
+/// shared across many different input files (and, since assignment is by
+/// mass rather than by file, records from the same file usually end up
+/// scattered across several shards), which is fine since `offset` still
+/// pins each record to its own bytes.
+#[derive(Clone, Copy, Debug)]
+pub struct SpillKey {
+    pub id: u64,
+    pub charge: i8,
+    pub precursor_mz: f64,
+    pub neutral_mass: f64,
+    pub shard: u32,
+    pub offset: u64,
+    pub len: u32,
+}
+
+/// What actually gets serialized to a shard/partition file: an `MSNSpectrum`
+/// plus the two extra fields normal ingestion tracks in
+/// `SpectralExperiment::metadata` (`scan_number`, `file_index`) but which
+/// have no dense-id-indexed table to live in on the low-mem path — so they
+/// travel with the record itself instead.
+#[derive(Clone, Debug, Archive, Serialize, Deserialize)]
+pub struct LowMemRecord {
+    pub msn: MSNSpectrum,
+    pub scan_number: usize,
+    pub file_index: usize,
 }
 
 /// A high-performance writer for MGF files.

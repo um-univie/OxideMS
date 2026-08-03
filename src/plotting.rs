@@ -1,4 +1,5 @@
 use crate::HashedSpectrumConfig;
+use crate::clustering::cluster::ClusterQualityMetrics;
 use crate::spectrum::{MSNSpectrum, MassSpectrum, Peak};
 use plotters::prelude::*;
 use plotters::*;
@@ -1201,6 +1202,172 @@ impl<'a> SpectrumAnalyzer<'a> {
 
             Circle::new((*rt, *mass), 2, color.filled())
         }))?;
+
+        root.present()?;
+        Ok(())
+    }
+}
+
+/// Plots distributions of per-cluster internal-validation quality metrics
+/// (see [`ClusterQualityMetrics`]).
+pub struct ClusterQualityAnalyzer<'a> {
+    data: &'a [ClusterQualityMetrics],
+}
+
+impl<'a> ClusterQualityAnalyzer<'a> {
+    pub fn new(data: &'a [ClusterQualityMetrics]) -> Self {
+        Self { data }
+    }
+
+    const CAPTION_FONT: (&'static str, u32) = ("sans-serif", 26);
+    const LABEL_FONT: (&'static str, u32) = ("sans-serif", 18);
+    const TICK_FONT: (&'static str, u32) = ("sans-serif", 14);
+
+    /// Buckets `values` (assumed within `[min, max]`) into `bins` equal-width
+    /// buckets, returning `(bucket_start, bucket_end, count)` triples.
+    fn float_histogram(values: &[f64], bins: usize, min: f64, max: f64) -> Vec<(f64, f64, u32)> {
+        let width = (max - min) / bins as f64;
+        let mut counts = vec![0u32; bins];
+        for &v in values {
+            let idx = (((v - min) / width) as usize).min(bins - 1);
+            counts[idx] += 1;
+        }
+        counts
+            .into_iter()
+            .enumerate()
+            .map(|(i, c)| (min + i as f64 * width, min + (i + 1) as f64 * width, c))
+            .collect()
+    }
+
+    fn draw_float_histogram(
+        area: &DrawingArea<BitMapBackend, plotters::coord::Shift>,
+        caption: &str,
+        x_desc: &str,
+        values: &[f64],
+        color: RGBColor,
+    ) -> Result<(), Box<dyn Error>> {
+        let bins = Self::float_histogram(values, 25, 0.0, 1.0);
+        let max_freq = bins.iter().map(|b| b.2).max().unwrap_or(1);
+
+        let mut chart = ChartBuilder::on(area)
+            .caption(caption, Self::CAPTION_FONT)
+            .margin(15)
+            .x_label_area_size(50)
+            .y_label_area_size(60)
+            .build_cartesian_2d(0.0..1.0, 0u32..(max_freq + max_freq / 10 + 1))?;
+
+        chart
+            .configure_mesh()
+            .disable_mesh()
+            .x_desc(x_desc)
+            .y_desc("# clusters")
+            .axis_desc_style(Self::LABEL_FONT)
+            .label_style(Self::TICK_FONT)
+            .draw()?;
+
+        chart.draw_series(
+            bins.iter()
+                .map(|&(x0, x1, c)| Rectangle::new([(x0, 0), (x1, c)], color.mix(0.6).filled())),
+        )?;
+        Ok(())
+    }
+
+    /// Plots a 2x2 overview: avg-cohesion distribution, min-cohesion (worst-case)
+    /// distribution, cluster size distribution, and a scatter of size vs avg cohesion.
+    pub fn plot_quality_overview(&self, out_path: &str) -> Result<(), Box<dyn Error>> {
+        let root = BitMapBackend::new(out_path, (1400, 1000)).into_drawing_area();
+        root.fill(&WHITE)?;
+
+        if self.data.is_empty() {
+            return Ok(());
+        }
+
+        let panels = root.split_evenly((2, 2));
+
+        let avg_vals: Vec<f64> = self.data.iter().map(|m| m.avg_cohesion).collect();
+        let min_vals: Vec<f64> = self.data.iter().map(|m| m.min_cohesion).collect();
+        let sizes: Vec<u64> = self.data.iter().map(|m| m.size as u64).collect();
+
+        Self::draw_float_histogram(
+            &panels[0],
+            "Avg. Cohesion (mean similarity to consensus)",
+            "Avg cohesion",
+            &avg_vals,
+            CYAN,
+        )?;
+
+        Self::draw_float_histogram(
+            &panels[1],
+            "Min. Cohesion (worst-case similarity to consensus)",
+            "Min cohesion",
+            &min_vals,
+            MAGENTA,
+        )?;
+
+        // Panel 3: cluster size histogram
+        {
+            let max_val = *sizes.iter().max().unwrap_or(&1);
+            let bin_count = 20u64;
+            let bin_size = (max_val / bin_count).max(1);
+
+            let mut bins = vec![0u32; (bin_count + 1) as usize];
+            for &s in &sizes {
+                let idx = (s / bin_size) as usize;
+                if idx < bins.len() {
+                    bins[idx] += 1;
+                }
+            }
+            let max_freq = *bins.iter().max().unwrap_or(&1);
+
+            let mut chart = ChartBuilder::on(&panels[2])
+                .caption("Cluster Size Distribution", Self::CAPTION_FONT)
+                .margin(15)
+                .x_label_area_size(50)
+                .y_label_area_size(60)
+                .build_cartesian_2d(0..max_val, 0..(max_freq + (max_freq / 10) + 1))?;
+
+            chart
+                .configure_mesh()
+                .disable_mesh()
+                .x_desc("Cluster size (# spectra)")
+                .y_desc("# clusters")
+                .axis_desc_style(Self::LABEL_FONT)
+                .label_style(Self::TICK_FONT)
+                .draw()?;
+
+            chart.draw_series(
+                Histogram::vertical(&chart)
+                    .style(GREEN.mix(0.6).filled())
+                    .data(sizes.iter().map(|&s| (s, 1))),
+            )?;
+        }
+
+        // Panel 4: scatter of cluster size vs avg cohesion
+        {
+            let max_size = *sizes.iter().max().unwrap_or(&1);
+
+            let mut chart = ChartBuilder::on(&panels[3])
+                .caption("Cluster Size vs Avg Cohesion", Self::CAPTION_FONT)
+                .margin(15)
+                .x_label_area_size(50)
+                .y_label_area_size(60)
+                .build_cartesian_2d(0u64..(max_size + 1), 0.0..1.0)?;
+
+            chart
+                .configure_mesh()
+                .disable_mesh()
+                .x_desc("Cluster size (# spectra)")
+                .y_desc("Avg cohesion")
+                .axis_desc_style(Self::LABEL_FONT)
+                .label_style(Self::TICK_FONT)
+                .draw()?;
+
+            chart.draw_series(
+                self.data
+                    .iter()
+                    .map(|m| Circle::new((m.size as u64, m.avg_cohesion), 3, BLUE.mix(0.4).filled())),
+            )?;
+        }
 
         root.present()?;
         Ok(())

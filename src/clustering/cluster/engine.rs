@@ -2,11 +2,12 @@ use super::dbscan::{
     ClusterLabel, dbscan_bitmatrix, dbscan_upper_triangular, dbscan_upper_triangular_packed,
 };
 use super::flat_clusters::FlatClusters;
+use super::mz_partition::mz_charge_boundaries;
 use crate::{
     MSNSpectrum, SpectrumHasher,
     clustering::{
         bitset::{BitSetOpsMSB0, WORDSIZE},
-        k_cluster_ivf::{BucketIndex, Edge, graph_dbscan},
+        k_cluster_ivf::{Edge, WINDOWED_EDGES_BLOCK_SIZE, graph_dbscan, windowed_mass_edges},
     },
     workflow::MassTolerance,
 };
@@ -246,6 +247,13 @@ pub struct SpectrumMetadata {
     pub scan_number: usize,
     /// The charge state of the precursor ion.
     pub charge: i8,
+    /// Byte offset in the source file where this spectrum's block starts.
+    /// Lets [`crate::clustering::cluster::experiment::SpectralExperiment::build_consensus_spectrum`]
+    /// reparse just this spectrum's peaks on demand, without keeping every
+    /// spectrum's peaks resident in RAM for the life of the run.
+    pub source_byte_start: u64,
+    /// Byte offset in the source file where this spectrum's block ends.
+    pub source_byte_end: u64,
 }
 
 /// The main engine for orchestrating large-scale spectral clustering.
@@ -455,29 +463,12 @@ impl ClusterEngine {
         let mut slow_batches = Vec::new();
 
         // Read-only pass: record where each mz/charge group starts.
-        let n = spectra.len();
-        let mut boundaries: Vec<usize> = vec![0];
-        for i in 1..n {
-            let a = &spectra[i - 1];
-            let b = &spectra[i];
-            let same_group = if a.charge() != b.charge() {
-                false
-            } else {
-                let m_a = a.get_neutral_mass();
-                let m_b = b.get_neutral_mass();
-                let gap = (m_b - m_a).abs();
-                match self.mz_tolerance {
-                    MassTolerance::Da(tol) => gap <= tol,
-                    MassTolerance::Ppm(tol) => gap <= m_b * (tol / 1_000_000.0),
-                }
-            };
-            if !same_group {
-                boundaries.push(i);
-            }
-        }
-        if n > 0 {
-            boundaries.push(n);
-        }
+        let boundaries = mz_charge_boundaries(
+            &spectra,
+            |s: &MSNSpectrum| s.charge(),
+            |s: &MSNSpectrum| s.get_neutral_mass(),
+            self.mz_tolerance,
+        );
 
         let rt_tolerance = self.rt_tolerance;
         let batch_size_threshold = self.batch_size_threshold;
@@ -817,7 +808,20 @@ impl ClusterEngine {
         collect_and_refine(dbscan_labels, spectra, precursor_mz_tolerance)
     }
 
-    /// Clusters a large batch using approximate graph-based DBSCAN (BucketIndex).
+    /// Clusters a large batch using windowed mass-bounded graph DBSCAN.
+    ///
+    /// `spectra` arrives already sorted by `(charge, precursor_mz)` — same
+    /// charge throughout a batch (batches are split on charge first), and
+    /// `precursor_mz` order matches `neutral_mass` order for a fixed charge —
+    /// so [`windowed_mass_edges`] can exploit that sortedness directly
+    /// instead of routing through an approximate ANN index. See that
+    /// function's docs for why: this "large batch" path exists specifically
+    /// because chaining in `split_on_mz_and_charge`'s partitioning can make
+    /// a batch span a much wider mass range than `mz_tolerance` would ever
+    /// actually link, and mass being an exact, pre-sorted range constraint
+    /// (not a generic high-dimensional nearest-neighbor problem) means a
+    /// sliding window over that sort order is both cheaper and exact, where
+    /// IVF/k-means was neither.
     fn cluster_approx_graph(
         &mut self,
         spectra: &[MSNSpectrum],
@@ -834,8 +838,21 @@ impl ClusterEngine {
             .for_each(|(buf, spectrum)| {
                 hasher.into_vector_native(spectrum.spectrum.peaks.as_slice(), true, buf);
             });
-        let index = BucketIndex::build(&self.spectral_buffer, hash_size, 64);
-        let edges = index.extract_edges(64, epsilon);
+        let neutral_masses: Vec<f64> = spectra.iter().map(|s| s.get_neutral_mass()).collect();
+        let edges = windowed_mass_edges(
+            &self.spectral_buffer,
+            hash_size,
+            &neutral_masses,
+            self.mz_tolerance,
+            epsilon,
+            WINDOWED_EDGES_BLOCK_SIZE,
+            // Reuses the same "how big before we need approximate search"
+            // threshold that decides dense-vs-this-path in the first place:
+            // a block whose candidate window is itself this large is a
+            // genuinely dense local neighborhood (not chaining), which is
+            // exactly the ANN problem IVF exists for.
+            self.approximate_threshold,
+        );
         graph_dbscan(n_spectra, &edges, epsilon, MIN_NEIGHBORS)
     }
 

@@ -15,17 +15,17 @@ xxhash-rust = {version="0.8.15", features = ["xxh32"]}
 fast-float = "0.2.0"
 memmap2 = "0.9.10"
 memchr = "2.8.0"
+quick-xml = "0.36"
+base64 = "0.22"
+bytemuck = "1.25.0"
 compact_str = "0.9.0"
 itertools = "0.14.0"
 faer = { version = "0.24", features = ["nightly", "sparse", "rayon"], default-features = false }
 
-burn = {version="0.20.1", features=["train", "wgpu"], optional=true}
-serde_json = {version= "1.0.149", optional = true}
-serde = {version="1.0.228", optional = true}
 wgpu = {version="29.0.1", optional = true}
-bytemuck = {version="1.25.0", optional = true}
 pollster = {version="0.4.0", optional = true}
 rkyv = "0.8.16"
+libdeflater = "1.25.2"
 
 
 [dev-dependencies]
@@ -33,10 +33,11 @@ criterion = "0.8.2"
 pollster = "0.4.0"
 wgpu = "29.0.1"
 bytemuck = "1.25.0"
+libc = "0.2"
+flate2 = "1.1.9"
 
 [features]
-gpu = ["dep:wgpu", "dep:bytemuck", "dep:pollster"]
-ml = ["dep:burn", "dep:serde_json", "dep:serde"]
+gpu = ["dep:wgpu", "dep:pollster"]
 # plotting = ["dep:plotters"]
 
 [profile.release]

@@ -18,7 +18,7 @@
 //! let mut wfm = WorkFlowManager::new();
 //! wfm.use_parallel = false;
 //! wfm.add_operation(FilterMZ::new(100.0, 500.0)); // drop outside (100, 500) Da
-//! wfm.add_operation(Box::new(Normalize {}));        // scale max intensity to 1.0
+//! wfm.add_operation(Normalize {});                  // scale max intensity to 1.0
 //! wfm.execute(&mut spectra);
 //!
 //! assert_eq!(spectra[0].peaks().len(), 1);          // only the 200 Da peak survived
@@ -140,7 +140,7 @@ impl<T: SingleOperation + Sync> Operation for T {
 ///
 /// let mut wfm = WorkFlowManager::new();
 /// wfm.use_parallel = false;
-/// wfm.add_operation(Box::new(Normalize {}));
+/// wfm.add_operation(Normalize {});
 /// wfm.add_operation(KeepTopNPeaks::new(2));
 /// wfm.execute(&mut spectra);
 ///
@@ -149,7 +149,7 @@ impl<T: SingleOperation + Sync> Operation for T {
 /// assert!((max_intensity - 1.0).abs() < 1e-6);
 /// ```
 pub struct WorkFlowManager {
-    workflow: Vec<(TypeId, Box<dyn Operation>)>,
+    workflow: Vec<(TypeId, &'static str, Box<dyn Operation>)>,
     pub use_parallel: bool,
 }
 
@@ -162,6 +162,13 @@ impl Default for WorkFlowManager {
     }
 }
 
+/// Short, human-readable name for an operation type (e.g. `"FilterMZ"`), used to label
+/// stages in a [`FilterReport`].
+fn stage_name<T>() -> &'static str {
+    let full = std::any::type_name::<T>();
+    full.rsplit("::").next().unwrap_or(full)
+}
+
 impl WorkFlowManager {
     pub fn new() -> Self {
         Self::default()
@@ -170,18 +177,21 @@ impl WorkFlowManager {
     /// Appends an operation to the end of the pipeline.
     ///
     /// The concrete type `T` is captured so that [`replace_operation`] and
-    /// [`remove_operation`] can locate the step later by type.
-    pub fn add_operation<T: Operation + 'static>(&mut self, op: Box<T>) {
-        self.workflow.push((TypeId::of::<T>(), op));
+    /// [`remove_operation`] can locate the step later by type. Takes `op` by
+    /// value and boxes it internally — pass a plain `SomeOperation { .. }` or
+    /// `SomeOperation::new(..)`, no manual `Box::new` needed.
+    pub fn add_operation<T: Operation + 'static>(&mut self, op: T) {
+        self.workflow
+            .push((TypeId::of::<T>(), stage_name::<T>(), Box::new(op)));
     }
 
     /// Replaces the step of type `T` with `op`, preserving its position.
     ///
     /// Returns `true` if found and replaced, `false` if `T` is not in the pipeline.
-    pub fn replace_operation<T: Operation + 'static>(&mut self, op: Box<T>) -> bool {
+    pub fn replace_operation<T: Operation + 'static>(&mut self, op: T) -> bool {
         let target = TypeId::of::<T>();
-        if let Some((_, slot)) = self.workflow.iter_mut().find(|(id, _)| *id == target) {
-            *slot = op;
+        if let Some(entry) = self.workflow.iter_mut().find(|(id, _, _)| *id == target) {
+            entry.2 = Box::new(op);
             true
         } else {
             false
@@ -193,7 +203,7 @@ impl WorkFlowManager {
     /// Returns `true` if found and removed, `false` if `T` is not present.
     pub fn remove_operation<T: Operation + 'static>(&mut self) -> bool {
         let target = TypeId::of::<T>();
-        if let Some(i) = self.workflow.iter().position(|(id, _)| *id == target) {
+        if let Some(i) = self.workflow.iter().position(|(id, _, _)| *id == target) {
             self.workflow.remove(i);
             true
         } else {
@@ -204,19 +214,88 @@ impl WorkFlowManager {
     /// Returns `true` if the pipeline contains a step of type `T`.
     pub fn has_operation<T: Operation + 'static>(&self) -> bool {
         let target = TypeId::of::<T>();
-        self.workflow.iter().any(|(id, _)| *id == target)
+        self.workflow.iter().any(|(id, _, _)| *id == target)
     }
 
     /// Iterates over all operations in pipeline order.
     pub fn operations(&self) -> impl Iterator<Item = &dyn Operation> {
-        self.workflow.iter().map(|(_, op)| op.as_ref())
+        self.workflow.iter().map(|(_, _, op)| op.as_ref())
     }
 
     /// Runs every operation in the pipeline over `spectra` in order.
     pub fn execute(&self, spectra: &mut [MassSpectralRecord]) {
-        for (_, op) in &self.workflow {
+        for (_, _, op) in &self.workflow {
             op.operate(spectra, self.use_parallel);
         }
+    }
+
+    /// Like [`execute`](Self::execute), but also tracks how many spectra are newly left
+    /// with zero peaks after each stage, attributing the drop to that stage's name.
+    ///
+    /// A spectrum that already had zero peaks before a stage runs is not re-counted at
+    /// a later stage, so each spectrum is attributed to the single stage that first
+    /// emptied it.
+    pub fn execute_with_report(&self, spectra: &mut [MassSpectralRecord]) -> FilterReport {
+        let mut report = FilterReport::new();
+        for (_, name, op) in &self.workflow {
+            let before_empty = spectra.iter().filter(|s| s.peaks().is_empty()).count();
+            op.operate(spectra, self.use_parallel);
+            let after_empty = spectra.iter().filter(|s| s.peaks().is_empty()).count();
+            report.record(name, after_empty.saturating_sub(before_empty));
+        }
+        report
+    }
+}
+
+/// Aggregated counts of how many spectra were dropped at each pipeline stage.
+///
+/// Built by [`WorkFlowManager::execute_with_report`]; [`SpectralExperiment`] additionally
+/// records its post-workflow charge filter under the `"unknown_charge"` stage name.
+/// Stages are kept in first-drop order, and a stage is only present if it dropped at
+/// least one spectrum.
+///
+/// [`SpectralExperiment`]: crate::clustering::cluster::experiment::SpectralExperiment
+#[derive(Default, Clone, Debug)]
+pub struct FilterReport {
+    stage_counts: Vec<(String, usize)>,
+}
+
+impl FilterReport {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds `count` drops attributed to `stage`, merging into an existing entry if the
+    /// stage already appears in the report. A `count` of zero is a no-op.
+    pub fn record(&mut self, stage: &str, count: usize) {
+        if count == 0 {
+            return;
+        }
+        if let Some(entry) = self.stage_counts.iter_mut().find(|(name, _)| name == stage) {
+            entry.1 += count;
+        } else {
+            self.stage_counts.push((stage.to_string(), count));
+        }
+    }
+
+    /// Merges another report's counts into this one, e.g. combining per-file reports
+    /// produced by parallel ingestion.
+    pub fn merge(&mut self, other: FilterReport) {
+        for (stage, count) in other.stage_counts {
+            self.record(&stage, count);
+        }
+    }
+
+    /// Iterates over `(stage_name, dropped_count)` pairs in first-drop order.
+    pub fn stages(&self) -> impl Iterator<Item = (&str, usize)> {
+        self.stage_counts
+            .iter()
+            .map(|(name, count)| (name.as_str(), *count))
+    }
+
+    /// Total number of spectra dropped across all stages.
+    pub fn total_dropped(&self) -> usize {
+        self.stage_counts.iter().map(|(_, c)| c).sum()
     }
 }
 
@@ -541,13 +620,87 @@ impl SingleOperation for CentroidPeaks {
     }
 }
 
+/// Searches `peaks[anchor_idx + 1..]` for the best-explained isotope envelope anchored at
+/// `peaks[anchor_idx]`, trying every charge state `1..=max_charge` independently and keeping
+/// only the single charge state whose M+1, M+2, … run matches the most consecutive satellites
+/// at the expected `C13_MASS_DIFF / z` spacing (ties favor the lower charge, since that's the
+/// more common case for small-molecule fragments).
+///
+/// Returns `(charge, satellite_indices, summed_satellite_intensity)`, or `None` if no charge
+/// state matched even one satellite. Candidate satellites already claimed by another envelope
+/// (`is_claimed[j]`) are skipped. Shared by [`Deisotope`] (which claims the returned satellites
+/// permanently) and [`AssignPrecursorCharge`] (which only reads off the charge).
+fn best_isotope_run(
+    peaks: &[Peak],
+    anchor_idx: usize,
+    max_charge: u32,
+    max_isotopes: u32,
+    tolerance: f64,
+    is_claimed: &[bool],
+) -> Option<(u32, Vec<usize>, f32)> {
+    let mut best: Option<(u32, Vec<usize>, f32)> = None;
+
+    for z in 1..=max_charge {
+        let step = C13_MASS_DIFF / (z as f64);
+        let mut current_mz = peaks[anchor_idx].mz;
+        let mut satellites = Vec::new();
+        let mut total_extra = 0.0f32;
+
+        for _ in 0..max_isotopes {
+            let expected_mz = current_mz + step;
+            let mut found = None;
+
+            for j in (anchor_idx + 1)..peaks.len() {
+                if is_claimed[j] || satellites.contains(&j) {
+                    continue;
+                }
+                let target_mz = peaks[j].mz;
+
+                // Array is sorted, so exceeding the window means we can stop.
+                if target_mz > expected_mz + tolerance {
+                    break;
+                }
+
+                if (target_mz - expected_mz).abs() <= tolerance {
+                    found = Some(j);
+                    break;
+                }
+            }
+
+            match found {
+                Some(j) => {
+                    total_extra += peaks[j].intensity;
+                    current_mz = peaks[j].mz;
+                    satellites.push(j);
+                }
+                // No M+1 means no M+2 either.
+                None => break,
+            }
+        }
+
+        if !satellites.is_empty() {
+            let is_better = best
+                .as_ref()
+                .map(|(_, best_satellites, _)| satellites.len() > best_satellites.len())
+                .unwrap_or(true);
+            if is_better {
+                best = Some((z, satellites, total_extra));
+            }
+        }
+    }
+
+    best
+}
+
 struct_with_new!(
     /// Collapses isotope peaks into their monoisotopic peak, adding their intensity upward.
     ///
-    /// For each non-isotope peak, the algorithm searches for M+1, M+2, … M+`max_isotopes`
-    /// satellites at the expected spacing of `C13_MASS_DIFF / z` Da (~1.003355 / z) for each
-    /// charge state up to `max_charge`. Peaks within `tolerance` Da of an expected position are
-    /// marked and their intensities are summed into the monoisotopic peak.
+    /// For each non-isotope peak, [`best_isotope_run`] tries every charge state `1..=max_charge`
+    /// and keeps only the single charge state that explains the most consecutive M+1, M+2, …
+    /// `max_isotopes` satellites at the expected `C13_MASS_DIFF / z` spacing (~1.003355 / z Da) —
+    /// a peak's isotopes are never merged from more than one charge hypothesis at once. Matched
+    /// satellites within `tolerance` Da are marked and their intensities summed into the
+    /// monoisotopic peak.
     ///
     /// # Examples
     ///
@@ -572,56 +725,150 @@ struct_with_new!(
 
 impl SingleOperation for Deisotope {
     fn operate_single(&self, spectrum: &mut MassSpectralRecord) {
-        if spectrum.peaks_mut().is_empty() {
+        if spectrum.peaks().is_empty() {
             return;
         }
 
-        let mut is_isotope = vec![false; spectrum.peaks_mut().len()];
+        let n = spectrum.peaks().len();
+        let mut is_isotope = vec![false; n];
 
-        for i in 0..spectrum.peaks_mut().len() {
+        for i in 0..n {
             if is_isotope[i] {
                 continue;
             }
 
-            for z in 1..=self.max_charge {
-                let mut current_mz = spectrum.peaks_mut()[i].mz;
-                let step = C13_MASS_DIFF / (z as f64);
+            let best = best_isotope_run(
+                spectrum.peaks(),
+                i,
+                self.max_charge,
+                self.max_isotopes,
+                self.tolerance,
+                &is_isotope,
+            );
 
-                for _ in 0..self.max_isotopes {
-                    let expected_mz = current_mz + step;
-                    let mut found_in_this_step = false;
-
-                    for j in (i + 1)..spectrum.peaks_mut().len() {
-                        if is_isotope[j] {
-                            continue;
-                        }
-                        let target_mz = spectrum.peaks_mut()[j].mz;
-
-                        // Array is sorted, so exceeding the window means we can stop
-                        if target_mz > expected_mz + self.tolerance {
-                            break;
-                        }
-
-                        if (target_mz - expected_mz).abs() <= self.tolerance {
-                            is_isotope[j] = true;
-                            let extra_intensity = spectrum.peaks_mut()[j].intensity;
-                            spectrum.peaks_mut()[i].intensity += extra_intensity;
-                            current_mz = target_mz;
-                            found_in_this_step = true;
-                            break;
-                        }
-                    }
-
-                    // No M+1 means no M+2 either
-                    if !found_in_this_step {
-                        break;
-                    }
+            if let Some((_, satellites, total_extra)) = best {
+                for &j in &satellites {
+                    is_isotope[j] = true;
                 }
+                spectrum.peaks_mut()[i].intensity += total_extra;
             }
         }
 
         let mut iter = is_isotope.into_iter();
         spectrum.peaks_mut().retain(|_| !iter.next().unwrap());
+    }
+}
+
+struct_with_new!(
+    /// Determines precursor charge from the isotope pattern of a surviving, unfragmented
+    /// precursor peak in the MS2/MS3 spectrum, and writes it via
+    /// [`MassSpectralRecord::set_charge`].
+    ///
+    /// Only applicable when the precursor ion itself still appears in the fragment list —
+    /// common with soft/incomplete fragmentation, wide isolation windows, or DIA-style
+    /// acquisition. This does **not** deduce the charge of individual fragment ions (assumed
+    /// singly charged, the norm for small-molecule MS2); it only refines the spectrum's own
+    /// `charge` field, and only when a real isotope envelope is found near `PEPMASS`.
+    ///
+    /// Algorithm: locate the peak closest to `PEPMASS` within `precursor_window` Da, then run
+    /// [`best_isotope_run`] from that anchor — the same scoring [`Deisotope`] uses — trying
+    /// every charge `1..=max_charge` and keeping the one that explains the most consecutive
+    /// isotopes (ties favor the lower charge). Requires at least `min_isotopes` matched
+    /// satellites to accept; a lone M+1 match is too weak to trust on its own. Leaves the
+    /// spectrum untouched if there's no `PEPMASS`, no anchor peak within `precursor_window`,
+    /// or too few isotopes matched.
+    ///
+    /// By default (`overwrite_existing = false`) a spectrum with an already-nonzero charge
+    /// (e.g. parsed from a `CHARGE` field) is left alone; set it to `true` to let a detected
+    /// pattern override existing metadata. Charge sign follows the spectrum's `IONMODE`
+    /// metadata when present (`NEGATIVE` → `-z`, anything else → `+z`), since isotope spacing
+    /// alone can't distinguish sign.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oxidems_lib::{MassSpectralRecord, Peak};
+    /// use oxidems_lib::workflow::{SingleOperation, AssignPrecursorCharge};
+    ///
+    /// // Precursor at 400.0 Da survives fragmentation with its +2 isotope envelope intact:
+    /// // M+1 at 400.0 + 1.003355/2 ≈ 400.502, M+2 at ≈ 401.003.
+    /// let peaks = vec![
+    ///     Peak::new(150.0, 900.0),    // an ordinary singly-charged fragment
+    ///     Peak::new(400.0, 500.0),    // surviving precursor, M+0
+    ///     Peak::new(400.502, 150.0),  // M+1
+    ///     Peak::new(401.003, 40.0),   // M+2
+    /// ];
+    /// let mut s = MassSpectralRecord::new(peaks, 0, 0); // charge unknown in source metadata
+    /// s.insert_metadata("PEPMASS", "400.0");
+    ///
+    /// AssignPrecursorCharge::new(3, 3, 0.01, 0.05, 2, false).operate_single(&mut s);
+    ///
+    /// assert_eq!(s.get_charge(), 2);
+    /// ```
+    pub struct AssignPrecursorCharge {
+        pub max_charge: u32,
+        pub max_isotopes: u32,
+        pub tolerance: f64,
+        pub precursor_window: f64,
+        pub min_isotopes: u32,
+        pub overwrite_existing: bool,
+    }
+);
+
+impl SingleOperation for AssignPrecursorCharge {
+    fn operate_single(&self, spectrum: &mut MassSpectralRecord) {
+        if !self.overwrite_existing && spectrum.get_charge() != 0 {
+            return;
+        }
+
+        let precursor_mz = spectrum
+            .get_metadata("PEPMASS")
+            .and_then(|mz_str| mz_str.split_whitespace().next())
+            .and_then(|s| s.parse::<f64>().ok());
+
+        let Some(precursor_mz) = precursor_mz else {
+            return;
+        };
+
+        let anchor_idx = spectrum
+            .peaks()
+            .iter()
+            .enumerate()
+            .filter(|(_, peak)| (peak.mz - precursor_mz).abs() <= self.precursor_window)
+            .min_by(|(_, a), (_, b)| {
+                (a.mz - precursor_mz)
+                    .abs()
+                    .total_cmp(&(b.mz - precursor_mz).abs())
+            })
+            .map(|(idx, _)| idx);
+
+        let Some(anchor_idx) = anchor_idx else {
+            return;
+        };
+
+        let is_claimed = vec![false; spectrum.peaks().len()];
+        let best = best_isotope_run(
+            spectrum.peaks(),
+            anchor_idx,
+            self.max_charge,
+            self.max_isotopes,
+            self.tolerance,
+            &is_claimed,
+        );
+
+        let Some((charge, satellites, _)) = best else {
+            return;
+        };
+        if satellites.len() < self.min_isotopes as usize {
+            return;
+        }
+
+        let negative = spectrum
+            .get_metadata("IONMODE")
+            .map(|mode| mode.eq_ignore_ascii_case("NEGATIVE"))
+            .unwrap_or(false);
+
+        spectrum.set_charge(if negative { -(charge as i8) } else { charge as i8 });
     }
 }
 
@@ -1041,5 +1288,756 @@ impl SingleOperation for RemoveCommonContaminants {
 
         peaks.truncate(spectrum_pointer);
         peaks.sort_by(|peak1, peak2| peak1.mz.total_cmp(&peak2.mz));
+    }
+}
+
+struct_with_new!(
+    /// Scales peak intensities so they sum to 1.0 (total ion current normalization).
+    ///
+    /// Unlike [`Normalize`], which pins the base peak to 1.0, this preserves the overall
+    /// signal shape: two spectra with the same relative peak pattern but different absolute
+    /// magnitude become numerically comparable. Spectra with no peaks or zero total
+    /// intensity are left unchanged.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oxidems_lib::MassSpectralRecord;
+    /// use oxidems_lib::workflow::{SingleOperation, TICNormalize};
+    ///
+    /// let mut s = MassSpectralRecord::from_tuples(&[
+    ///     (100.0f32, 100.0), (200.0, 300.0), (300.0, 600.0),
+    /// ]);
+    /// TICNormalize::new().operate_single(&mut s);
+    ///
+    /// let total: f32 = s.peaks().iter().map(|p| p.intensity).sum();
+    /// assert!((total - 1.0).abs() < 1e-6);
+    /// assert!((s.peaks()[2].intensity - 0.6).abs() < 1e-6); // 600 / 1000
+    /// ```
+    pub struct TICNormalize {}
+);
+
+impl SingleOperation for TICNormalize {
+    fn operate_single(&self, spectrum: &mut MassSpectralRecord) {
+        let total: f32 = spectrum.peaks().iter().map(|p| p.intensity).sum();
+        if total > 0.0 {
+            spectrum
+                .peaks_mut()
+                .iter_mut()
+                .for_each(|peak| peak.intensity /= total);
+        }
+    }
+}
+
+struct_with_new!(
+    /// Normalizes intensities independently within each fixed-width m/z window.
+    ///
+    /// The m/z axis is partitioned into non-overlapping `window_size`-Da windows anchored at
+    /// 0 (window `k` covers `[k * window_size, (k+1) * window_size)`); peaks in each window
+    /// are scaled so the window's most intense peak equals 1.0. A single global [`Normalize`]
+    /// would wash out weaker regions of the spectrum under one dominant peak; this keeps each
+    /// region's internal shape visible. Peaks must be sorted by m/z (guaranteed by all
+    /// standard constructors).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oxidems_lib::MassSpectralRecord;
+    /// use oxidems_lib::workflow::{SingleOperation, WindowedNormalize};
+    ///
+    /// // Window 1 [100,200): weak signal. Window 2 [200,300): strong signal.
+    /// // A global Normalize would flatten window 1 to near-zero; this doesn't.
+    /// let mut s = MassSpectralRecord::from_tuples(&[
+    ///     (110.0f32, 10.0), (150.0, 5.0), (250.0, 1000.0),
+    /// ]);
+    /// WindowedNormalize::new(100.0).operate_single(&mut s);
+    ///
+    /// assert!((s.peaks()[0].intensity - 1.0).abs() < 1e-6); // 10 / 10, base peak of window 1
+    /// assert!((s.peaks()[1].intensity - 0.5).abs() < 1e-6); // 5 / 10
+    /// assert!((s.peaks()[2].intensity - 1.0).abs() < 1e-6); // 1000 / 1000, base peak of window 2
+    /// ```
+    pub struct WindowedNormalize {
+        pub window_size: f64,
+    }
+);
+
+impl SingleOperation for WindowedNormalize {
+    fn operate_single(&self, spectrum: &mut MassSpectralRecord) {
+        if spectrum.peaks().is_empty() || self.window_size <= 0.0 {
+            return;
+        }
+
+        // Single forward pass to find each window's max (windows are visited in order since
+        // peaks are sorted by m/z, so consecutive same-window peaks are contiguous).
+        let mut window_max: Vec<(i64, f32)> = Vec::new();
+        for peak in spectrum.peaks() {
+            let window = (peak.mz / self.window_size).floor() as i64;
+            match window_max.last_mut() {
+                Some((w, max)) if *w == window => *max = max.max(peak.intensity),
+                _ => window_max.push((window, peak.intensity)),
+            }
+        }
+
+        let mut idx = 0usize;
+        for peak in spectrum.peaks_mut() {
+            let window = (peak.mz / self.window_size).floor() as i64;
+            while window_max[idx].0 != window {
+                idx += 1;
+            }
+            let max = window_max[idx].1;
+            if max > 0.0 {
+                peak.intensity /= max;
+            }
+        }
+    }
+}
+
+struct_with_new!(
+    /// Removes peaks matching a neutral loss from the precursor (e.g. loss of water or
+    /// ammonia).
+    ///
+    /// For each mass in `losses` (a neutral, uncharged Da value), the expected fragment m/z is
+    /// `precursor_mz - loss / charge` — the fragment is assumed to retain the precursor's
+    /// charge state, which holds for the vast majority of in-source neutral losses. Reads
+    /// `PEPMASS` from metadata and charge via [`MassSpectralRecord::get_charge`]; spectra
+    /// missing `PEPMASS`, or with charge 0, are left unchanged.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oxidems_lib::{MassSpectralRecord, Peak};
+    /// use oxidems_lib::workflow::{SingleOperation, NeutralLossFilter, MassTolerance};
+    ///
+    /// // Precursor at 300.0 Da, charge +1. Loss of water (18.0106 Da) puts a fragment at
+    /// // 281.9894 Da.
+    /// let peaks = vec![Peak::new(150.0, 400.0), Peak::new(281.9894, 800.0)];
+    /// let mut s = MassSpectralRecord::new(peaks, 1, 0);
+    /// s.insert_metadata("PEPMASS", "300.0");
+    /// NeutralLossFilter::new(vec![18.0106], MassTolerance::Da(0.01)).operate_single(&mut s);
+    ///
+    /// assert_eq!(s.peaks().len(), 1);
+    /// assert!((s.peaks()[0].mz - 150.0).abs() < 1e-9);
+    /// ```
+    pub struct NeutralLossFilter {
+        pub losses: Vec<f64>,
+        pub tolerance: MassTolerance,
+    }
+);
+
+impl SingleOperation for NeutralLossFilter {
+    fn operate_single(&self, spectrum: &mut MassSpectralRecord) {
+        if self.losses.is_empty() {
+            return;
+        }
+
+        let precursor_mz = spectrum
+            .get_metadata("PEPMASS")
+            .and_then(|mz_str| mz_str.split_whitespace().next())
+            .and_then(|s| s.parse::<f64>().ok());
+
+        let Some(precursor_mz) = precursor_mz else {
+            return;
+        };
+
+        let charge = spectrum.get_charge();
+        if charge == 0 {
+            return;
+        }
+        let charge = charge.unsigned_abs() as f64;
+
+        let target_mzs: Vec<f64> = self
+            .losses
+            .iter()
+            .map(|loss| precursor_mz - loss / charge)
+            .collect();
+
+        spectrum.peaks_mut().retain(|peak| {
+            !target_mzs
+                .iter()
+                .any(|&target_mz| self.tolerance.is_within(peak.mz, target_mz))
+        });
+    }
+}
+
+struct_with_new!(
+    /// Resamples peaks onto a fixed-width m/z grid, summing intensity within each bin.
+    ///
+    /// Bin `k` covers `[min_mz + k*bin_width, min_mz + (k+1)*bin_width)`. Peaks sharing a bin
+    /// are merged into one, with intensity = the sum of the contributing peaks' intensities
+    /// and m/z = their intensity-weighted centroid. Peaks outside `[min_mz, max_mz)` are
+    /// dropped. Output peaks are emitted in ascending m/z order, matching the sorted-peaks
+    /// invariant the rest of the pipeline relies on.
+    ///
+    /// This is the same fixed-grid resampling as
+    /// [`BinSpectra`](crate::machine_learning::feature_extraction::BinSpectra)'s ML feature
+    /// matrix, exposed instead as an in-place spectrum transform — useful earlier in a
+    /// pipeline, e.g. to put variable-resolution spectra on a common grid before
+    /// [`cosine_similarity`](crate::spectrum::MassSpectralRecord::cosine_similarity).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oxidems_lib::MassSpectralRecord;
+    /// use oxidems_lib::workflow::{SingleOperation, BinPeaks};
+    ///
+    /// // Two peaks land in the same 0.1 Da bin and merge into an intensity-weighted centroid;
+    /// // a third peak lands in its own bin further away.
+    /// let mut s = MassSpectralRecord::from_tuples(&[
+    ///     (100.02f32, 10.0), (100.05, 20.0), (101.5, 5.0),
+    /// ]);
+    /// BinPeaks::new(100.0, 102.0, 0.1).operate_single(&mut s);
+    ///
+    /// assert_eq!(s.peaks().len(), 2);
+    /// // Merged bin: (100.02*10 + 100.05*20) / 30 ≈ 100.04
+    /// assert!((s.peaks()[0].mz - 100.04).abs() < 0.01);
+    /// assert!((s.peaks()[0].intensity - 30.0).abs() < 1e-4);
+    /// assert!((s.peaks()[1].mz - 101.5).abs() < 1e-9);
+    /// assert!((s.peaks()[1].intensity - 5.0).abs() < 1e-4);
+    /// ```
+    pub struct BinPeaks {
+        pub min_mz: f64,
+        pub max_mz: f64,
+        pub bin_width: f64,
+    }
+);
+
+impl SingleOperation for BinPeaks {
+    fn operate_single(&self, spectrum: &mut MassSpectralRecord) {
+        if self.bin_width <= 0.0 || self.max_mz <= self.min_mz {
+            spectrum.peaks_mut().clear();
+            return;
+        }
+
+        let num_bins = ((self.max_mz - self.min_mz) / self.bin_width).ceil() as usize;
+        let mut mz_intensity_product = vec![0.0f64; num_bins];
+        let mut intensity_sum = vec![0.0f32; num_bins];
+
+        for peak in spectrum.peaks() {
+            if peak.mz < self.min_mz || peak.mz >= self.max_mz {
+                continue;
+            }
+            let bin = (((peak.mz - self.min_mz) / self.bin_width) as usize).min(num_bins - 1);
+            mz_intensity_product[bin] += peak.mz * peak.intensity as f64;
+            intensity_sum[bin] += peak.intensity;
+        }
+
+        *spectrum.peaks_mut() = (0..num_bins)
+            .filter(|&i| intensity_sum[i] > 0.0)
+            .map(|i| Peak {
+                mz: mz_intensity_product[i] / intensity_sum[i] as f64,
+                intensity: intensity_sum[i],
+            })
+            .collect();
+    }
+}
+
+struct_with_new!(
+    /// Corrects systematic m/z drift by matching peaks against known reference masses
+    /// (lock masses / internal standards) and shifting the whole spectrum by the observed
+    /// ppm error.
+    ///
+    /// For each mass in `reference_mzs`, looks for the nearest peak within `search_window` Da.
+    /// Matched pairs contribute a signed ppm error `(observed - expected) / expected * 1e6`;
+    /// the spectrum is then scaled by the *mean* of those errors, correcting instrument drift
+    /// before downstream m/z-based comparisons (clustering, library matching). Requires at
+    /// least `min_references` matches to apply a correction — spectra where the reference
+    /// compound wasn't present/fragmented are left unchanged rather than guessing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oxidems_lib::MassSpectralRecord;
+    /// use oxidems_lib::workflow::{SingleOperation, MzRecalibrate};
+    ///
+    /// // A known reference compound at 200.0 Da is observed 10 ppm high across the board,
+    /// // and so is every other peak in the (drift-affected) spectrum.
+    /// let mut s = MassSpectralRecord::from_tuples(&[
+    ///     (200.002f32, 500.0), (350.0035, 300.0), // both shifted by the same +10 ppm
+    /// ]);
+    /// MzRecalibrate::new(vec![200.0], 0.01, 1).operate_single(&mut s);
+    ///
+    /// assert!((s.peaks()[0].mz - 200.0).abs() < 1e-4);
+    /// assert!((s.peaks()[1].mz - 350.0).abs() < 1e-3);
+    /// ```
+    pub struct MzRecalibrate {
+        pub reference_mzs: Vec<f64>,
+        pub search_window: f64,
+        pub min_references: usize,
+    }
+);
+
+impl SingleOperation for MzRecalibrate {
+    fn operate_single(&self, spectrum: &mut MassSpectralRecord) {
+        if self.reference_mzs.is_empty() || spectrum.peaks().is_empty() {
+            return;
+        }
+
+        let ppm_errors: Vec<f64> = self
+            .reference_mzs
+            .iter()
+            .filter_map(|&reference_mz| {
+                spectrum
+                    .peaks()
+                    .iter()
+                    .filter(|peak| (peak.mz - reference_mz).abs() <= self.search_window)
+                    .min_by(|a, b| {
+                        (a.mz - reference_mz)
+                            .abs()
+                            .total_cmp(&(b.mz - reference_mz).abs())
+                    })
+                    .map(|nearest| (nearest.mz - reference_mz) / reference_mz * 1_000_000.0)
+            })
+            .collect();
+
+        if ppm_errors.len() < self.min_references {
+            return;
+        }
+
+        let mean_ppm_error = ppm_errors.iter().sum::<f64>() / ppm_errors.len() as f64;
+        let correction_factor = 1.0 - mean_ppm_error / 1_000_000.0;
+
+        spectrum
+            .peaks_mut()
+            .iter_mut()
+            .for_each(|peak| peak.mz *= correction_factor);
+    }
+}
+
+struct_with_new!(
+    /// Estimates and subtracts a local intensity background, one fixed-width m/z window at a
+    /// time.
+    ///
+    /// Distinct from [`LocalSNRFilter`], which *gates* peaks below a single spectrum-wide noise
+    /// floor: this estimates a background level independently in each `window_size`-Da window
+    /// (same windowing scheme as [`WindowedNormalize`]/[`BinPeaks`]) and subtracts it from
+    /// every peak in that window, floored at 0 — a local correction rather than a global
+    /// yes/no gate. The background estimate is the `percentile`-th percentile of intensities
+    /// within the window (nearest-rank method). Windows with fewer than 2 peaks are left
+    /// untouched — not enough local signal to estimate a background from. Zeroed-out peaks are
+    /// not removed; chain with [`FilterIntensity`] or [`AbsoluteIntensityFilter`] to drop them.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oxidems_lib::MassSpectralRecord;
+    /// use oxidems_lib::workflow::{SingleOperation, BaselineSubtract};
+    ///
+    /// // One 100 Da window with 3 peaks: intensities [50, 60, 500]. The 50th percentile
+    /// // (nearest-rank on the sorted 3-element list) picks the middle value, 60, as the
+    /// // local baseline.
+    /// let mut s = MassSpectralRecord::from_tuples(&[
+    ///     (110.0f32, 50.0), (120.0, 60.0), (150.0, 500.0),
+    /// ]);
+    /// BaselineSubtract::new(100.0, 50.0).operate_single(&mut s);
+    ///
+    /// assert!((s.peaks()[0].intensity - 0.0).abs() < 1e-4);   // 50 - 60, floored at 0
+    /// assert!((s.peaks()[1].intensity - 0.0).abs() < 1e-4);   // 60 - 60
+    /// assert!((s.peaks()[2].intensity - 440.0).abs() < 1e-4); // 500 - 60
+    /// ```
+    pub struct BaselineSubtract {
+        pub window_size: f64,
+        pub percentile: f32,
+    }
+);
+
+impl SingleOperation for BaselineSubtract {
+    fn operate_single(&self, spectrum: &mut MassSpectralRecord) {
+        if spectrum.peaks().is_empty() || self.window_size <= 0.0 {
+            return;
+        }
+
+        // Group peak indices into (window, start, end) runs. Windows are contiguous since
+        // peaks are sorted by m/z.
+        let mut windows: Vec<(i64, usize, usize)> = Vec::new();
+        for (idx, peak) in spectrum.peaks().iter().enumerate() {
+            let window = (peak.mz / self.window_size).floor() as i64;
+            match windows.last_mut() {
+                Some((w, _, end)) if *w == window => *end = idx + 1,
+                _ => windows.push((window, idx, idx + 1)),
+            }
+        }
+
+        let mut baselines = vec![0.0f32; spectrum.peaks().len()];
+        for (_, start, end) in windows {
+            if end - start < 2 {
+                continue;
+            }
+            let mut intensities: Vec<f32> =
+                spectrum.peaks()[start..end].iter().map(|p| p.intensity).collect();
+            intensities.sort_by(|a, b| a.total_cmp(b));
+            let rank = ((self.percentile / 100.0) * (intensities.len() - 1) as f32).round() as usize;
+            let baseline = intensities[rank.min(intensities.len() - 1)];
+            baselines[start..end].fill(baseline);
+        }
+
+        spectrum
+            .peaks_mut()
+            .iter_mut()
+            .zip(baselines)
+            .for_each(|(peak, baseline)| peak.intensity = (peak.intensity - baseline).max(0.0));
+    }
+}
+
+/// Shannon entropy of the intensity-normalized peak distribution: `-Σ p_i * ln(p_i)` where
+/// `p_i = intensity_i / Σintensity`. Ranges from 0 (all signal in one peak) up to `ln(n)` for
+/// `n` equal-intensity peaks. Shared by [`SpectralEntropyFilter`] and [`EntropyWeightTransform`].
+fn shannon_entropy(peaks: &[Peak]) -> f32 {
+    let total: f32 = peaks.iter().map(|p| p.intensity).sum();
+    if total <= 0.0 {
+        return 0.0;
+    }
+    -peaks
+        .iter()
+        .map(|peak| {
+            let p_i = peak.intensity / total;
+            if p_i > 0.0 { p_i * p_i.ln() } else { 0.0 }
+        })
+        .sum::<f32>()
+}
+
+struct_with_new!(
+    /// Clears the spectrum if its Shannon entropy falls below `min_entropy`.
+    ///
+    /// Low entropy means the spectrum's signal is concentrated in a few dominant peaks —
+    /// often too little information to identify a compound, or a sign of poor
+    /// fragmentation/noise dominance. Follows the entropy-based quality reasoning from
+    /// Li et al. 2021 (*Nat. Methods*, "Spectral entropy outperforms MS/MS dot product
+    /// similarity for small-molecule compound identification"), who found spectral entropy a
+    /// more informative single-number quality/complexity signal than raw peak count.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oxidems_lib::MassSpectralRecord;
+    /// use oxidems_lib::workflow::{SingleOperation, SpectralEntropyFilter};
+    ///
+    /// // One dominant peak (99% of signal) => low entropy, gets cleared.
+    /// let mut dominated = MassSpectralRecord::from_tuples(&[
+    ///     (100.0f32, 1.0), (200.0, 990.0), (300.0, 9.0),
+    /// ]);
+    /// SpectralEntropyFilter::new(1.0).operate_single(&mut dominated);
+    /// assert!(dominated.peaks().is_empty());
+    ///
+    /// // Four roughly equal peaks => high entropy (ln(4) ≈ 1.386), survives.
+    /// let mut balanced = MassSpectralRecord::from_tuples(&[
+    ///     (100.0f32, 250.0), (200.0, 250.0), (300.0, 250.0), (400.0, 250.0),
+    /// ]);
+    /// SpectralEntropyFilter::new(1.0).operate_single(&mut balanced);
+    /// assert_eq!(balanced.peaks().len(), 4);
+    /// ```
+    pub struct SpectralEntropyFilter {
+        pub min_entropy: f32,
+    }
+);
+
+impl SingleOperation for SpectralEntropyFilter {
+    fn operate_single(&self, spectrum: &mut MassSpectralRecord) {
+        if shannon_entropy(spectrum.peaks()) < self.min_entropy {
+            spectrum.peaks_mut().clear();
+        }
+    }
+}
+
+struct_with_new!(
+    /// Reweights peak intensities so low-entropy (dominant-peak) spectra get compressed toward
+    /// `weight_threshold`'s entropy level, following the entropy-weighting concept from
+    /// Li et al. 2021 (*Nat. Methods*): dot-product/cosine similarity performs poorly when a
+    /// couple of peaks overwhelm the rest, so weighting them down before comparison helps.
+    /// Similar in spirit to [`SquareRootTransformIntensity`], but the compression exponent
+    /// adapts to each spectrum's own entropy instead of being a fixed constant.
+    ///
+    /// If the spectrum's [`shannon_entropy`] `S` is below `weight_threshold` `T`, every
+    /// intensity is raised to `weight = 0.25 + 0.75 * (S / T)` — so `weight` ranges from 0.25
+    /// at `S = 0` up to 1.0 (no change) at `S = T` — and the result is renormalized back to the
+    /// spectrum's original total intensity. Spectra already at or above `T` are left untouched.
+    /// `weight_threshold = 3.0` matches the default threshold used in the reference paper; the
+    /// weighting formula itself is this crate's own parameterization of that idea for
+    /// arbitrary thresholds, not a verbatim reproduction of the paper's constants.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oxidems_lib::MassSpectralRecord;
+    /// use oxidems_lib::workflow::{SingleOperation, EntropyWeightTransform};
+    ///
+    /// // A dominant peak next to a much weaker one: low entropy, so intensities get
+    /// // compressed (raised to a fractional power) — the weak peak's relative share grows.
+    /// let mut s = MassSpectralRecord::from_tuples(&[(100.0f32, 10.0), (200.0, 990.0)]);
+    /// let total_before: f32 = s.peaks().iter().map(|p| p.intensity).sum();
+    /// let weak_share_before = s.peaks()[0].intensity / total_before;
+    ///
+    /// EntropyWeightTransform::new(3.0).operate_single(&mut s);
+    ///
+    /// let total_after: f32 = s.peaks().iter().map(|p| p.intensity).sum();
+    /// assert!((total_after - total_before).abs() < 1e-2); // total intensity conserved
+    ///
+    /// let weak_share_after = s.peaks()[0].intensity / total_after;
+    /// assert!(weak_share_after > weak_share_before); // compression grows the weak peak's share
+    /// ```
+    pub struct EntropyWeightTransform {
+        pub weight_threshold: f32,
+    }
+);
+
+impl SingleOperation for EntropyWeightTransform {
+    fn operate_single(&self, spectrum: &mut MassSpectralRecord) {
+        if spectrum.peaks().is_empty() || self.weight_threshold <= 0.0 {
+            return;
+        }
+
+        let entropy = shannon_entropy(spectrum.peaks());
+        if entropy >= self.weight_threshold {
+            return;
+        }
+
+        let original_total: f32 = spectrum.peaks().iter().map(|p| p.intensity).sum();
+        if original_total <= 0.0 {
+            return;
+        }
+
+        let weight = 0.25 + 0.75 * (entropy / self.weight_threshold);
+        spectrum
+            .peaks_mut()
+            .iter_mut()
+            .for_each(|peak| peak.intensity = peak.intensity.powf(weight));
+
+        let new_total: f32 = spectrum.peaks().iter().map(|p| p.intensity).sum();
+        if new_total > 0.0 {
+            let rescale = original_total / new_total;
+            spectrum
+                .peaks_mut()
+                .iter_mut()
+                .for_each(|peak| peak.intensity *= rescale);
+        }
+    }
+}
+
+#[cfg(test)]
+mod new_ops_real_data_tests {
+    //! Exercises TICNormalize, WindowedNormalize, NeutralLossFilter, BinPeaks, MzRecalibrate,
+    //! BaselineSubtract, and EntropyWeightTransform against
+    //! `test_files/test1.mgf` — two real MS3 spectra (Glaucine and Tetramethylkaempferol,
+    //! from MassIVE dataset MSV000094528) — rather than synthetic peak lists.
+
+    use super::*;
+    use crate::io::mgf::{MgfParser, MgfParserConfig};
+
+    fn load_test1() -> Vec<MassSpectralRecord> {
+        let mut config = MgfParserConfig::default();
+        config.use_parallel_parsing = false;
+        let mut parser = MgfParser::new(config);
+        parser.parse_file("test_files/test1.mgf").unwrap()
+    }
+
+    #[test]
+    fn assign_precursor_charge_leaves_known_charge_alone_on_real_spectrum() {
+        let spectra = load_test1();
+        let mut s = spectra[0].clone(); // Glaucine, CHARGE=1+ already parsed
+        assert_eq!(s.get_charge(), 1);
+
+        AssignPrecursorCharge::new(3, 3, 0.01, 0.05, 2, false).operate_single(&mut s);
+
+        // overwrite_existing = false: an already-known charge must not be touched.
+        assert_eq!(s.get_charge(), 1);
+    }
+
+    #[test]
+    fn assign_precursor_charge_is_noop_without_a_surviving_precursor_peak_on_real_spectrum() {
+        let spectra = load_test1();
+        let mut s = spectra[0].clone();
+        // PEPMASS=356.18563, but this is an MS3 fragment spectrum: every peak is well below
+        // the precursor m/z (max peak 310.12 Da), so no isotope envelope survives to anchor
+        // on. Forcing overwrite still can't invent a charge with nothing to detect.
+        AssignPrecursorCharge::new(3, 3, 0.01, 0.05, 1, true).operate_single(&mut s);
+
+        assert_eq!(s.get_charge(), 1); // untouched: no peak within precursor_window of PEPMASS
+    }
+
+    #[test]
+    fn tic_normalize_preserves_ratios_on_real_spectrum() {
+        let spectra = load_test1();
+        let mut s = spectra[1].clone(); // Tetramethylkaempferol, 7 peaks
+        let original_total: f32 = s.peaks().iter().map(|p| p.intensity).sum();
+        let original_base_peak = s
+            .peaks()
+            .iter()
+            .map(|p| p.intensity)
+            .fold(0.0f32, f32::max);
+
+        TICNormalize::new().operate_single(&mut s);
+
+        let new_total: f32 = s.peaks().iter().map(|p| p.intensity).sum();
+        assert!((new_total - 1.0).abs() < 1e-5);
+
+        let new_base_peak = s.peaks().iter().map(|p| p.intensity).fold(0.0f32, f32::max);
+        assert!((new_base_peak - original_base_peak / original_total).abs() < 1e-6);
+    }
+
+    #[test]
+    fn windowed_normalize_scales_each_window_independently_on_real_spectrum() {
+        let spectra = load_test1();
+        let mut s = spectra[1].clone();
+        // Peaks span 254.09-313.07 Da; a 50 Da window splits them into [250,300) and [300,350).
+        WindowedNormalize::new(50.0).operate_single(&mut s);
+
+        let base_in_low_window = s
+            .peaks()
+            .iter()
+            .filter(|p| p.mz < 300.0)
+            .map(|p| p.intensity)
+            .fold(0.0f32, f32::max);
+        let base_in_high_window = s
+            .peaks()
+            .iter()
+            .filter(|p| p.mz >= 300.0)
+            .map(|p| p.intensity)
+            .fold(0.0f32, f32::max);
+
+        // Each window's own base peak hits 1.0, independent of the other window's magnitude.
+        assert!((base_in_low_window - 1.0).abs() < 1e-6);
+        assert!((base_in_high_window - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn neutral_loss_filter_removes_only_the_matching_fragment_on_real_spectrum() {
+        let spectra = load_test1();
+        let mut s = spectra[0].clone(); // Glaucine, PEPMASS=356.18563, charge 1+
+
+        let precursor_mz: f64 = s.get_metadata("PEPMASS").unwrap().parse().unwrap();
+        let base_peak_mz = s.peaks().iter().max_by(|a, b| a.intensity.total_cmp(&b.intensity)).unwrap().mz;
+        let observed_loss = precursor_mz - base_peak_mz;
+
+        let peaks_before = s.peaks().len();
+        NeutralLossFilter::new(vec![observed_loss], MassTolerance::Da(0.01)).operate_single(&mut s);
+
+        // Only the peak at exactly `observed_loss` from the precursor is dropped; the other
+        // three real fragment peaks (whose gaps to the precursor differ by more than the
+        // 0.01 Da tolerance) survive.
+        assert_eq!(s.peaks().len(), peaks_before - 1);
+        assert!(s.peaks().iter().all(|p| (p.mz - base_peak_mz).abs() > 1e-9));
+    }
+
+    #[test]
+    fn bin_peaks_conserves_intensity_and_merges_close_peaks_on_real_spectrum() {
+        let spectra = load_test1();
+        let mut s = spectra[1].clone(); // 7 peaks, 254.09-313.07 Da
+        let original_total: f32 = s.peaks().iter().map(|p| p.intensity).sum();
+        let original_count = s.peaks().len();
+
+        // 5 Da bins are wide enough that the three peaks clustered at 309-313 Da collapse
+        // into a single bin, while the well-separated 254 and 282 Da peaks stay distinct.
+        BinPeaks::new(250.0, 320.0, 5.0).operate_single(&mut s);
+
+        assert!(s.peaks().len() < original_count);
+        let new_total: f32 = s.peaks().iter().map(|p| p.intensity).sum();
+        assert!((new_total - original_total).abs() < 1e-3);
+
+        // Peaks stay sorted and each centroid lands inside its own bin.
+        for w in s.peaks().windows(2) {
+            assert!(w[0].mz < w[1].mz);
+        }
+    }
+
+    #[test]
+    fn mz_recalibrate_removes_a_synthetic_drift_from_real_peak_positions() {
+        let spectra = load_test1();
+        let mut s = spectra[1].clone(); // 7 real peaks, 254.09-313.07 Da
+        let original_mzs: Vec<f64> = s.peaks().iter().map(|p| p.mz).collect();
+        let base_peak_mz = s
+            .peaks()
+            .iter()
+            .max_by(|a, b| a.intensity.total_cmp(&b.intensity))
+            .unwrap()
+            .mz;
+
+        // Simulate +15 ppm instrument drift across every real peak.
+        for peak in s.peaks_mut() {
+            peak.mz *= 1.0 + 15.0 / 1_000_000.0;
+        }
+
+        // Recalibrate using the (drifted) base peak as the only reference, anchored at its
+        // known-true real m/z.
+        MzRecalibrate::new(vec![base_peak_mz], 0.1, 1).operate_single(&mut s);
+
+        for (peak, &original_mz) in s.peaks().iter().zip(&original_mzs) {
+            assert!((peak.mz - original_mz).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn baseline_subtract_never_increases_total_intensity_on_real_spectrum() {
+        let spectra = load_test1();
+        let mut s = spectra[1].clone(); // 7 peaks, several close together at 309-313 Da
+        let original_total: f32 = s.peaks().iter().map(|p| p.intensity).sum();
+        let original_count = s.peaks().len();
+
+        BaselineSubtract::new(10.0, 25.0).operate_single(&mut s);
+
+        assert_eq!(s.peaks().len(), original_count); // subtracts, never drops peaks
+        let new_total: f32 = s.peaks().iter().map(|p| p.intensity).sum();
+        assert!(new_total <= original_total + 1e-3);
+        assert!(s.peaks().iter().all(|p| p.intensity >= 0.0));
+    }
+
+    #[test]
+    fn entropy_weight_transform_conserves_intensity_on_real_spectrum() {
+        let spectra = load_test1();
+        let mut s = spectra[0].clone(); // Glaucine: one dominant base peak among 4, low entropy
+        let original_total: f32 = s.peaks().iter().map(|p| p.intensity).sum();
+        let entropy_before = shannon_entropy(s.peaks());
+
+        // A generous threshold guarantees this real, dominated spectrum actually gets
+        // reweighted rather than left untouched.
+        EntropyWeightTransform::new(10.0).operate_single(&mut s);
+
+        let new_total: f32 = s.peaks().iter().map(|p| p.intensity).sum();
+        assert!((new_total - original_total).abs() < 1e-2);
+
+        // Compression raises the post-transform spectrum's own entropy toward the threshold.
+        let entropy_after = shannon_entropy(s.peaks());
+        assert!(entropy_after > entropy_before);
+    }
+}
+
+#[cfg(test)]
+mod deisotope_charge_contamination_regression_test {
+    //! Regression test for a bug in the original Deisotope: its charge-state loop never broke
+    //! after a successful match, so a single monoisotopic candidate could absorb isotope
+    //! satellites from *multiple, mutually incompatible* charge hypotheses at once (chemically
+    //! impossible — an ion has one charge). Fixed by `best_isotope_run` picking a single
+    //! best-scoring charge state per monoisotopic peak.
+
+    use super::*;
+
+    #[test]
+    fn only_the_best_scoring_charge_state_is_merged() {
+        // Base peak at 500.0 Da. A real M+1 isotope at the z=1 spacing (501.0034 Da) coexists
+        // with a decoy peak that just happens to sit exactly at the z=2 M+1 spacing
+        // (500.5017 Da) from the same base peak, but is unrelated (e.g. a genuine fragment
+        // ion). max_isotopes = 1 caps the search at a single satellite per charge, so this
+        // is a genuine tie (both z=1 and z=2 explain exactly 1 satellite) rather than z=2
+        // legitimately winning by also reaching the M+2 isotope-train harmonic that any
+        // charge state re-syncs to at z steps (which would make it the objectively better
+        // explanation, not a bug). The old code tried z=1 *and* z=2 for the same base peak
+        // without ever stopping, so it merged both into one bloated peak regardless. The fix
+        // must pick a single charge hypothesis (z=1: found first, ties favor the lower charge)
+        // and leave the decoy alone.
+        let peaks = vec![
+            Peak::new(500.0, 1000.0),
+            Peak::new(500.5017, 50.0), // decoy: exact z=2 M+1 spacing, not a real isotope
+            Peak::new(501.0034, 300.0), // real M+1 isotope at z=1 spacing
+        ];
+        let mut s = MassSpectralRecord::new(peaks, 1, 0);
+
+        Deisotope::new(2, 0.005, 1).operate_single(&mut s);
+
+        // Old buggy behavior: 1 peak left, intensity 1000 + 300 + 50 = 1350 (both merged).
+        // Fixed behavior: the z=1 hypothesis wins the tie (evaluated first), so only the true
+        // isotope is absorbed; the unrelated decoy survives untouched.
+        assert_eq!(s.peaks().len(), 2);
+        let merged = s.peaks().iter().find(|p| (p.mz - 500.0).abs() < 1e-6).unwrap();
+        assert!((merged.intensity - 1300.0).abs() < 1e-3);
+        let decoy = s.peaks().iter().find(|p| (p.mz - 500.5017).abs() < 1e-6).unwrap();
+        assert!((decoy.intensity - 50.0).abs() < 1e-6);
     }
 }

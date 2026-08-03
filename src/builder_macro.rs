@@ -38,10 +38,10 @@ macro_rules! struct_with_new {
         }
 
         impl $name {
-            pub fn new($($field_name : $field_type),*) -> Box<Self> {
-                Box::new(Self {
+            pub fn new($($field_name : $field_type),*) -> Self {
+                Self {
                     $($field_name),*
-                })
+                }
             }
         }
     };

@@ -551,6 +551,10 @@ impl MassSpectralRecord {
         self.spectrum.charge
     }
 
+    pub fn set_charge(&mut self, charge: i8) {
+        self.spectrum.charge = charge;
+    }
+
     pub fn from_tuples(peaks: &[(f32, f32)]) -> Self {
         let spectrum = MassSpectrum::from_tuples(peaks);
         MassSpectralRecord {
@@ -610,10 +614,10 @@ impl MassSpectralRecord {
     ///
     /// # Examples
     /// ```
-    /// use ms_tools::{MassSpectrum, BinnedSpectrumConfig};
+    /// use oxidems_lib::{MassSpectralRecord, BinnedSpectrumConfig};
     ///
     /// let peaks = vec![(100.0, 1000.0), (200.0, 500.0)];
-    /// let spectrum = MassSpectrum::new(peaks);
+    /// let spectrum = MassSpectralRecord::from_tuples(&peaks);
     /// let config = BinnedSpectrumConfig::fast();
     /// let binned = spectrum.to_binned(&config);
     /// ```
@@ -814,12 +818,12 @@ impl BinnedSpectrum {
     ///
     /// # Examples
     /// ```
-    /// use ms_tools::{MassSpectrum, BinnedSpectrumConfig};
+    /// use oxidems_lib::{MassSpectralRecord, BinnedSpectrumConfig};
     ///
     /// let peaks1 = vec![(100.0, 1000.0), (200.0, 500.0)];
     /// let peaks2 = vec![(100.0, 1000.0), (200.0, 500.0)];
-    /// let spectrum1 = MassSpectrum::new(peaks1);
-    /// let spectrum2 = MassSpectrum::new(peaks2);
+    /// let spectrum1 = MassSpectralRecord::from_tuples(&peaks1);
+    /// let spectrum2 = MassSpectralRecord::from_tuples(&peaks2);
     /// let config = BinnedSpectrumConfig::default();
     ///
     /// let binned1 = spectrum1.to_binned(&config);
@@ -920,12 +924,12 @@ impl SpectrumComparison {
     ///
     /// # Examples
     /// ```
-    /// use ms_tools::{MassSpectrum, SpectrumComparison, BinnedSpectrumConfig};
+    /// use oxidems_lib::{MassSpectralRecord, SpectrumComparison, BinnedSpectrumConfig};
     ///
     /// let peaks1 = vec![(100.0, 1000.0), (200.0, 500.0)];
     /// let peaks2 = vec![(100.1, 950.0), (200.1, 480.0)];
-    /// let spectrum1 = MassSpectrum::new(peaks1);
-    /// let spectrum2 = MassSpectrum::new(peaks2);
+    /// let spectrum1 = MassSpectralRecord::from_tuples(&peaks1);
+    /// let spectrum2 = MassSpectralRecord::from_tuples(&peaks2);
     ///
     /// let similarity = SpectrumComparison::fast_cosine_similarity(
     ///     &spectrum1, &spectrum2, &BinnedSpectrumConfig::fast()
