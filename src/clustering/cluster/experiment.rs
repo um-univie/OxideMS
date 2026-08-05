@@ -5,6 +5,7 @@ use super::mz_partition::mz_charge_boundaries;
 use crate::{
     MSNSpectrum, MassSpectralRecord, Peak, SpectrumHasher,
     io::mgf::{LowMemRecord, MGF_SPECTRA_SIZE, MgfParser, MgfParserConfig, SpillKey},
+    io::mzml::{MzmlParser, MzmlParserConfig},
     workflow::*,
 };
 use memmap2::Mmap;
@@ -161,6 +162,47 @@ fn log_partition_timing_summary(stats: &[PartitionStats], overall_elapsed: std::
     }
 }
 
+/// Known spectral file extensions, in the order checked. Both parsers return
+/// the same `Vec<MassSpectralRecord>`, so callers can treat any mix of
+/// these formats identically once parsed.
+const SPECTRAL_FILE_EXTENSIONS: [&str; 3] = ["mgf", "mzml", "mzML"];
+
+fn has_known_spectral_extension(path: &str) -> bool {
+    SPECTRAL_FILE_EXTENSIONS
+        .iter()
+        .any(|ext| path.ends_with(&format!(".{ext}")))
+}
+
+/// Strips whichever known spectral extension a filename ends with, for
+/// deriving a display/lookup name from a file path (e.g. "run1.mzML" ->
+/// "run1"). Falls back to the original name unchanged if none match.
+fn strip_spectral_extension(file_stem: &str) -> &str {
+    for ext in SPECTRAL_FILE_EXTENSIONS {
+        let suffix = format!(".{ext}");
+        if let Some(stripped) = file_stem.strip_suffix(&suffix) {
+            return stripped;
+        }
+    }
+    file_stem
+}
+
+/// Parses a single spectral file with the parser matching its extension
+/// (case-insensitive on `.mzml`/`.mzML`; `.mgf` otherwise). `parallel`
+/// controls each parser's own internal per-file parallelism -- pass `false`
+/// when the caller already parallelizes across files (e.g. rayon over
+/// multiple files at once), to avoid oversubscribing threads.
+fn parse_spectral_file(path: &str, parallel: bool) -> io::Result<Vec<MassSpectralRecord>> {
+    if path.to_lowercase().ends_with(".mzml") {
+        let mut config = MzmlParserConfig::default();
+        config.use_parallel_parsing = parallel;
+        MzmlParser::new(config).parse_file(path)
+    } else {
+        let mut parser = MgfParser::default();
+        parser.config.use_parallel_parsing = parallel;
+        parser.parse_file(path)
+    }
+}
+
 impl SpectralExperiment {
     pub fn default() -> Self {
         let mut workflow = WorkFlowManager::default();
@@ -179,6 +221,34 @@ impl SpectralExperiment {
         }
     }
 
+    /// Proteomics preset, tuned by a 2-level factorial screen + a follow-up
+    /// fine-grained epsilon sweep on three label-free human proteomics datasets
+    /// (PXD000561, PXD000865, PXD004452) against MS-GF+ database-search ground
+    /// truth (see `ms-cluster-benchmark/doe/README.md` and
+    /// `oxidems_lib/publication/main.tex`, "Tuning and Validation of the
+    /// Proteomics Preset"):
+    ///   - `epsilon` 0.05: an earlier pass scored the epsilon sweep with a plain
+    ///     `purity * completeness` product and concluded 0.3 was best. That metric
+    ///     is badly misleading near the purity ceiling this domain operates in --
+    ///     e.g. on PXD000561, purity 0.997->0.941 "looks like" a 5.6-point dip, but
+    ///     is actually an ~19x increase in the clustering error rate (1-purity)
+    ///     for only ~1.6x more completeness. Re-scored by completeness/(1-purity)
+    ///     (completeness earned per unit of error, respecting that error rate is
+    ///     the thing with real multiplicative cost) across a fine 9-point sweep
+    ///     (0.01 to 0.3), 0.05 is a clean interior optimum on *all three* real
+    ///     datasets simultaneously -- lower values (0.01-0.03) score worse too, so
+    ///     this isn't a boundary artifact either direction.
+    ///   - no intensity transform, `top_n_peaks` 50, `min_peaks`/`min_mz_range`
+    ///     confirmed to have zero measurable effect on purity or completeness for
+    ///     this domain (identical outputs across every tested level) -- kept at the
+    ///     shared baseline's values, unaffected by the epsilon correction above.
+    ///   - `min_mz` 200.0: Falcon's own default low-mass cutoff (101.0) was
+    ///     tested as a controlled change on PXD021518 (matching both the
+    ///     workflow peak filter AND the hasher's own mz range -- the CLI's
+    ///     `--min-mz` override only touches the former, which gave a
+    ///     misleadingly different, invalid result during investigation) and
+    ///     did not improve RedshiftMS's purity-vs-N10 AUC relative to Falcon
+    ///     for either hashed or exact mode; kept at 200.0.
     pub fn proteomics() -> Self {
         let mut workflow = WorkFlowManager::default();
         let min_mz = 200.0;
@@ -193,6 +263,7 @@ impl SpectralExperiment {
 
         let mut engine = ClusterEngine::default();
         engine.set_mz_range(min_mz, max_mz);
+        engine.epsilon = 0.05;
 
         Self {
             workflow,
@@ -203,37 +274,45 @@ impl SpectralExperiment {
         }
     }
 
-    /// Metabolomics preset, tuned by a full-factorial + response-surface DOE on an
-    /// InChIKey-labelled 600k-spectrum library set (compound-level purity) and cross-checked
-    /// on an independent 1.3M-spectrum MS3 set and a real untargeted DDA dataset (MS-RT proxy):
-    ///   - `min_mz_range` 50 Da: the dominant completeness lever (100 Da discards far more
-    ///     small-molecule spectra) on every benchmark.
-    ///   - relaxed `min_peaks` 3 and no relative-intensity floor: recover sparse metabolite
-    ///     spectra at negligible purity cost.
-    ///   - `Normalize` then square-root intensity transform: on the trusted InChIKey metric a
-    ///     transform raises purity by several percent over raw intensities (up to ~6% on MS3).
-    ///     `sqrt` is chosen over `log` because it is scale-invariant under cosine, so it behaves
-    ///     identically on raw (e.g. ThermoRawFileParser) and normalised (e.g. mzMine) input;
-    ///     `log` is not scale-invariant and collapses clustering on un-normalised raw counts.
-    ///     The leading `Normalize` makes intensities well-defined regardless of input scale.
-    ///   - 20 ppm precursor tolerance: conservative and robust across instruments.
-    /// Net vs. the previous preset (100 Da, min_peaks 5): completeness roughly doubles on the
-    /// annotated benchmarks and improves purity+completeness together on the untargeted set.
+    /// Metabolomics preset, tuned by a full-factorial DOE (256 runs, mirroring the
+    /// proteomics preset's methodology) against the real, charge-filtered Astral
+    /// dataset scored by the internal MS-RT proxy (`average_weighted_cluster_purity`/
+    /// `calculate_n10_value`), cross-checked against the ALL_GNPS community spectral
+    /// library (InChIKey ground truth). See `oxidems_lib/publication/main.tex`
+    /// ("Tuning and Validation of the Metabolomics Preset") for the full derivation.
+    ///   - `epsilon` 0.5: scored by completeness/(1-purity) (completeness earned per
+    ///     unit of clustering error -- see the proteomics preset's docs for why the
+    ///     naive purity*completeness product is misleading), this score rises
+    ///     monotonically from 0.02 through 0.5 (0.91->2.04) then falls back through
+    ///     1.0 (1.97 at eps=0.7, 1.97 at eps=1.0), making 0.5 the real interior
+    ///     optimum -- notably not the same value as the proteomics preset (0.05),
+    ///     confirming these two domains genuinely need different operating points
+    ///     rather than sharing one.
+    ///   - no intensity transform: on the same real MS-RT ground truth, `none` clearly
+    ///     beats `sqrt` on completeness (0.147 vs. 0.079) at equal purity (~0.91) --
+    ///     the opposite of what the now-invalidated InChIKey-library comparison found,
+    ///     which is exactly why this preset was re-derived against real acquisition
+    ///     data instead.
+    ///   - `min_mz_range` 50 Da: still the dominant completeness lever (100 Da discards
+    ///     far more small-molecule spectra), confirmed again on this new ground truth.
+    ///   - relaxed `min_peaks` 3, no relative-intensity floor, `top_n_peaks` 50: all three
+    ///     confirmed to have negligible-to-zero measurable effect on this domain.
+    ///   - 20 ppm precursor tolerance, 0.05 Da fragment tolerance: both confirmed inert
+    ///     within the tested range, kept for consistency with the proteomics preset.
     pub fn metabolomics() -> Self {
         let mut workflow = WorkFlowManager::default();
         let min_mz = 50.0;
         let max_mz = 1500.0;
         workflow.add_operation(FilterMZ::new(min_mz, max_mz));
         workflow.add_operation(RemovePrecursor::new(MassTolerance::Da(1.5), 0));
-        workflow.add_operation(Normalize {});
-        workflow.add_operation(SquareRootTransformIntensity::new());
-        workflow.add_operation(KeepTopNPeaks::new(100));
+        workflow.add_operation(KeepTopNPeaks::new(50));
         workflow.add_operation(MinNumberOfPeaks::new(3));
         workflow.add_operation(MinMZRangeFilter::new(50.0));
 
         let mut engine = ClusterEngine::default();
         engine.set_mz_range(min_mz, max_mz);
         engine.mz_tolerance = MassTolerance::Ppm(20.0);
+        engine.epsilon = 0.5;
 
         Self {
             workflow,
@@ -471,7 +550,7 @@ impl SpectralExperiment {
             .filter_map(|e| {
                 let path = e.ok()?.path();
                 let s = path.to_str()?.to_string();
-                if s.ends_with(".mgf") { Some(s) } else { None }
+                if has_known_spectral_extension(&s) { Some(s) } else { None }
             })
             .collect();
 
@@ -488,13 +567,7 @@ impl SpectralExperiment {
         let start_index = self.file_names.len();
 
         self.file_names.extend(paths.iter().map(|p| {
-            p.split('/')
-                .last()
-                .unwrap()
-                .split(".mgf")
-                .next()
-                .unwrap()
-                .to_string()
+            strip_spectral_extension(p.split('/').last().unwrap()).to_string()
         }));
         self.file_paths.extend(paths.iter().map(PathBuf::from));
 
@@ -525,9 +598,7 @@ impl SpectralExperiment {
         path: &str,
         file_index: usize,
     ) -> (Vec<MSNSpectrum>, Vec<SpectrumMetadata>, usize, FilterReport) {
-        let mut parser = MgfParser::default();
-        parser.config.use_parallel_parsing = false;
-        let mut spectra = parser.parse_file(path).unwrap();
+        let mut spectra = parse_spectral_file(path, false).unwrap();
 
         let raw_count = spectra.len();
         let mut report = self.workflow.execute_with_report(&mut spectra);
@@ -591,18 +662,11 @@ impl SpectralExperiment {
     pub fn ingest_file(&mut self, file_path: &str) {
         let file_index = self.file_names.len();
         self.file_names.push(
-            file_path
-                .split("/")
-                .last()
-                .unwrap()
-                .split(".mgf")
-                .next()
-                .unwrap()
-                .to_string(),
+            strip_spectral_extension(file_path.split("/").last().unwrap()).to_string(),
         );
         self.file_paths.push(PathBuf::from(file_path));
 
-        let mut spectra = self.parser.parse_file(file_path).unwrap();
+        let mut spectra = parse_spectral_file(file_path, true).unwrap();
         self.total_spectra_ingested += spectra.len();
         let mut report = self.workflow.execute_with_report(&mut spectra);
 
@@ -898,41 +962,63 @@ impl SpectralExperiment {
         let partition_paths = self.finalize_low_mem_partitions()?;
 
         type ClusterRow = (usize, usize, i8, f64, f32); // file_index, scan_number, charge, precursor_mz, rt
-        let per_partition: Vec<io::Result<Vec<Vec<ClusterRow>>>> = partition_paths
+
+        let process_partition = |partition_path: &Path| -> io::Result<Vec<Vec<ClusterRow>>> {
+            let records = Self::load_partition(partition_path)?;
+            let mut lookup: HashMap<u64, ClusterRow> = HashMap::with_capacity(records.len());
+            let mut msn_spectra = Vec::with_capacity(records.len());
+            for r in records {
+                lookup.insert(
+                    r.msn.id,
+                    (
+                        r.file_index,
+                        r.scan_number,
+                        r.msn.charge(),
+                        r.msn.precursor_mz,
+                        r.msn.retention_time_in_seconds,
+                    ),
+                );
+                msn_spectra.push(r.msn);
+            }
+
+            let mut engine = self.engine_like_self();
+            engine.split_on_mz_and_charge(msn_spectra).unwrap();
+            let clusters = engine.cluster().unwrap();
+
+            Ok(clusters
+                .iter()
+                .map(|cluster| {
+                    cluster
+                        .iter()
+                        .map(|id| lookup[&(*id as u64)])
+                        .collect::<Vec<ClusterRow>>()
+                })
+                .collect())
+        };
+
+        // Mirrors ClusterEngine::cluster()'s own fast_batches/slow_batches
+        // split: a partition at or above batch_size_threshold pays a
+        // per-partition O(n^2) dense-matrix cost for hashed mode
+        // (compute_dense_dbscan) -- processing many such partitions
+        // concurrently (previously: one flat par_iter over ALL partitions,
+        // any size) let their peak memory sum instead of being bounded by
+        // "at most one large partition resident at a time", the property
+        // normal (non-low-mem) clustering already enforces by processing
+        // slow_batches in a plain sequential loop. Small partitions stay
+        // fully parallel; this only serializes the ones expensive enough
+        // to matter.
+        let batch_size_threshold = self.engine.batch_size_threshold;
+        let (small_partitions, large_partitions): (Vec<_>, Vec<_>) = partition_paths
+            .into_iter()
+            .partition(|&(_, n_spectra)| n_spectra < batch_size_threshold);
+
+        let mut per_partition: Vec<io::Result<Vec<Vec<ClusterRow>>>> = small_partitions
             .par_iter()
-            .map(|(partition_path, _n_spectra)| -> io::Result<Vec<Vec<ClusterRow>>> {
-                let records = Self::load_partition(partition_path)?;
-                let mut lookup: HashMap<u64, ClusterRow> = HashMap::with_capacity(records.len());
-                let mut msn_spectra = Vec::with_capacity(records.len());
-                for r in records {
-                    lookup.insert(
-                        r.msn.id,
-                        (
-                            r.file_index,
-                            r.scan_number,
-                            r.msn.charge(),
-                            r.msn.precursor_mz,
-                            r.msn.retention_time_in_seconds,
-                        ),
-                    );
-                    msn_spectra.push(r.msn);
-                }
-
-                let mut engine = self.engine_like_self();
-                engine.split_on_mz_and_charge(msn_spectra).unwrap();
-                let clusters = engine.cluster().unwrap();
-
-                Ok(clusters
-                    .iter()
-                    .map(|cluster| {
-                        cluster
-                            .iter()
-                            .map(|id| lookup[&(*id as u64)])
-                            .collect::<Vec<ClusterRow>>()
-                    })
-                    .collect())
-            })
+            .map(|(partition_path, _n_spectra)| process_partition(partition_path))
             .collect();
+        for (partition_path, _n_spectra) in &large_partitions {
+            per_partition.push(process_partition(partition_path));
+        }
 
         let file = File::create(output_file_name)?;
         let mut writer = BufWriter::new(file);

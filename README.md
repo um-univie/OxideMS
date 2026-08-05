@@ -35,7 +35,7 @@ oxidems_lib = { path = "path/to/oxidems-lib-dev" }
 
 ## Parsing
 
-MGF (Mascot Generic Format) is the supported input format. The parser uses memory-mapped I/O and byte-level peak parsing with no intermediate string allocations, making it suitable for very large files.
+MGF (Mascot Generic Format) and mzML are both supported input formats, dispatched automatically by file extension — a single input folder may freely mix `.mgf` and `.mzML` files. Both parsers use memory-mapped I/O with no intermediate string allocations, making them suitable for very large files.
 
 ```rust
 use oxidems_lib::io::mgf::MgfParser;
@@ -122,17 +122,17 @@ FilterMZ(101–1500 Da) → RemovePrecursor(±1.5 Da) → FilterIntensityRelativ
 ```
 
 **`SpectralExperiment::proteomics()`**
-Adds a square-root intensity transform and raises the minimum m/z to 200 Da to exclude low-mass noise common in peptide fragmentation.
+Raises the minimum m/z to 200 Da to exclude low-mass immonium-ion noise common in peptide fragmentation, and removes common laboratory contaminants. Tuned by a DOE study against three real proteomics datasets with MS-GF+ ground truth; `epsilon = 0.05`.
 ```
-FilterMZ(200–1500 Da) → RemovePrecursor(±1.5 Da) → FilterIntensityRelative(1%)
-→ SquareRootTransform → KeepTopNPeaks(50) → MinNumberOfPeaks(5) → MinMZRangeFilter(250 Da)
+FilterMZ(200–1500 Da) → RemovePrecursor(±1.5 Da) → RemoveCommonContaminants(20 ppm)
+→ FilterIntensityRelative(1%) → KeepTopNPeaks(50) → MinNumberOfPeaks(5) → MinMZRangeFilter(250 Da)
 ```
 
 **`SpectralExperiment::metabolomics()`**
-Lowers the minimum m/z to 50 Da to retain small metabolite fragment ions, while keeping the square-root transform.
+Lowers the minimum m/z to 50 Da to retain small metabolite fragment ions and relaxes the peak-count/m-z-range floors. Tuned by a DOE study against real MS-RT-proxy-scored acquisition data; no intensity transform (an earlier square-root transform was dropped after re-validation against real data showed it hurt completeness); `epsilon = 0.5`.
 ```
-FilterMZ(50–1500 Da) → RemovePrecursor(±1.5 Da) → FilterIntensityRelative(1%)
-→ SquareRootTransform → KeepTopNPeaks(50) → MinNumberOfPeaks(5) → MinMZRangeFilter(250 Da)
+FilterMZ(50–1500 Da) → RemovePrecursor(±1.5 Da)
+→ KeepTopNPeaks(50) → MinNumberOfPeaks(3) → MinMZRangeFilter(50 Da)
 ```
 
 Building a custom profile on top of an existing one is straightforward e.g.:
