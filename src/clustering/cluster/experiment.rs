@@ -1277,10 +1277,11 @@ impl SpectralExperiment {
         self.cluster()
     }
 
+    /// Always writes the file, even when nothing clustered: a header-only CSV
+    /// is a result ("no cluster met the threshold"), whereas a missing file is
+    /// indistinguishable from a crash for anything downstream. The two low-mem
+    /// paths have always behaved this way; this one used to return early.
     pub fn write_results(&self, clusters: &FlatClusters, output_file_name: &str) {
-        if clusters.total_elements() == 0 {
-            return;
-        }
         let mut file = std::fs::File::create(output_file_name).unwrap();
         let mut writer = std::io::BufWriter::new(&mut file);
         writer.write(format!("# RedshiftMS (OxideMS core v{}) {}\n# eps = {}\n# hash_len = {}\n# total_spectra_parsed = {}\nidentifier,precursor_charge,precursor_mz,retention_time,cluster\n", env!("CARGO_PKG_VERSION"), if self.engine.exact {"(exact)"} else {""},  self.engine.epsilon, self.engine.hash_size(), self.total_spectra_ingested).as_bytes())
