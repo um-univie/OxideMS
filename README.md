@@ -20,6 +20,16 @@ The library targets large-scale experiments — hundreds of MGF files, millions 
 
 ## Installation
 
+On Linux, the plotting support links against fontconfig, so `pkg-config` and
+the fontconfig development headers must be present before you build:
+
+```bash
+# Debian / Ubuntu
+sudo apt install pkg-config libfontconfig-dev
+# Fedora / RHEL
+sudo dnf install pkgconf-pkg-config fontconfig-devel
+```
+
 Add to your `Cargo.toml`:
 
 ```toml
