@@ -1,2 +1,7 @@
 [build]
-rustflags = ["-C", "target-cpu=native", "-A", "warnings"]
+# target-cpu=native disabled: it bakes in whatever CPU did the build, which
+# breaks (SIGILL) when the resulting binary runs on a different node -- the
+# workspace has several nodes with different instruction sets (e.g. some
+# with AVX-512, some without). Re-enable only for a build you know will run
+# on the exact same machine that compiled it.
+rustflags = ["-A", "warnings"] # , "-C", "target-cpu=native"

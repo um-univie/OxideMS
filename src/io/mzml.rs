@@ -1346,13 +1346,14 @@ mod tests {
     /// every span, spectrum-for-spectrum, on real data with real XML
     /// irregularities (whitespace, attribute ordering, etc. synthetic test
     /// fixtures don't naturally exercise). Gated behind `--ignored` since it
-    /// depends on a file from a sibling checkout outside this repo, not
+    /// depends on OXIDEMS_TEST_MZML_FIXTURE pointing at a real mzML file, not
     /// something every clone of oxidems_lib will have on disk.
     #[test]
-    #[ignore = "depends on a real mzML file from a sibling checkout; run explicitly with --ignored"]
+    #[ignore = "depends on OXIDEMS_TEST_MZML_FIXTURE; run explicitly with --ignored"]
     fn indexed_and_scanned_paths_agree_on_real_file() {
-        let path = "/scratch/muhlir/projects/oxidems/Incremental_Clustering-1.0.0/data/bench_mzml/pxd023047/pxd023047_9k.mzML";
-        let file = std::fs::File::open(path).expect("real test fixture missing");
+        let path = std::env::var("OXIDEMS_TEST_MZML_FIXTURE")
+            .expect("set OXIDEMS_TEST_MZML_FIXTURE to a real mzML file to run this ignored test");
+        let file = std::fs::File::open(&path).expect("real test fixture missing");
         let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
 
         let indexed = MzmlParser::indexed_spans(&mmap).expect("file should carry a valid index");
@@ -1367,7 +1368,7 @@ mod tests {
         assert_eq!(indexed.len(), expected);
 
         let mut parser = MzmlParser::default();
-        let records = parser.parse_file(path).unwrap();
+        let records = parser.parse_file(&path).unwrap();
         assert_eq!(records.len(), expected);
         assert!(records.iter().all(|r| !r.peaks().is_empty()));
         assert!(records.iter().all(|r| r.get_metadata("PEPMASS").is_some()));
@@ -1380,21 +1381,22 @@ mod tests {
     /// synthetic fixtures don't naturally produce. Gated behind `--ignored`
     /// for the same reason as `indexed_and_scanned_paths_agree_on_real_file`.
     #[test]
-    #[ignore = "depends on a real mzML file from a sibling checkout; run explicitly with --ignored"]
+    #[ignore = "depends on OXIDEMS_TEST_MZML_FIXTURE; run explicitly with --ignored"]
     fn fast_and_quickxml_tokenizers_agree_on_real_file() {
-        let path = "/scratch/muhlir/projects/oxidems/Incremental_Clustering-1.0.0/data/bench_mzml/pxd023047/pxd023047_9k.mzML";
+        let path = std::env::var("OXIDEMS_TEST_MZML_FIXTURE")
+            .expect("set OXIDEMS_TEST_MZML_FIXTURE to a real mzML file to run this ignored test");
 
         let mut fast_parser = MzmlParser::new(MzmlParserConfig {
             use_fast_tokenizer: true,
             ..MzmlParserConfig::default()
         });
-        let fast_records = fast_parser.parse_file(path).unwrap();
+        let fast_records = fast_parser.parse_file(&path).unwrap();
 
         let mut quickxml_parser = MzmlParser::new(MzmlParserConfig {
             use_fast_tokenizer: false,
             ..MzmlParserConfig::default()
         });
-        let quickxml_records = quickxml_parser.parse_file(path).unwrap();
+        let quickxml_records = quickxml_parser.parse_file(&path).unwrap();
 
         assert_records_equivalent(&fast_records, &quickxml_records);
     }
