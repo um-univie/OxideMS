@@ -24,11 +24,11 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxidems_lib = { path = "path/to/oxidems-lib-dev" }
+oxidems_lib = { git = "https://github.com/um-univie/OxideMS", branch = "main" }
 
 # Optional features
-# oxidems_lib = { path = "...", features = ["gpu"] }   # GPU-accelerated similarity
-# oxidems_lib = { path = "...", features = ["ml"] }    # Burn-based machine learning
+# oxidems_lib = { git = "...", features = ["gpu"] }   # GPU-accelerated similarity
+# oxidems_lib = { git = "...", features = ["ml"] }    # Burn-based machine learning
 ```
 
 ---
