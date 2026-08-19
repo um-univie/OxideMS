@@ -327,7 +327,9 @@ pub fn plot_purity_vs_n10(
         .collect();
 
     // Sort by purity to ensure the line flows from lowest to highest
-    data.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    // total_cmp: average_purities can be NaN (e.g. a 0/0 ratio from an empty
+    // cluster) -- a diagnostic plot shouldn't panic the run over that.
+    data.sort_by(|a, b| a.0.total_cmp(&b.0));
 
     let max_n10 = *n10.iter().max().unwrap_or(&100) as f64 * 1.1;
     let max_purity = 1.00;

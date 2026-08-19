@@ -205,8 +205,11 @@ pub fn detect_ridges(
 ) -> CriticalPoints {
     let mut peaks = Vec::new();
     let mut boundaries = Vec::new();
+    // Kde::new doesn't validate non-empty data, so this indexes the same
+    // way x_min does above rather than pretending the unwrap was the only
+    // risk -- an empty `data` slice isn't handled by this function at all.
     let x_min = self.data[0];
-    let x_max = *self.data.iter().last().unwrap();
+    let x_max = self.data[self.data.len() - 1];
     
     let step_size = (x_max - x_min) / (steps as f64);
     
@@ -265,14 +268,18 @@ pub fn deconvolve_gaussian(
     let mut residual: Vec<f64> = curve.iter().map(|&(_, y)| y).collect();
     
     let mut found_peaks = Vec::new();
+    if residual.is_empty() {
+        return found_peaks;
+    }
 
     for _ in 0..max_peaks {
-        // 1. Find the index of the absolute maximum in the current residual curve
+        // 1. Find the index of the absolute maximum in the current residual curve.
+        // total_cmp, not partial_cmp: a caller-supplied curve can contain NaN.
         let (max_idx, &max_y) = residual
             .iter()
             .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .unwrap();
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .expect("residual checked non-empty above");
 
         // 2. If the highest remaining peak is just noise, we are done
         if max_y < noise_threshold {
@@ -302,7 +309,7 @@ pub fn deconvolve_gaussian(
     }
 
     // Sort the peaks from left to right on the X-axis before returning
-    found_peaks.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap());
+    found_peaks.sort_by(|a, b| a.x.total_cmp(&b.x));
     
     found_peaks
 }

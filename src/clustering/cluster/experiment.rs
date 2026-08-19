@@ -398,17 +398,30 @@ impl SpectralExperiment {
             }
         }
 
+        // cluster_ids are ids the engine itself assigned to clusters, and
+        // self.metadata is populated for every ingested spectrum before
+        // clustering runs, so every id here has a metadata entry.
         let mut file_assignments = Vec::with_capacity(n);
         for &id in cluster_ids {
-            let f_idx = self.metadata.get(id).unwrap().file_index;
+            let f_idx = self
+                .metadata
+                .get(id)
+                .expect("cluster id has a metadata entry")
+                .file_index;
             file_assignments.push(f_idx);
         }
 
         for i in 0..n {
             for j in i + 1..n {
                 if file_assignments[i] == file_assignments[j] {
-                    let s1 = self.metadata.get(cluster_ids[i]).unwrap();
-                    let s2 = self.metadata.get(cluster_ids[j]).unwrap();
+                    let s1 = self
+                        .metadata
+                        .get(cluster_ids[i])
+                        .expect("cluster id has a metadata entry");
+                    let s2 = self
+                        .metadata
+                        .get(cluster_ids[j])
+                        .expect("cluster id has a metadata entry");
 
                     let mz_diff = (s1.precursor_mz - s2.precursor_mz).abs();
                     let rt_diff =
@@ -546,7 +559,7 @@ impl SpectralExperiment {
     pub fn ingest_files_parallel(&mut self, folder_path: &str) {
         self.workflow.use_parallel = false;
         let paths: Vec<_> = std::fs::read_dir(folder_path)
-            .unwrap()
+            .unwrap_or_else(|e| panic!("cannot read directory {folder_path:?}: {e}"))
             .filter_map(|e| {
                 let path = e.ok()?.path();
                 let s = path.to_str()?.to_string();
@@ -567,7 +580,10 @@ impl SpectralExperiment {
         let start_index = self.file_names.len();
 
         self.file_names.extend(paths.iter().map(|p| {
-            strip_spectral_extension(p.split('/').last().unwrap()).to_string()
+            strip_spectral_extension(
+                p.split('/').last().expect("str::split always yields at least one item"),
+            )
+            .to_string()
         }));
         self.file_paths.extend(paths.iter().map(PathBuf::from));
 
@@ -724,8 +740,12 @@ impl SpectralExperiment {
     }
 
     pub fn ingest_files(&mut self, folder_path: &str) {
-        for file_entry in std::fs::read_dir(folder_path).unwrap() {
-            let file_path = file_entry.unwrap().path();
+        for file_entry in std::fs::read_dir(folder_path)
+            .unwrap_or_else(|e| panic!("cannot read directory {folder_path:?}: {e}"))
+        {
+            let file_path = file_entry
+                .unwrap_or_else(|e| panic!("error reading entry in {folder_path:?}: {e}"))
+                .path();
             if let Some(path_str) = file_path.to_str() {
                 if !path_str.ends_with(".mgf") {
                     continue;
@@ -765,10 +785,10 @@ impl SpectralExperiment {
             file_path
                 .split("/")
                 .last()
-                .unwrap()
+                .expect("str::split always yields at least one item")
                 .split(".mgf")
                 .next()
-                .unwrap()
+                .expect("str::split always yields at least one item")
                 .to_string(),
         );
 
@@ -982,8 +1002,12 @@ impl SpectralExperiment {
             }
 
             let mut engine = self.engine_like_self();
-            engine.split_on_mz_and_charge(msn_spectra).unwrap();
-            let clusters = engine.cluster().unwrap();
+            engine
+                .split_on_mz_and_charge(msn_spectra)
+                .expect("clustering I/O failure (e.g. low-mem spill write)");
+            let clusters = engine
+                .cluster()
+                .expect("clustering I/O failure (e.g. low-mem spill read)");
 
             Ok(clusters
                 .iter()
@@ -1135,8 +1159,12 @@ impl SpectralExperiment {
             let spectra_for_quality = msn_spectra.clone();
 
             let mut engine = self.engine_like_self();
-            engine.split_on_mz_and_charge(msn_spectra).unwrap();
-            let clusters = engine.cluster().unwrap();
+            engine
+                .split_on_mz_and_charge(msn_spectra)
+                .expect("clustering I/O failure (e.g. low-mem spill write)");
+            let clusters = engine
+                .cluster()
+                .expect("clustering I/O failure (e.g. low-mem spill read)");
 
             let elapsed_ms = partition_start.elapsed().as_millis();
             let done = completed.fetch_add(1, AtomicOrdering::Relaxed) + 1;
@@ -1239,11 +1267,16 @@ impl SpectralExperiment {
 
     pub fn prepare_clustering(&mut self) {
         let spectra = std::mem::take(&mut self.spectra);
-        self.engine.split_on_mz_and_charge(spectra).unwrap();
+        self.engine
+            .split_on_mz_and_charge(spectra)
+            .expect("clustering I/O failure (e.g. low-mem spill write)");
     }
 
     pub fn cluster(&mut self) -> FlatClusters {
-        let clusters = self.engine.cluster().unwrap();
+        let clusters = self
+            .engine
+            .cluster()
+            .expect("clustering I/O failure (e.g. low-mem spill read)");
 
         clusters
         // let mz_values: Vec<f64> = clusters
@@ -1282,15 +1315,21 @@ impl SpectralExperiment {
     /// indistinguishable from a crash for anything downstream. The two low-mem
     /// paths have always behaved this way; this one used to return early.
     pub fn write_results(&self, clusters: &FlatClusters, output_file_name: &str) {
-        let mut file = std::fs::File::create(output_file_name).unwrap();
+        let mut file = std::fs::File::create(output_file_name)
+            .unwrap_or_else(|e| panic!("cannot create output file {output_file_name:?}: {e}"));
         let mut writer = std::io::BufWriter::new(&mut file);
         writer.write(format!("# RedshiftMS (OxideMS core v{}) {}\n# eps = {}\n# hash_len = {}\n# total_spectra_parsed = {}\nidentifier,precursor_charge,precursor_mz,retention_time,cluster\n", env!("CARGO_PKG_VERSION"), if self.engine.exact {"(exact)"} else {""},  self.engine.epsilon, self.engine.hash_size(), self.total_spectra_ingested).as_bytes())
-            .unwrap();
+            .unwrap_or_else(|e| panic!("failed writing header to {output_file_name:?}: {e}"));
         let mut counter = 0;
         for cluster in clusters.iter() {
             counter += 1;
             for spectrum in cluster {
-                let metadata = self.metadata.get(*spectrum).unwrap();
+                // Every clustered id came from self.spectra, which is
+                // ingested in lockstep with self.metadata.
+                let metadata = self
+                    .metadata
+                    .get(*spectrum)
+                    .expect("clustered id has a metadata entry");
                 let precursor_charge = metadata.charge;
                 let precursor_mz = metadata.precursor_mz;
                 let retention_time = metadata.retention_time_in_seconds;
@@ -1307,7 +1346,7 @@ impl SpectralExperiment {
                         )
                         .as_bytes(),
                     )
-                    .unwrap();
+                    .unwrap_or_else(|e| panic!("failed writing row to {output_file_name:?}: {e}"));
             }
         }
     }

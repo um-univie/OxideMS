@@ -900,13 +900,16 @@ fn decode_binary_bytes(
 /// than the source), but at least it's one pass, not two.
 fn bytes_to_f64(bytes: &[u8], precision: Precision) -> Vec<f64> {
     match precision {
+        // SAFETY: chunks_exact(8) guarantees every yielded slice has length
+        // exactly 8 (the remainder, if any, is never yielded), so try_into::<[u8; 8]>
+        // cannot fail. Hot path (one call per peak value): skip the panic branch.
         Precision::F64 => bytes
             .chunks_exact(8)
-            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .map(|c| f64::from_le_bytes(unsafe { c.try_into().unwrap_unchecked() }))
             .collect(),
         Precision::F32 => bytes
             .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()) as f64)
+            .map(|c| f32::from_le_bytes(unsafe { c.try_into().unwrap_unchecked() }) as f64)
             .collect(),
     }
 }
@@ -917,13 +920,14 @@ fn bytes_to_f64(bytes: &[u8], precision: Precision) -> Vec<f64> {
 /// once, not widen-then-narrow via an intermediate `Vec<f64>`.
 fn bytes_to_f32(bytes: &[u8], precision: Precision) -> Vec<f32> {
     match precision {
+        // SAFETY: same chunks_exact(N) length guarantee as bytes_to_f64 above.
         Precision::F64 => bytes
             .chunks_exact(8)
-            .map(|c| f64::from_le_bytes(c.try_into().unwrap()) as f32)
+            .map(|c| f64::from_le_bytes(unsafe { c.try_into().unwrap_unchecked() }) as f32)
             .collect(),
         Precision::F32 => bytes
             .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .map(|c| f32::from_le_bytes(unsafe { c.try_into().unwrap_unchecked() }))
             .collect(),
     }
 }

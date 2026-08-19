@@ -229,7 +229,7 @@ impl<B: Backend> Batcher<B, FormulaTrainingItem, FormulaBatch<B>> for FormulaBat
 
         for mut item in items {
             // 1. Sort peaks by m/z to ensure [Mono, M+1, M+2] order
-            item.peaks.sort_by(|a, b| a.mz.partial_cmp(&b.mz).unwrap());
+            item.peaks.sort_by(|a, b| a.mz.total_cmp(&b.mz));
 
             // 2. Extract the Monoisotopic Intensity (for scaling)
             let mono_int = item
@@ -319,7 +319,7 @@ pub fn predict_formula<B: burn::tensor::backend::Backend>(
 
     let model = FormulaPredictor::new(device).load_record(record);
 
-    peaks.sort_by(|a, b| a.mz.partial_cmp(&b.mz).unwrap());
+    peaks.sort_by(|a, b| a.mz.total_cmp(&b.mz));
     let mono_int = peaks[0].intensity;
     // 3. Build the 4 features
     let mut features = [0.0_f32; 4];
@@ -350,7 +350,10 @@ pub fn predict_formula<B: burn::tensor::backend::Backend>(
 
     // 5. Extract the data back into standard Rust arrays
     let output_data = predicted_tensor.into_data();
-    let predicted_values = output_data.as_slice::<f32>().unwrap();
+    // FormulaPredictor's output layer is fixed at f32; not caller-input-dependent.
+    let predicted_values = output_data
+        .as_slice::<f32>()
+        .expect("FormulaPredictor output tensor is always f32");
 
     // Copy the 6 predicted floats [C, H, N, O, P, S] into a fixed array
     let mut predicted_atoms = [0.0; 6];

@@ -534,7 +534,7 @@ impl<'a> SpectrumAnalyzer<'a> {
         let std_dev = Self::calculate_standard_deviation(data, mean);
 
         let mut sorted_data = data.to_vec();
-        sorted_data.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        sorted_data.sort_unstable_by(|a, b| a.total_cmp(b));
 
         let q1 = sorted_data[data.len() / 4];
         let q3 = sorted_data[data.len() * 3 / 4];
@@ -576,8 +576,16 @@ impl<'a> SpectrumAnalyzer<'a> {
             return Ok(()); // Need at least 2 points for density
         }
 
-        let min_mz = *mzs.iter().min_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
-        let max_mz = *mzs.iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
+        // mzs.len() >= 2 checked above; total_cmp since precursor m/z from a
+        // real file can be NaN.
+        let min_mz = *mzs
+            .iter()
+            .min_by(|a, b| a.total_cmp(b))
+            .expect("mzs checked len >= 2 above");
+        let max_mz = *mzs
+            .iter()
+            .max_by(|a, b| a.total_cmp(b))
+            .expect("mzs checked len >= 2 above");
 
         // 1. Calculate dynamic bandwidth
         let bandwidth = Self::calculate_silverman_bandwidth(&mzs);
@@ -758,7 +766,7 @@ impl<'a> SpectrumAnalyzer<'a> {
             .collect();
 
         // Sort by RT to ensure the line draws correctly
-        tic_data.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        tic_data.sort_by(|a, b| a.0.total_cmp(&b.0));
 
         let max_rt = tic_data.last().map(|d| d.0).unwrap_or(1.0);
         let max_int = tic_data.iter().map(|d| d.1).fold(0.0, f32::max);
@@ -996,7 +1004,7 @@ impl<'a> SpectrumAnalyzer<'a> {
         if all_log_intensities.is_empty() {
             return Ok(());
         }
-        all_log_intensities.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        all_log_intensities.sort_by(|a, b| a.total_cmp(b));
 
         // Create the Quartiles object required by the new API
         let quartiles = Quartiles::new(&all_log_intensities);

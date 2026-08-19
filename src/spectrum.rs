@@ -103,7 +103,7 @@ impl MassSpectrum {
             })
             .collect::<Vec<Peak>>();
 
-        peaks.sort_by(|a, b| a.mz.partial_cmp(&b.mz).unwrap());
+        peaks.sort_by(|a, b| a.mz.total_cmp(&b.mz));
         MassSpectrum { peaks, charge: 0 }
     }
 
@@ -536,7 +536,7 @@ impl MassSpectralRecord {
     /// # Arguments
     /// * `peaks` - Vector of Peak(s)
     pub fn new(mut peaks: Vec<Peak>, charge: i8, id: usize) -> Self {
-        peaks.sort_by(|a, b| a.mz.partial_cmp(&b.mz).unwrap());
+        peaks.sort_by(|a, b| a.mz.total_cmp(&b.mz));
 
         Self {
             id,
@@ -632,8 +632,9 @@ impl MassSpectralRecord {
             };
         }
 
-        let data_min_mz = self.peaks().first().unwrap().mz;
-        let data_max_mz = self.peaks().last().unwrap().mz;
+        // SAFETY: peaks checked non-empty by the early return above.
+        let data_min_mz = unsafe { self.peaks().first().unwrap_unchecked() }.mz;
+        let data_max_mz = unsafe { self.peaks().last().unwrap_unchecked() }.mz;
         let bin_offset = config.bin_offset.unwrap_or(0.0);
 
         let first_nominal_center =
@@ -708,12 +709,12 @@ impl MassSpectralRecord {
             // Sort by intensity (descending), then take top N
             self.spectrum
                 .peaks
-                .sort_by(|a, b| b.intensity.partial_cmp(&a.intensity).unwrap());
+                .sort_by(|a, b| b.intensity.total_cmp(&a.intensity));
             self.spectrum.peaks.truncate(config.max_peaks);
             // Sort back by m/z
             self.spectrum
                 .peaks
-                .sort_by(|a, b| a.mz.partial_cmp(&b.mz).unwrap());
+                .sort_by(|a, b| a.mz.total_cmp(&b.mz));
         }
 
         // Normalize intensities to [0, 1]

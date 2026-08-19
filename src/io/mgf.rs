@@ -411,7 +411,10 @@ impl MgfParser {
                 mass_bucket_max_da,
             )?);
         }
-        let pool = self.shard_pool.as_ref().unwrap();
+        let pool = self
+            .shard_pool
+            .as_ref()
+            .expect("shard_pool was just initialized above if it was None");
         let parse_metadata = self.config.parse_metadata;
 
         // Chunking here is purely for parallel load-balancing: unlike the old
@@ -483,7 +486,9 @@ impl MgfParser {
                     let shard_idx =
                         mass_bucket_index(neutral_mass, mass_bucket_min_da, mass_bucket_max_da);
                     let offset = {
-                        let mut slot = pool[shard_idx].lock().unwrap();
+                        let mut slot = pool[shard_idx]
+                            .lock()
+                            .expect("shard slot mutex poisoned by a panicking writer thread");
                         slot.writer.write_all(&(bytes.len() as u32).to_le_bytes())?;
                         slot.writer.write_all(&bytes)?;
                         let offset = slot.offset;
@@ -510,7 +515,10 @@ impl MgfParser {
         // -> OS page cache only), so doing it for the whole pool after every
         // input file is negligible next to the actual parse/write work.
         for slot in pool.iter() {
-            slot.lock().unwrap().writer.flush()?;
+            slot.lock()
+                .expect("shard slot mutex poisoned by a panicking writer thread")
+                .writer
+                .flush()?;
         }
 
         let mut keys = Vec::with_capacity(n);

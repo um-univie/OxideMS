@@ -171,7 +171,8 @@ impl BitSetOpsMSB0 for [usize] {
                 result.push('_');
             }
             // Format as binary, padded with zeros to full width
-            write!(&mut result, "{:0width$b}", word, width = WORDSIZE).unwrap();
+            write!(&mut result, "{:0width$b}", word, width = WORDSIZE)
+                .expect("fmt::Write for String never fails");
         }
         result
     }

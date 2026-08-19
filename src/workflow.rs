@@ -33,7 +33,8 @@ use chemistry_consts::NEUTRON_MASS_AMU as NEUTRON_MASS;
 use std::any::TypeId;
 // C13-C12 monoisotopic mass difference: the expected m/z spacing between isotope peaks
 // for organic molecules at charge state z=1. Derived from IUPAC isotope masses.
-const C13_MASS_DIFF: f64 = ISOTOPES[6][1].unwrap().mass - ISOTOPES[6][0].unwrap().mass;
+const C13_MASS_DIFF: f64 = ISOTOPES[6][1].expect("C13 isotope entry").mass
+    - ISOTOPES[6][0].expect("C12 isotope entry").mass;
 use rayon::prelude::*;
 
 /// Expresses a peak-matching tolerance in either absolute (Da) or relative (ppm) units.
@@ -754,8 +755,14 @@ impl SingleOperation for Deisotope {
             }
         }
 
+        // SAFETY: is_isotope has exactly one entry per peak (built as
+        // vec![false; n] above) and peaks_mut()'s length hasn't changed
+        // since, so this zips 1:1 with retain's iteration -- iter can't run
+        // dry before retain does. Hot path: one call per peak per spectrum.
         let mut iter = is_isotope.into_iter();
-        spectrum.peaks_mut().retain(|_| !iter.next().unwrap());
+        spectrum
+            .peaks_mut()
+            .retain(|_| !unsafe { iter.next().unwrap_unchecked() });
     }
 }
 

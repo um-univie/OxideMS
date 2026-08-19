@@ -209,10 +209,19 @@ impl GpuSimilarity {
 
         let slice = self.staging_buffer.slice(0..copy_bytes);
         let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |v| tx.send(v).unwrap());
-        self.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        // tx.send only fails if rx was already dropped, which can't happen --
+        // rx is owned by this call frame and outlives the callback.
+        slice.map_async(wgpu::MapMode::Read, move |v| {
+            tx.send(v).expect("rx is held by the enclosing call frame")
+        });
 
         let mut result = vec![0.0f32; packed_size];
+        // A poll error (e.g. device lost) means the map callback may never
+        // fire -- skip the blocking recv and return the zeroed buffer rather
+        // than hang or panic the whole clustering run over a GPU hiccup.
+        if self.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+            return result;
+        }
         if let Ok(Ok(())) = rx.recv() {
             let mapped = slice.get_mapped_range();
             result.copy_from_slice(bytemuck::cast_slice(&mapped));

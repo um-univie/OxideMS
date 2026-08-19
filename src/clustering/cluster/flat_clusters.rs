@@ -101,7 +101,14 @@ impl FlatClusters {
             let end = self.offsets[i + 1];
 
             let cluster_mzs = &mz_values[start..end];
-            spans.push(cluster_mzs.last().unwrap() - cluster_mzs.get(0).unwrap())
+            // Empty clusters are real (see active_clusters_count) -- a span
+            // of 0.0 keeps spans[i] aligned with cluster i rather than
+            // panicking or shifting indices by skipping the push.
+            let span = match (cluster_mzs.first(), cluster_mzs.last()) {
+                (Some(&first), Some(&last)) => last - first,
+                _ => 0.0,
+            };
+            spans.push(span)
         }
         spans
     }
@@ -119,9 +126,17 @@ impl FlatClusters {
             let end = self.offsets[i + 1];
 
             let cluster_mzs = &mz_values[start..end];
-            let max_mass = cluster_mzs.iter().max_by(|a, b| a.total_cmp(b)).unwrap();
-            let min_mass = cluster_mzs.iter().min_by(|a, b| a.total_cmp(b)).unwrap();
-            spans.push(1_000_000.0 * ((max_mass - min_mass) / max_mass))
+            // Same empty-cluster case as get_cluster_spans above.
+            let span_ppm = match (
+                cluster_mzs.iter().max_by(|a, b| a.total_cmp(b)),
+                cluster_mzs.iter().min_by(|a, b| a.total_cmp(b)),
+            ) {
+                (Some(max_mass), Some(min_mass)) => {
+                    1_000_000.0 * ((max_mass - min_mass) / max_mass)
+                }
+                _ => 0.0,
+            };
+            spans.push(span_ppm)
         }
         spans
     }
