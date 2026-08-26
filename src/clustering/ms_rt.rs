@@ -35,6 +35,7 @@ pub fn plot_msrt_benchmarks(
     purity_data: &BTreeMap<usize, BinStats>,
     output_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    crate::plotting::ensure_fonts_registered();
     let root = BitMapBackend::new(output_path, (1024, 768)).into_drawing_area();
     root.fill(&WHITE)?;
 

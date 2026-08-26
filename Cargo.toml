@@ -10,7 +10,20 @@ chemistry_consts = "0.2.0"
 rayon = "1.11.0"
 rand = "0.10.0"
 rand_distr = "0.6.0"
-plotters = { version = "0.3.7" }
+plotters = { version = "0.3.7", default-features = false, features = [
+    "all_elements",
+    "all_series",
+    "bitmap_backend",
+    "bitmap_encoder",
+    "bitmap_gif",
+    "svg_backend",
+    "chrono",
+    "image",
+    "deprecated_items",
+    "full_palette",
+    "colormaps",
+    "ab_glyph",
+] }
 xxhash-rust = {version="0.8.15", features = ["xxh32"]}
 fast-float = "0.2.0"
 memmap2 = "0.9.10"

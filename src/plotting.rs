@@ -7,6 +7,34 @@ use std::f64::consts::PI;
 
 use std::error::Error;
 use std::path::Path;
+use std::sync::Once;
+
+static INIT_FONTS: Once = Once::new();
+
+/// Ensures that standard font families ("sans-serif", "serif", "monospace") are registered
+/// with plotters using an embedded pure-Rust font, completely avoiding any external
+/// system dependencies like fontconfig, pkg-config, or C libraries.
+pub fn ensure_fonts_registered() {
+    INIT_FONTS.call_once(|| {
+        const FONT_DATA: &[u8] = include_bytes!("assets/Tuffy.ttf");
+        let _ = plotters::style::register_font(
+            "sans-serif",
+            plotters::style::FontStyle::Normal,
+            FONT_DATA,
+        );
+        let _ = plotters::style::register_font(
+            "serif",
+            plotters::style::FontStyle::Normal,
+            FONT_DATA,
+        );
+        let _ = plotters::style::register_font(
+            "monospace",
+            plotters::style::FontStyle::Normal,
+            FONT_DATA,
+        );
+    });
+}
+
 // --- Plot Layout & Scaling Constants ---
 const BASE_RESOLUTION: f32 = 800.0;
 const BASE_WIDTH_FOR_STATS: f32 = 1024.0;
@@ -74,6 +102,7 @@ pub struct SpectrumPlotter {
 
 impl Default for SpectrumPlotter {
     fn default() -> Self {
+        ensure_fonts_registered();
         Self {
             width: 1024,
             height: 768,
@@ -457,6 +486,7 @@ pub struct SpectrumAnalyzer<'a> {
 
 impl<'a> SpectrumAnalyzer<'a> {
     pub fn new(data: &'a Vec<MSNSpectrum>) -> Self {
+        ensure_fonts_registered();
         Self { data }
     }
 
