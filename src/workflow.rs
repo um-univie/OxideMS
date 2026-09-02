@@ -627,6 +627,16 @@ impl SingleOperation for CentroidPeaks {
 /// at the expected `C13_MASS_DIFF / z` spacing (ties favor the lower charge, since that's the
 /// more common case for small-molecule fragments).
 ///
+/// A candidate satellite is only accepted if its intensity does not exceed the intensity of
+/// the peak immediately before it in the run (anchor, then M+1, then M+2, …). Natural isotope
+/// abundance means a real M+n peak is essentially never more intense than M+(n-1) in this mass
+/// range — without this check, an unrelated, more intense peak that merely happens to sit near
+/// isotope spacing below a *weaker* peak gets absorbed as if the weak peak were its monoisotopic
+/// anchor, deleting real signal (observed in practice: a minor H-loss fragment sitting ~1 Da
+/// below a spectrum's actual base peak wrongly "explained away" the base peak as its M+1
+/// isotope). Requiring non-increasing intensity along the run rules that out while still
+/// allowing genuine envelopes, whose intensities fall off with each successive isotope.
+///
 /// Returns `(charge, satellite_indices, summed_satellite_intensity)`, or `None` if no charge
 /// state matched even one satellite. Candidate satellites already claimed by another envelope
 /// (`is_claimed[j]`) are skipped. Shared by [`Deisotope`] (which claims the returned satellites
@@ -644,6 +654,7 @@ fn best_isotope_run(
     for z in 1..=max_charge {
         let step = C13_MASS_DIFF / (z as f64);
         let mut current_mz = peaks[anchor_idx].mz;
+        let mut current_intensity = peaks[anchor_idx].intensity;
         let mut satellites = Vec::new();
         let mut total_extra = 0.0f32;
 
@@ -662,7 +673,9 @@ fn best_isotope_run(
                     break;
                 }
 
-                if (target_mz - expected_mz).abs() <= tolerance {
+                if (target_mz - expected_mz).abs() <= tolerance
+                    && peaks[j].intensity <= current_intensity
+                {
                     found = Some(j);
                     break;
                 }
@@ -672,6 +685,7 @@ fn best_isotope_run(
                 Some(j) => {
                     total_extra += peaks[j].intensity;
                     current_mz = peaks[j].mz;
+                    current_intensity = peaks[j].intensity;
                     satellites.push(j);
                 }
                 // No M+1 means no M+2 either.
@@ -2046,5 +2060,55 @@ mod deisotope_charge_contamination_regression_test {
         assert!((merged.intensity - 1300.0).abs() < 1e-3);
         let decoy = s.peaks().iter().find(|p| (p.mz - 500.5017).abs() < 1e-6).unwrap();
         assert!((decoy.intensity - 50.0).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod deisotope_intensity_inversion_regression_test {
+    //! Regression test for a real false positive found on experimental data (steroid EAD
+    //! spectrum, Stanozolol at 8 eV): a minor H-loss fragment sitting ~1.007 Da below the
+    //! spectrum's actual base peak/precursor is close enough to the C13 isotope spacing
+    //! (1.0034 Da) to be misread, at realistic tolerances, as the *monoisotopic* anchor of
+    //! an "isotope" whose real M+1 satellite is the base peak itself — 20x more intense than
+    //! the supposed monoisotopic peak. `best_isotope_run` now refuses a satellite match whose
+    //! intensity exceeds the intensity of the peak before it in the run, so the dominant peak
+    //! survives untouched.
+
+    use super::*;
+
+    #[test]
+    fn weaker_peak_cannot_absorb_a_much_stronger_one_as_its_isotope() {
+        let peaks = vec![
+            Peak::new(328.2506, 51.0),  // minor H-loss fragment, NOT a monoisotopic anchor
+            Peak::new(329.2572, 1000.0), // real base peak / precursor, 1.0066 Da higher
+        ];
+        let mut s = MassSpectralRecord::new(peaks, 1, 0);
+
+        Deisotope::new(1, 0.01, 5).operate_single(&mut s);
+
+        // Both peaks must survive: 329.2572 is far too intense to be an isotope of 328.2506.
+        assert_eq!(s.peaks().len(), 2);
+        let base = s.peaks().iter().find(|p| (p.mz - 329.2572).abs() < 1e-6).unwrap();
+        assert!((base.intensity - 1000.0).abs() < 1e-3);
+        let minor = s.peaks().iter().find(|p| (p.mz - 328.2506).abs() < 1e-6).unwrap();
+        assert!((minor.intensity - 51.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn genuine_descending_envelope_still_merges() {
+        // A real envelope where intensity legitimately falls off with each isotope must still
+        // be collapsed as before.
+        let peaks = vec![
+            Peak::new(500.0, 1000.0),
+            Peak::new(501.0034, 300.0),
+            Peak::new(502.0067, 50.0),
+        ];
+        let mut s = MassSpectralRecord::new(peaks, 1, 0);
+
+        Deisotope::new(1, 0.005, 5).operate_single(&mut s);
+
+        assert_eq!(s.peaks().len(), 1);
+        let merged = s.peaks().iter().find(|p| (p.mz - 500.0).abs() < 1e-6).unwrap();
+        assert!((merged.intensity - 1350.0).abs() < 1e-3);
     }
 }
