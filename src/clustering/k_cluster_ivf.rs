@@ -148,7 +148,10 @@ impl<'a> BucketIndex<'a> {
 
         centroids
     }
-    pub fn build(bucket_data: &'a [f32], dim: usize, max_k: usize) -> Self {
+    /// `par` controls the k-means routing matmul's own threading: pass
+    /// [`faer::Par::Seq`] when the caller is already inside a rayon task, so
+    /// the matmul does not compete with its sibling tasks for the pool.
+    pub fn build(bucket_data: &'a [f32], dim: usize, max_k: usize, par: faer::Par) -> Self {
         let n_vectors = bucket_data.len() / dim;
 
         let n_list = if n_vectors < 100 {
@@ -205,7 +208,7 @@ faer::linalg::matmul::matmul(
     a_mat,                 // A (lhs: bucket data)
     b_mat.transpose(),     // B^T (rhs: centroids, transposed)
     1.0,                   // alpha = 1.0
-    faer::Par::rayon(0),   // Let faer handle chunking and threading via Rayon
+    par,
 );
             // 2. Argmax: Find best centroid for each vector.
             // Each row is independent (reads its own slice of scores_buffer,
@@ -330,8 +333,29 @@ faer::linalg::matmul::matmul(
         }
     }
     pub fn extract_edges(&self, k: usize, epsilon: f32) -> Vec<Edge> {
+        self.extract_edges_for_queries(0, self.n_vectors, k, epsilon, faer::Par::rayon(0))
+    }
+
+    /// [`extract_edges`](Self::extract_edges) restricted to queries in
+    /// `query_start..query_end`. Candidates are still every indexed vector;
+    /// only the set of rows searched *from* is narrowed, so a caller holding
+    /// an index over a superset of its own rows pays for its own searches
+    /// alone. Returned ids are indices into the indexed data, as always.
+    pub fn extract_edges_for_queries(
+        &self,
+        query_start: usize,
+        query_end: usize,
+        k: usize,
+        epsilon: f32,
+        par: faer::Par,
+    ) -> Vec<Edge> {
+        let query_end = query_end.min(self.n_vectors);
+        if query_start >= query_end {
+            return Vec::new();
+        }
+        let n_queries = query_end - query_start;
         let min_similarity = 1.0 - epsilon;
-        let total_routing_elements = self.n_vectors * self.n_list;
+        let total_routing_elements = n_queries * self.n_list;
 
         // 1. AVOID ZEROING MEMORY: sgemm (beta = 0.0) overwrites everything.
         let mut routing_scores = Vec::with_capacity(total_routing_elements);
@@ -342,10 +366,12 @@ faer::linalg::matmul::matmul(
             routing_scores.set_len(total_routing_elements);
         }
 
-// 1. Create safe row-major matrix views
-let a_mat = faer::MatRef::from_row_major_slice(&self.bucket_data, self.n_vectors, self.dim);
+// 1. Create safe row-major matrix views. Only the query rows are routed --
+// the rest of the index is candidates, never a search origin here.
+let query_slice = &self.bucket_data[query_start * self.dim..query_end * self.dim];
+let a_mat = faer::MatRef::from_row_major_slice(query_slice, n_queries, self.dim);
 let b_mat = faer::MatRef::from_row_major_slice(&self.centroids, self.n_list, self.dim);
-let c_mat = faer::MatMut::from_row_major_slice_mut(&mut routing_scores, self.n_vectors, self.n_list);
+let c_mat = faer::MatMut::from_row_major_slice_mut(&mut routing_scores, n_queries, self.n_list);
 
 // 2. Perform the matrix multiplication (Scores = BucketData * Centroids^T)
 faer::linalg::matmul::matmul(
@@ -354,14 +380,14 @@ faer::linalg::matmul::matmul(
     a_mat,                 // A
     b_mat.transpose(),     // B^T
     1.0,                   // alpha = 1.0
-    faer::Par::rayon(0),   // Multithreading via Rayon
+    par,
 );
 
         // 2. PARALLELIZE WITH RAYON (while preserving allocation hoisting)
         // We chunk the queries so we only allocate the hot-loop buffers a few times per CPU core.
         let chunk_size = 128; // Tune this: 64, 128, or 256 usually work best
 
-        let all_edges: Vec<Edge> = (0..self.n_vectors)
+        let all_edges: Vec<Edge> = (query_start..query_end)
             .into_par_iter()
             .chunks(chunk_size)
             .flat_map_iter(|chunk| {
@@ -378,7 +404,7 @@ faer::linalg::matmul::matmul(
                     let query_vec = &self.bucket_data[q_offset..q_offset + self.dim];
 
                     // FAST COPY: use extend instead of looping push
-                    let r_offset = query_id * self.n_list;
+                    let r_offset = (query_id - query_start) * self.n_list;
                     let scores = &routing_scores[r_offset..r_offset + self.n_list];
                     // OPTIMIZATION 1: Early Discard before sorting
                     for (c_id, &c_score) in scores.iter().enumerate() {
@@ -533,11 +559,71 @@ pub fn graph_dbscan(
     labels
 }
 
-/// Default block size for [`windowed_mass_edges`]'s batched matmul. Large
-/// enough to keep GEMM efficient (a 4096 x ~4096 f32 matmul is a solid-sized
-/// unit of work for faer/rayon), small enough that the "lookahead" superset
-/// each block computes past its own rows doesn't balloon.
+/// Upper bound on the rows in one [`windowed_mass_edges`] block. Blocks are
+/// normally cut earlier than this, by mass span (see [`mass_span_blocks`]);
+/// this caps the pathological case where a huge run of spectra sits inside a
+/// single tolerance width, which would otherwise put a `rows x rows` score
+/// matrix on the heap.
 pub const WINDOWED_EDGES_BLOCK_SIZE: usize = 4096;
+
+/// How many tolerance widths of mass a [`windowed_mass_edges`] block may span
+/// before it is cut. A block costs `rows x window_len` dot products but only
+/// the pairs within one tolerance of each other can become edges, so the
+/// wasted fraction of that matmul is roughly this multiple. Keeping it small
+/// keeps the waste small; keeping it above 1 means the lookahead past the
+/// block's own rows stays a minority of the window.
+const BLOCK_SPAN_TOLERANCES: f64 = 8.0;
+
+/// Floor on block rows, as a divisor of the maximum: a block never falls
+/// below `WINDOWED_EDGES_BLOCK_SIZE / 16` rows even if its mass span is
+/// already over budget. Sparse mass regions would otherwise cut blocks down
+/// to a handful of rows, where the matmul is too small to be worth
+/// dispatching.
+const BLOCK_MIN_ROWS_DIVISOR: usize = 16;
+
+/// Cuts `neutral_masses` (sorted ascending) into blocks for
+/// [`windowed_mass_edges`], returning boundary indices that start with `0`
+/// and end with `neutral_masses.len()`, so consecutive pairs
+/// `boundaries[i]..boundaries[i + 1]` are the blocks.
+///
+/// A block ends once it has covered [`BLOCK_SPAN_TOLERANCES`] tolerance
+/// widths of mass, clamped to at least `max_rows / BLOCK_MIN_ROWS_DIVISOR`
+/// and at most `max_rows` rows. Sizing by mass span rather than by a fixed
+/// row count is what keeps the per-block matmul honest: the block computes
+/// every pair among its rows, but only pairs within one tolerance of each
+/// other can survive the mass check, so a block spanning a thousand
+/// tolerance widths throws away all but a thousandth of its own work. Total
+/// dot products across all blocks are `n_vectors x (block rows + lookahead)`,
+/// i.e. linear in the block size, so cutting blocks at the point where they
+/// stop being locally dense is a direct saving in both time and in the size
+/// of the score buffer held per in-flight block.
+///
+/// Runs in O(n) overall: each row is examined by exactly one block.
+fn mass_span_blocks(
+    neutral_masses: &[f64],
+    max_rows: usize,
+    max_gap_at: impl Fn(f64) -> f64,
+) -> Vec<usize> {
+    let n = neutral_masses.len();
+    let mut boundaries = vec![0usize];
+    let max_rows = max_rows.max(1);
+    let min_rows = (max_rows / BLOCK_MIN_ROWS_DIVISOR).max(1);
+    let mut start = 0usize;
+    while start < n {
+        let hard_end = (start + max_rows).min(n);
+        // Always take `min_rows` first, then keep taking rows while the block
+        // still fits in its mass budget. `end > start` always holds, so this
+        // terminates.
+        let mut end = (start + min_rows).min(n);
+        let span_limit = BLOCK_SPAN_TOLERANCES * max_gap_at(neutral_masses[start]);
+        while end < hard_end && neutral_masses[end] - neutral_masses[start] <= span_limit {
+            end += 1;
+        }
+        boundaries.push(end);
+        start = end;
+    }
+    boundaries
+}
 
 /// Finds cosine-similarity edges within `mz_tolerance` of each other, given
 /// `bucket_data` (n_vectors x dim, L2-normalized hashed spectra) and
@@ -571,8 +657,10 @@ pub const WINDOWED_EDGES_BLOCK_SIZE: usize = 4096;
 /// training, no approximation, and the O(chain length) cost of a giant
 /// partition collapses to O(n_vectors * local mass density) instead of O(n *
 /// n_list). To keep the GEMM efficiency IVF had, spectra are processed in
-/// contiguous blocks: for each block, one matmul is computed between that
-/// block's rows and every row within reach of the block's own last (i.e.
+/// contiguous blocks, sized by mass span rather than by a fixed row count
+/// (see [`mass_span_blocks`] -- `block_size` here is the upper bound on a
+/// block's rows, not its usual size): for each block, one matmul is computed
+/// between that block's rows and every row within reach of its own last (i.e.
 /// heaviest, since sorted ascending) member — a superset of what any single
 /// row in the block actually needs — then each row's real neighbors are
 /// picked out of its slice of that block's scores with an exact per-pair
@@ -619,34 +707,51 @@ pub fn windowed_mass_edges(
         }
     };
 
-    let num_blocks = n_vectors.div_ceil(block_size);
+    let block_boundaries = mass_span_blocks(neutral_masses, block_size, max_gap_at);
+    let num_blocks = block_boundaries.len() - 1;
 
     // For each block, how far forward the candidate window must extend to
     // cover every possible tolerance-neighbor of any row in that block --
     // driven by the block's last (heaviest) row, since that's the furthest
-    // any row in the block could reach. `lookahead` only ever moves forward
-    // across the whole loop, so this is one O(n_vectors) pass total, not one
-    // per block.
+    // any row in the block could reach. The bound has to match the per-pair
+    // test below, which evaluates the tolerance at the *heavier* partner's
+    // mass: under ppm that is strictly wider than the tolerance at the
+    // block's own last row, and pairs in the difference would otherwise be
+    // scored by nobody, since the next block only looks forward.
+    // `lookahead` only ever moves forward across the whole loop, so this is
+    // one O(n_vectors) pass total, not one per block.
     let mut block_window_end = vec![0usize; num_blocks];
     let mut lookahead = 0usize;
     for (b, window_end) in block_window_end.iter_mut().enumerate() {
-        let block_end = ((b + 1) * block_size).min(n_vectors);
+        let block_end = block_boundaries[b + 1];
         let last_mass = neutral_masses[block_end - 1];
-        let max_gap = max_gap_at(last_mass);
         if lookahead < block_end {
             lookahead = block_end;
         }
-        while lookahead < n_vectors && neutral_masses[lookahead] - last_mass <= max_gap {
+        while lookahead < n_vectors
+            && neutral_masses[lookahead] - last_mass <= max_gap_at(neutral_masses[lookahead])
+        {
             lookahead += 1;
         }
         *window_end = lookahead;
     }
 
+    // Blocks already run one per rayon task, so a matmul that also spreads
+    // itself across the pool just fights its siblings for the same threads.
+    // The exception is having too few blocks to fill the pool -- one large
+    // dense partition can be a handful of blocks on a many-core machine, and
+    // there a sequential matmul would leave most cores idle.
+    let inner_par = if num_blocks >= rayon::current_num_threads() {
+        faer::Par::Seq
+    } else {
+        faer::Par::rayon(0)
+    };
+
     (0..num_blocks)
         .into_par_iter()
         .flat_map_iter(|b| {
-            let block_start = b * block_size;
-            let block_end = ((b + 1) * block_size).min(n_vectors);
+            let block_start = block_boundaries[b];
+            let block_end = block_boundaries[b + 1];
             let window_end = block_window_end[b];
             let query_len = block_end - block_start;
             let window_len = window_end - block_start;
@@ -661,6 +766,7 @@ pub fn windowed_mass_edges(
                     window_end,
                     max_gap_at,
                     min_similarity,
+                    inner_par,
                 );
             }
 
@@ -677,7 +783,7 @@ pub fn windowed_mass_edges(
                 a_mat,
                 b_mat.transpose(),
                 1.0,
-                faer::Par::rayon(0),
+                inner_par,
             );
 
             let mut local_edges = Vec::new();
@@ -722,27 +828,26 @@ fn dense_window_edges_via_ivf(
     window_end: usize,
     max_gap_at: impl Fn(f64) -> f64,
     min_similarity: f32,
+    par: faer::Par,
 ) -> Vec<Edge> {
     let candidate_slice = &bucket_data[block_start * dim..window_end * dim];
-    let index = BucketIndex::build(candidate_slice, dim, 64);
-    let local_edges = index.extract_edges(64, 1.0 - min_similarity);
+    let index = BucketIndex::build(candidate_slice, dim, 64, par);
     let query_len = block_end - block_start;
+    // Search only from this block's own rows. The rest of the window is
+    // candidates here and queries in their own block, so searching from them
+    // too would compute the same neighbourhoods twice -- for a window several
+    // times the block's size, most of the search was thrown away by the
+    // `source_id >= query_len` test that used to sit below.
+    let local_edges = index.extract_edges_for_queries(0, query_len, 64, 1.0 - min_similarity, par);
 
-    // `extract_edges` searches from every row in the window, not just this
-    // block's own rows, and a mutual pair can be found from either side
-    // (i's search lands on j, j's search lands on i) -- both filtered down
-    // to the same canonical (smaller, larger) id pair below, so dedup on
-    // that pair rather than assuming the direction alone is unique.
+    // A mutual pair can still be found from either side within this block
+    // (i's search lands on j, j's search lands on i) -- both filtered down to
+    // the same canonical (smaller, larger) id pair below, so dedup on that
+    // pair rather than assuming the direction alone is unique.
     let mut seen = std::collections::HashSet::new();
     local_edges
         .into_iter()
         .filter_map(|edge| {
-            // Only keep edges whose query side is this block's own row --
-            // the candidate side may reach into later blocks' rows, which
-            // will (re-)search their own neighborhoods when their turn comes.
-            if edge.source_id >= query_len {
-                return None;
-            }
             let global_i = block_start + edge.source_id;
             let global_j = block_start + edge.target_id;
             let (global_i, global_j) = if global_i < global_j {
@@ -820,6 +925,70 @@ mod windowed_mass_edges_tests {
         (bucket_data, neutral_masses)
     }
 
+    /// Random L2-normalized vectors in one of two near-orthogonal
+    /// directions, with randomly spaced masses. The two directions are far
+    /// enough apart that no similarity lands near the threshold, so the only
+    /// thing that decides an edge is the mass window -- which is what these
+    /// tests are about, and it keeps the comparison against the brute-force
+    /// reference free of float-boundary flakiness.
+    fn random_dataset(n: usize, seed: u64, max_step: f64) -> (Vec<f32>, Vec<f64>) {
+        let dim = 4;
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut bucket_data = vec![0.0f32; n * dim];
+        let mut neutral_masses = vec![0.0f64; n];
+        let mut mass = 1000.0f64;
+        for i in 0..n {
+            let base = rng.random_range(0..2usize);
+            let jitter = rng.random_range(-0.02f32..0.02f32);
+            let mut v = [0.0f32; 4];
+            v[base] = 1.0;
+            v[(base + 2) % dim] = jitter;
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            for d in 0..dim {
+                bucket_data[i * dim + d] = v[d] / norm;
+            }
+            neutral_masses[i] = mass;
+            mass += rng.random_range(0.0..max_step);
+        }
+        (bucket_data, neutral_masses)
+    }
+
+    /// O(n^2) reference: every forward pair whose mass gap is within
+    /// tolerance *evaluated at the heavier partner* (the convention
+    /// [`windowed_mass_edges`] and `mz_charge_boundaries` both use) and whose
+    /// cosine similarity clears the threshold.
+    fn brute_force_edge_set(
+        bucket_data: &[f32],
+        dim: usize,
+        neutral_masses: &[f64],
+        tolerance: MassTolerance,
+        epsilon: f32,
+    ) -> std::collections::HashSet<(usize, usize)> {
+        let min_similarity = 1.0 - epsilon;
+        let n = neutral_masses.len();
+        let mut out = std::collections::HashSet::new();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let gap = neutral_masses[j] - neutral_masses[i];
+                let max_gap = match tolerance {
+                    MassTolerance::Da(tol) => tol,
+                    MassTolerance::Ppm(tol) => neutral_masses[j] * (tol / 1_000_000.0),
+                };
+                if gap > max_gap {
+                    continue;
+                }
+                let score = fast_dot_product(
+                    &bucket_data[i * dim..(i + 1) * dim],
+                    &bucket_data[j * dim..(j + 1) * dim],
+                );
+                if score >= min_similarity {
+                    out.insert((i, j));
+                }
+            }
+        }
+        out
+    }
+
     fn edge_set(edges: &[Edge]) -> std::collections::HashSet<(usize, usize)> {
         edges
             .iter()
@@ -880,5 +1049,197 @@ mod windowed_mass_edges_tests {
                 "unexpected cross-cluster edge: {edge:?}"
             );
         }
+    }
+
+    #[test]
+    fn matches_brute_force_with_da_tolerance() {
+        let dim = 4;
+        let epsilon = 0.3;
+        let tolerance = MassTolerance::Da(0.05);
+        for seed in 0..4u64 {
+            let (bucket_data, neutral_masses) = random_dataset(600, seed, 0.02);
+            let expected =
+                brute_force_edge_set(&bucket_data, dim, &neutral_masses, tolerance, epsilon);
+            assert!(!expected.is_empty(), "seed {seed}: reference found no edges");
+            for block_size in [1, 2, 7, 64, 512, 4096] {
+                let actual = edge_set(&windowed_mass_edges(
+                    &bucket_data,
+                    dim,
+                    &neutral_masses,
+                    tolerance,
+                    epsilon,
+                    block_size,
+                    usize::MAX,
+                ));
+                assert_eq!(
+                    actual, expected,
+                    "seed {seed}, block_size {block_size}: windowed edges differ from brute force"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn matches_brute_force_with_ppm_tolerance() {
+        let dim = 4;
+        let epsilon = 0.3;
+        let tolerance = MassTolerance::Ppm(5_000.0);
+        for seed in 10..14u64 {
+            let (bucket_data, neutral_masses) = random_dataset(600, seed, 2.0);
+            let expected =
+                brute_force_edge_set(&bucket_data, dim, &neutral_masses, tolerance, epsilon);
+            assert!(!expected.is_empty(), "seed {seed}: reference found no edges");
+            for block_size in [1, 2, 7, 64, 512, 4096] {
+                let actual = edge_set(&windowed_mass_edges(
+                    &bucket_data,
+                    dim,
+                    &neutral_masses,
+                    tolerance,
+                    epsilon,
+                    block_size,
+                    usize::MAX,
+                ));
+                assert_eq!(
+                    actual, expected,
+                    "seed {seed}, block_size {block_size}: windowed edges differ from brute force"
+                );
+            }
+        }
+    }
+
+    /// Blocking is an implementation detail of how the work is batched, so
+    /// the edge set must not depend on it -- including on how the mass-span
+    /// rule happens to cut blocks for a given dataset.
+    #[test]
+    fn block_size_does_not_change_the_edge_set() {
+        let dim = 4;
+        let epsilon = 0.3;
+        let (bucket_data, neutral_masses) = random_dataset(800, 42, 0.01);
+        let tolerance = MassTolerance::Da(0.05);
+        let reference = edge_set(&windowed_mass_edges(
+            &bucket_data,
+            dim,
+            &neutral_masses,
+            tolerance,
+            epsilon,
+            1,
+            usize::MAX,
+        ));
+        for block_size in [2, 3, 7, 64, 333, 1024, 8192] {
+            let actual = edge_set(&windowed_mass_edges(
+                &bucket_data,
+                dim,
+                &neutral_masses,
+                tolerance,
+                epsilon,
+                block_size,
+                usize::MAX,
+            ));
+            assert_eq!(actual, reference, "block_size {block_size} changed the edges");
+        }
+    }
+
+    /// Every edge must be forward (`source_id < target_id`) and appear once:
+    /// `graph_dbscan` builds its adjacency list symmetrically from each edge,
+    /// so a reverse or duplicate edge inflates neighbour counts.
+    #[test]
+    fn edges_are_forward_and_unique() {
+        let dim = 4;
+        let (bucket_data, neutral_masses) = random_dataset(500, 7, 0.01);
+        let edges = windowed_mass_edges(
+            &bucket_data,
+            dim,
+            &neutral_masses,
+            MassTolerance::Da(0.05),
+            0.3,
+            64,
+            usize::MAX,
+        );
+        assert!(!edges.is_empty());
+        let mut seen = std::collections::HashSet::new();
+        for edge in &edges {
+            assert!(
+                edge.source_id < edge.target_id,
+                "non-forward edge: {edge:?}"
+            );
+            assert!(seen.insert((edge.source_id, edge.target_id)), "duplicate edge: {edge:?}");
+        }
+    }
+
+    fn block_sizes(boundaries: &[usize]) -> Vec<usize> {
+        boundaries.windows(2).map(|w| w[1] - w[0]).collect()
+    }
+
+    /// Masses packed inside a single tolerance width: nothing to cut on, so
+    /// blocks run to the row cap.
+    #[test]
+    fn mass_span_blocks_cap_dense_regions_at_max_rows() {
+        let masses: Vec<f64> = (0..1000).map(|i| 1000.0 + i as f64 * 1e-6).collect();
+        let boundaries = mass_span_blocks(&masses, 256, |_| 0.01);
+        assert_eq!(block_sizes(&boundaries), vec![256, 256, 256, 232]);
+    }
+
+    /// Masses spaced well beyond the span budget: every block bottoms out at
+    /// the row floor rather than shrinking to single rows.
+    #[test]
+    fn mass_span_blocks_floor_sparse_regions_at_min_rows() {
+        let masses: Vec<f64> = (0..100).map(|i| 1000.0 + i as f64 * 10.0).collect();
+        let boundaries = mass_span_blocks(&masses, 64, |_| 0.01);
+        // 64 / BLOCK_MIN_ROWS_DIVISOR = 4 rows per block.
+        assert_eq!(block_sizes(&boundaries), vec![4; 25]);
+    }
+
+    /// Whatever the mass distribution, the boundaries must be a partition of
+    /// `0..n`: strictly increasing, non-empty blocks, no row skipped or
+    /// visited twice.
+    #[test]
+    fn mass_span_blocks_partition_every_row() {
+        for (n, seed, max_step) in [(0, 1, 0.0), (1, 2, 0.1), (7, 3, 0.1), (997, 4, 0.5)] {
+            let (_, masses) = random_dataset(n, seed, max_step);
+            let boundaries = mass_span_blocks(&masses, 64, |m| m * 1e-5);
+            assert_eq!(boundaries.first().copied(), Some(0));
+            assert_eq!(boundaries.last().copied(), Some(n), "n = {n}");
+            for w in boundaries.windows(2) {
+                assert!(w[1] > w[0], "empty or backwards block in {boundaries:?}");
+                assert!(w[1] - w[0] <= 64, "block over the row cap in {boundaries:?}");
+            }
+        }
+    }
+
+    /// Regression test for the lookahead bound.
+    ///
+    /// A block's candidate window used to be extended while
+    /// `mass - last_mass <= max_gap_at(last_mass)`, but the per-pair test
+    /// that decides an edge uses `max_gap_at(mass_of_heavier)`, which is
+    /// strictly larger under ppm tolerance. Pairs in that sliver were never
+    /// scored: the earlier block's window stopped short of them, and the
+    /// later block only looks forward. The ppm here is exaggerated so the
+    /// sliver is wide enough to write down; at instrument tolerances it is
+    /// `mass * ppm^2` wide.
+    #[test]
+    fn lookahead_reaches_neighbours_of_the_blocks_last_row() {
+        let dim = 4;
+        // Identical vectors: similarity is 1.0 for every pair, so the mass
+        // window alone decides the edges.
+        let bucket_data = vec![1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0];
+        // 10% tolerance. Row 1 (the last row of a 2-row block) reaches row 2:
+        // gap 105.0 <= max_gap_at(1105.0) = 110.5. Bounding the window by
+        // max_gap_at(1000.0) = 100.0 instead stops one row short.
+        let neutral_masses = vec![1000.0, 1000.0, 1105.0];
+        let tolerance = MassTolerance::Ppm(100_000.0);
+        let edges = edge_set(&windowed_mass_edges(
+            &bucket_data,
+            dim,
+            &neutral_masses,
+            tolerance,
+            0.3,
+            2,
+            usize::MAX,
+        ));
+        assert_eq!(
+            edges,
+            brute_force_edge_set(&bucket_data, dim, &neutral_masses, tolerance, 0.3),
+            "window must cover every tolerance-neighbour of the block's last row"
+        );
     }
 }
