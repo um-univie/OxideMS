@@ -24,16 +24,17 @@ use std::{
 pub const MGF_SPECTRA_SIZE: usize = 5_000;
 
 /// Width (Da) of each mass bucket in [`parse_file_low_mem`](MgfParser::parse_file_low_mem)'s
-/// shard pool. Always 1 Da — many multiples of a typical `mz_tolerance` (20
+/// shard pool. 25 Da — many multiples of a typical `mz_tolerance` (20
 /// ppm ~= 0.03 Da at 1500 Da) so a clustering partition's narrow mass window
-/// almost always falls inside a single bucket/shard file, instead of
+/// almost always falls inside a single bucket/shard file, while keeping the
+/// pool to ~60 shard files over 50-1500 Da (1 Da buckets needed ~1,450), instead of
 /// scattering across every shard the way round-robin-by-parse-order
 /// assignment did. The bucket *range* (min/max Da) is not a fixed constant:
 /// it's passed in per call, derived from the caller's configured mz range
 /// (e.g. `ClusterEngine::hasher`'s `min_mz`/`max_mz` for whichever preset is
 /// in use) — spectra outside that range are filtered out before ingestion
 /// anyway, so sizing the pool past it would only create dead buckets.
-pub const MASS_BUCKET_WIDTH_DA: f64 = 1.0;
+pub const MASS_BUCKET_WIDTH_DA: f64 = 25.0;
 
 /// Number of shards in the mass-bucketed pool for a given `[min_da, max_da)`
 /// range (fixed regardless of corpus size or thread count).
