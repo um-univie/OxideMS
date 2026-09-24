@@ -309,6 +309,7 @@ fn parse_spectrum_slice_quickxml(
     let mut current_array_kind = ArrayKind::Other;
     let mut current_precision = Precision::F64;
     let mut current_compressed = false;
+    let mut current_numpress = Numpress::None;
     let mut mz_array: Vec<f64> = Vec::new();
     let mut intensity_array: Vec<f32> = Vec::new();
     let mut in_binary = false;
@@ -340,6 +341,7 @@ fn parse_spectrum_slice_quickxml(
                         current_array_kind = ArrayKind::Other;
                         current_precision = Precision::F64;
                         current_compressed = false;
+                        current_numpress = Numpress::None;
                     }
                     b"binary" => in_binary = true,
                     b"cvParam" => {
@@ -407,6 +409,25 @@ fn parse_spectrum_slice_quickxml(
                             b"MS:1000523" => current_precision = Precision::F64,
                             // 32-bit float
                             b"MS:1000521" => current_precision = Precision::F32,
+                            // MS-Numpress positive-integer, with and without zlib.
+                            // Anything decoded as plain floats here would come out
+                            // the wrong length and silently drop the spectrum, so
+                            // these are recognised explicitly.
+                            b"MS:1002745" => current_numpress = Numpress::Pic,
+                            b"MS:1002747" => {
+                                current_numpress = Numpress::Pic;
+                                current_compressed = true;
+                            }
+                            b"MS:1002312" => current_numpress = Numpress::Linear,
+                            b"MS:1002746" => {
+                                current_numpress = Numpress::Linear;
+                                current_compressed = true;
+                            }
+                            b"MS:1002314" => current_numpress = Numpress::Slof,
+                            b"MS:1002748" => {
+                                current_numpress = Numpress::Slof;
+                                current_compressed = true;
+                            }
                             // zlib compression
                             b"MS:1000574" => current_compressed = true,
                             // no compression
@@ -425,7 +446,16 @@ fn parse_spectrum_slice_quickxml(
                 if let Ok(unescaped) = t.unescape() {
                     match current_array_kind {
                         ArrayKind::Mz => {
-                            if let Ok(v) = decode_binary_f64(
+                            if current_numpress != Numpress::None {
+                                if let Ok(raw) = decode_binary_bytes(
+                                    unescaped.as_bytes(),
+                                    current_compressed,
+                                    Precision::F64,
+                                    None,
+                                ) {
+                                    mz_array = numpress_decode(current_numpress, &raw);
+                                }
+                            } else if let Ok(v) = decode_binary_f64(
                                 unescaped.as_bytes(),
                                 current_compressed,
                                 current_precision,
@@ -435,7 +465,19 @@ fn parse_spectrum_slice_quickxml(
                             }
                         }
                         ArrayKind::Intensity => {
-                            if let Ok(v) = decode_binary_f32(
+                            if current_numpress != Numpress::None {
+                                if let Ok(raw) = decode_binary_bytes(
+                                    unescaped.as_bytes(),
+                                    current_compressed,
+                                    Precision::F32,
+                                    None,
+                                ) {
+                                    intensity_array = numpress_decode(current_numpress, &raw)
+                                        .into_iter()
+                                        .map(|v| v as f32)
+                                        .collect();
+                                }
+                            } else if let Ok(v) = decode_binary_f32(
                                 unescaped.as_bytes(),
                                 current_compressed,
                                 current_precision,
@@ -602,6 +644,7 @@ pub fn parse_spectrum_slice_fast(
     let mut current_array_kind = ArrayKind::Other;
     let mut current_precision = Precision::F64;
     let mut current_compressed = false;
+    let mut current_numpress = Numpress::None;
     let mut mz_array: Vec<f64> = Vec::new();
     let mut intensity_array: Vec<f32> = Vec::new();
 
@@ -675,6 +718,7 @@ pub fn parse_spectrum_slice_fast(
                         current_array_kind = ArrayKind::Other;
                         current_precision = Precision::F64;
                         current_compressed = false;
+                        current_numpress = Numpress::None;
                     }
                     b"cvParam" => {
                         if let Some(accession) = find_attr(attrs, b"accession") {
@@ -731,6 +775,21 @@ pub fn parse_spectrum_slice_fast(
                                 // 32-bit float
                                 b"MS:1000521" => current_precision = Precision::F32,
                                 // zlib compression
+                                b"MS:1002745" => current_numpress = Numpress::Pic,
+                                b"MS:1002747" => {
+                                    current_numpress = Numpress::Pic;
+                                    current_compressed = true;
+                                }
+                                b"MS:1002312" => current_numpress = Numpress::Linear,
+                                b"MS:1002746" => {
+                                    current_numpress = Numpress::Linear;
+                                    current_compressed = true;
+                                }
+                                b"MS:1002314" => current_numpress = Numpress::Slof,
+                                b"MS:1002748" => {
+                                    current_numpress = Numpress::Slof;
+                                    current_compressed = true;
+                                }
                                 b"MS:1000574" => current_compressed = true,
                                 // no compression
                                 b"MS:1000576" => current_compressed = false,
@@ -760,7 +819,13 @@ pub fn parse_spectrum_slice_fast(
                             let text = &slice[text_start..text_end];
                             match current_array_kind {
                                 ArrayKind::Mz => {
-                                    if let Ok(v) = decode_binary_f64(
+                                    if current_numpress != Numpress::None {
+                                        if let Ok(raw) = decode_binary_bytes(
+                                            text, current_compressed, Precision::F64, None,
+                                        ) {
+                                            mz_array = numpress_decode(current_numpress, &raw);
+                                        }
+                                    } else if let Ok(v) = decode_binary_f64(
                                         text,
                                         current_compressed,
                                         current_precision,
@@ -770,7 +835,16 @@ pub fn parse_spectrum_slice_fast(
                                     }
                                 }
                                 ArrayKind::Intensity => {
-                                    if let Ok(v) = decode_binary_f32(
+                                    if current_numpress != Numpress::None {
+                                        if let Ok(raw) = decode_binary_bytes(
+                                            text, current_compressed, Precision::F32, None,
+                                        ) {
+                                            intensity_array = numpress::decode_pic(&raw)
+                                                .into_iter()
+                                                .map(|v| v as f32)
+                                                .collect();
+                                        }
+                                    } else if let Ok(v) = decode_binary_f32(
                                         text,
                                         current_compressed,
                                         current_precision,
@@ -1564,5 +1638,258 @@ mod tests {
         let quickxml_records = quickxml_parser.parse_file(&path).unwrap();
 
         assert_records_equivalent(&fast_records, &quickxml_records);
+    }
+}
+
+/// MS-Numpress "positive integer" (PIC) decoding, `MS:1002746`/`MS:1002747`.
+///
+/// ProteoWizard writes intensity arrays this way by default for Thermo data, and
+/// a reader that does not know it decodes the payload as raw floats, produces an
+/// array of the wrong length, and drops the spectrum. Every MSnLib file was
+/// unreadable for exactly that reason.
+///
+/// PIC packs each value as a nibble stream: a head nibble giving the count of
+/// leading zero nibbles (`<= 8`), or `8 + count` for leading *ones*, followed by
+/// the remaining nibbles of the 32-bit integer, least-significant first.
+/// Reference: Teleman et al., *Mol Cell Proteomics* 2014, `MSNumpress.cpp`.
+/// Applies whichever MS-Numpress transform an array declared.
+fn numpress_decode(kind: Numpress, raw: &[u8]) -> Vec<f64> {
+    match kind {
+        Numpress::None => Vec::new(),
+        Numpress::Pic => numpress::decode_pic(raw),
+        Numpress::Linear => numpress::decode_linear(raw),
+        Numpress::Slof => numpress::decode_slof(raw),
+    }
+}
+
+/// Which MS-Numpress transform a binary array carries, if any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Numpress {
+    None,
+    /// Positive-integer compression (`MS:1002745`, or `MS:1002747` with zlib).
+    Pic,
+    /// Linear prediction (`MS:1002312`, or `MS:1002746` with zlib).
+    Linear,
+    /// Short logged float (`MS:1002314`, or `MS:1002748` with zlib).
+    Slof,
+}
+
+mod numpress {
+    /// Reads one nibble, advancing the byte cursor every second read.
+    #[inline]
+    fn nibble(data: &[u8], di: &mut usize, half: &mut bool) -> Option<u8> {
+        let b = *data.get(*di)?;
+        let v = if !*half { b >> 4 } else { b & 0x0f };
+        if *half {
+            *di += 1;
+        }
+        *half = !*half;
+        Some(v)
+    }
+
+    fn decode_int(data: &[u8], di: &mut usize, half: &mut bool) -> Option<u32> {
+        let head = nibble(data, di, half)?;
+        let (n, mut res) = if head <= 8 {
+            (head as usize, 0u32)
+        } else {
+            // Leading ones: the top `head - 8` nibbles are all 1s.
+            let n = (head - 8) as usize;
+            let mut r = 0u32;
+            for i in 0..n {
+                r |= 0xF << (4 * (7 - i));
+            }
+            (n, r)
+        };
+        if n == 8 {
+            return Some(res);
+        }
+        for j in 0..(8 - n) {
+            let nib = nibble(data, di, half)? as u32;
+            res |= nib << (4 * j);
+        }
+        Some(res)
+    }
+
+    /// Linear prediction (`numLinear`). The payload opens with an 8-byte fixed-point
+    /// scaling factor and two seed values; every later value is encoded as the
+    /// residual against the linear extrapolation of the previous two.
+    pub fn decode_linear(data: &[u8]) -> Vec<f64> {
+        if data.len() < 8 {
+            return Vec::new();
+        }
+        let mut fixed = 0f64;
+        for i in 0..8 {
+            fixed += (data[i] as f64) * 2f64.powi(8 * i as i32);
+        }
+        if fixed == 0.0 {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        if data.len() < 12 {
+            return out;
+        }
+        let first = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as f64;
+        out.push(first / fixed);
+        if data.len() < 16 {
+            return out;
+        }
+        let second = u32::from_le_bytes([data[12], data[13], data[14], data[15]]) as f64;
+        out.push(second / fixed);
+        let (mut di, mut half) = (16usize, false);
+        while di < data.len() {
+            if di == data.len() - 1 && half && (data[di] & 0x0f) == 0 {
+                break;
+            }
+            let Some(diff) = decode_int(data, &mut di, &mut half) else { break };
+            let n = out.len();
+            // Two previous values, in fixed point, extrapolated linearly.
+            let a = (out[n - 1] * fixed).round();
+            let b = (out[n - 2] * fixed).round();
+            let pred = 2.0 * a - b;
+            let val = pred + (diff as i32) as f64;
+            out.push(val / fixed);
+        }
+        out
+    }
+
+    /// Short logged float (`numSlof`): each value is `ln(v+1)` scaled into a u16.
+    pub fn decode_slof(data: &[u8]) -> Vec<f64> {
+        if data.len() < 8 {
+            return Vec::new();
+        }
+        let mut fixed = 0f64;
+        for i in 0..8 {
+            fixed += (data[i] as f64) * 2f64.powi(8 * i as i32);
+        }
+        if fixed == 0.0 {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity((data.len() - 8) / 2);
+        let mut i = 8;
+        while i + 1 < data.len() {
+            let x = u16::from_le_bytes([data[i], data[i + 1]]) as f64;
+            out.push((x / fixed).exp() - 1.0);
+            i += 2;
+        }
+        out
+    }
+
+    /// Decodes a whole PIC payload (already zlib-inflated) into f64 values.
+    pub fn decode_pic(data: &[u8]) -> Vec<f64> {
+        let mut out = Vec::new();
+        let (mut di, mut half) = (0usize, false);
+        while di < data.len() {
+            // A final half-consumed byte whose low nibble is zero is padding.
+            if di == data.len() - 1 && half && (data[di] & 0x0f) == 0 {
+                break;
+            }
+            match decode_int(data, &mut di, &mut half) {
+                Some(v) => out.push(v as f64),
+                None => break,
+            }
+        }
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Mirror of the reference `encodeInt`, so the decoder is tested against an
+        /// independent implementation of the format rather than against itself.
+        fn encode_int(x: u32, out: &mut Vec<u8>) {
+            let mut nibbles = Vec::new();
+            let init = x & 0xf000_0000;
+            let l = if init == 0 {
+                (0..8).find(|i| (x & (0xf000_0000u32 >> (4 * i))) != 0).unwrap_or(8)
+            } else if init == 0xf000_0000 {
+                (0..8)
+                    .find(|i| {
+                        let m = 0xf000_0000u32 >> (4 * i);
+                        (x & m) != m
+                    })
+                    .unwrap_or(8)
+            } else {
+                0
+            };
+            let head = if init == 0xf000_0000 { l + 8 } else { l };
+            nibbles.push(head as u8);
+            for j in 0..(8 - l) {
+                nibbles.push(((x >> (4 * j)) & 0xf) as u8);
+            }
+            out.extend(nibbles);
+        }
+
+        fn pack(nibbles: &[u8]) -> Vec<u8> {
+            let mut b = Vec::new();
+            for pair in nibbles.chunks(2) {
+                let hi = pair[0] << 4;
+                let lo = if pair.len() > 1 { pair[1] } else { 0 };
+                b.push(hi | lo);
+            }
+            b
+        }
+
+        /// Slof is exactly invertible on its own definition, so encode it here and
+        /// require the decoder to recover the values within the format's precision.
+        #[test]
+        fn slof_round_trips() {
+            let vals = [0.0f64, 1.0, 10.0, 1234.0, 8_483_545.0];
+            let max = vals.iter().cloned().fold(0.0f64, f64::max);
+            // The 8-byte header is a byte-decomposed integer, so a fractional
+            // scaling factor would not survive it — encoder and decoder would then
+            // disagree on the scale and every value would drift. Round it, as the
+            // reference encoder does.
+            let fixed = ((0xFFFFu32 as f64) / (max + 1.0).ln()).floor();
+            let mut data = Vec::new();
+            // 8-byte little-endian fixed-point header, as `numSlof` writes it.
+            let mut f = fixed;
+            for _ in 0..8 {
+                data.push((f as u64 & 0xff) as u8);
+                f /= 256.0;
+            }
+            for &v in &vals {
+                let x = ((v + 1.0).ln() * fixed).round() as u16;
+                data.extend_from_slice(&x.to_le_bytes());
+            }
+            let got = decode_slof(&data);
+            assert_eq!(got.len(), vals.len());
+            for (g, w) in got.iter().zip(vals.iter()) {
+                // 16 bits over a log scale: relative, not absolute, precision.
+                assert!((g - w).abs() <= (w.abs() * 1e-3).max(1e-3), "got {g} want {w}");
+            }
+        }
+
+        /// Linear must at minimum recover its two seed values exactly; those are
+        /// stored as plain fixed-point and are what a truncated payload yields.
+        #[test]
+        fn linear_recovers_its_seed_values() {
+            let fixed = 1000.0f64;
+            let mut data = Vec::new();
+            let mut f = fixed;
+            for _ in 0..8 {
+                data.push((f as u64 & 0xff) as u8);
+                f /= 256.0;
+            }
+            data.extend_from_slice(&((100.5 * fixed) as u32).to_le_bytes());
+            data.extend_from_slice(&((200.25 * fixed) as u32).to_le_bytes());
+            let got = decode_linear(&data);
+            assert_eq!(got.len(), 2);
+            assert!((got[0] - 100.5).abs() < 1e-6);
+            assert!((got[1] - 200.25).abs() < 1e-6);
+        }
+
+        #[test]
+        fn pic_round_trips_through_an_independent_encoder() {
+            let vals: Vec<u32> = vec![0, 1, 15, 16, 255, 4096, 65535, 1_000_000, 8_483_545];
+            let mut nib = Vec::new();
+            for &v in &vals {
+                encode_int(v, &mut nib);
+            }
+            let bytes = pack(&nib);
+            let got = decode_pic(&bytes);
+            let want: Vec<f64> = vals.iter().map(|&v| v as f64).collect();
+            assert_eq!(&got[..want.len()], &want[..]);
+        }
     }
 }
