@@ -293,7 +293,13 @@ fn parse_spectrum_slice_quickxml(
     let mut scan_number: Option<usize> = None;
     let mut precursor_mz: Option<f64> = None;
     let mut charge: i8 = 0;
+    let mut polarity: i8 = 0;
+    let mut isolation_target: Option<f64> = None;
+    let mut isolation_lower: Option<f64> = None;
+    let mut isolation_upper: Option<f64> = None;
+    let mut collision_energy: Option<f64> = None;
     let mut retention_time_seconds: Option<f64> = None;
+    let mut ms_level: u8 = 0;
     // mzML's own peak count for this spectrum, when present -- lets
     // decode_binary preallocate its decompression buffer at the exact
     // final size instead of guessing, see decode_binary's docs.
@@ -361,6 +367,12 @@ fn parse_spectrum_slice_quickxml(
                             }
                         }
                         match &accession_buf[..accession_len] {
+                            b"MS:1000130" => polarity = 1,
+                            b"MS:1000129" => polarity = -1,
+                            b"MS:1000827" if in_precursor => isolation_target = attr_value_f64(&e, b"value"),
+                            b"MS:1000828" if in_precursor => isolation_lower = attr_value_f64(&e, b"value"),
+                            b"MS:1000829" if in_precursor => isolation_upper = attr_value_f64(&e, b"value"),
+                            b"MS:1000045" if in_precursor => collision_energy = attr_value_f64(&e, b"value"),
                             // selected ion m/z
                             b"MS:1000744" if in_precursor => {
                                 precursor_mz = attr_value_f64(&e, b"value");
@@ -383,6 +395,14 @@ fn parse_spectrum_slice_quickxml(
                                     });
                                 }
                             }
+                            // ms level
+                            b"MS:1000511" if !in_precursor => {
+                                if let Some(l) = attr_value_f64(&e, b"value") {
+                                    ms_level = l as u8;
+                                }
+                            }
+                            // "MS1 spectrum" boolean cvParam -- fallback
+                            b"MS:1000579" if ms_level == 0 => ms_level = 1,
                             // 64-bit float
                             b"MS:1000523" => current_precision = Precision::F64,
                             // 32-bit float
@@ -441,16 +461,25 @@ fn parse_spectrum_slice_quickxml(
         buf.clear();
     }
 
-    build_record(
+    let mut record = build_record(
         id,
-        charge,
+        if polarity < 0 { -charge.abs() } else { charge },
         mz_array,
         intensity_array,
         parse_metadata,
         precursor_mz,
         retention_time_seconds,
         scan_number,
-    )
+        if ms_level == 0 { 2 } else { ms_level },
+    )?;
+    if parse_metadata {
+        if polarity != 0 { record.insert_metadata("IONMODE", if polarity < 0 { "Negative" } else { "Positive" }); }
+        for (key, value) in [("ISOLATION_TARGET", isolation_target), ("ISOLATION_LOWER", isolation_lower),
+                             ("ISOLATION_UPPER", isolation_upper), ("COLLISION_ENERGY", collision_energy)] {
+            if let Some(v) = value { record.insert_metadata(key, &v.to_string()); }
+        }
+    }
+    Some(record)
 }
 
 /// Finds `<cvParam ... key="...">`'s value attribute and parses it as `f64`,
@@ -487,6 +516,7 @@ fn build_record(
     precursor_mz: Option<f64>,
     retention_time_seconds: Option<f64>,
     scan_number: Option<usize>,
+    ms_level: u8,
 ) -> Option<MassSpectralRecord> {
     if mz_array.is_empty() || mz_array.len() != intensity_array.len() {
         return None;
@@ -498,6 +528,7 @@ fn build_record(
         .map(|(mz, intensity)| Peak::new(mz, intensity))
         .collect();
     let mut record = MassSpectralRecord::new(peaks, charge, id);
+    record.ms_level = ms_level;
 
     if parse_metadata {
         if let Some(mz) = precursor_mz {
@@ -509,11 +540,15 @@ fn build_record(
         if let Some(scan) = scan_number {
             record.insert_metadata("SCANS", &scan.to_string());
         }
-    } else if let Some(mz) = precursor_mz {
+    } else {
         // PEPMASS/RTINSECONDS/charge are load-bearing for downstream code
-        // (`to_msn`, clustering partitioning) even when `parse_metadata` is
-        // off -- only genuinely optional extra metadata is skipped.
-        record.insert_metadata("PEPMASS", &mz.to_string());
+        // (`to_msn`, clustering partitioning, MS1 survey-scan lookup) even when
+        // `parse_metadata` is off -- only genuinely optional extra metadata is
+        // skipped. RT is written whether or not there is a precursor, so an MS1
+        // survey scan still carries its retention time.
+        if let Some(mz) = precursor_mz {
+            record.insert_metadata("PEPMASS", &mz.to_string());
+        }
         if let Some(rt) = retention_time_seconds {
             record.insert_metadata("RTINSECONDS", &rt.to_string());
         }
@@ -542,7 +577,7 @@ fn build_record(
 /// `MzmlParserConfig::use_fast_tokenizer` selects between them, so a
 /// real-world mzML variant this wasn't tested against can fall back to the
 /// more general, better-established parser instead of silently mis-parsing.
-fn parse_spectrum_slice_fast(
+pub fn parse_spectrum_slice_fast(
     slice: &[u8],
     id: usize,
     parse_metadata: bool,
@@ -553,8 +588,15 @@ fn parse_spectrum_slice_fast(
     let mut scan_number: Option<usize> = None;
     let mut precursor_mz: Option<f64> = None;
     let mut charge: i8 = 0;
+    let mut polarity: i8 = 0;
+    let mut isolation_target: Option<f64> = None;
+    let mut isolation_lower: Option<f64> = None;
+    let mut isolation_upper: Option<f64> = None;
+    let mut collision_energy: Option<f64> = None;
     let mut retention_time_seconds: Option<f64> = None;
     let mut default_array_length: Option<usize> = None;
+    // mzML `MS:1000511` ("ms level"); `MS:1000579` (MS1 spectrum) as a fallback.
+    let mut ms_level: u8 = 0;
 
     let mut in_precursor = false;
     let mut current_array_kind = ArrayKind::Other;
@@ -638,6 +680,12 @@ fn parse_spectrum_slice_fast(
                         if let Some(accession) = find_attr(attrs, b"accession") {
                             match accession {
                                 // selected ion m/z
+                                b"MS:1000130" => polarity = 1,
+                                b"MS:1000129" => polarity = -1,
+                                b"MS:1000827" if in_precursor => isolation_target = find_attr(attrs, b"value").and_then(|v| fast_float::parse::<f64, _>(v).ok()),
+                                b"MS:1000828" if in_precursor => isolation_lower = find_attr(attrs, b"value").and_then(|v| fast_float::parse::<f64, _>(v).ok()),
+                                b"MS:1000829" if in_precursor => isolation_upper = find_attr(attrs, b"value").and_then(|v| fast_float::parse::<f64, _>(v).ok()),
+                                b"MS:1000045" if in_precursor => collision_energy = find_attr(attrs, b"value").and_then(|v| fast_float::parse::<f64, _>(v).ok()),
                                 b"MS:1000744" if in_precursor => {
                                     precursor_mz = find_attr(attrs, b"value")
                                         .and_then(|v| std::str::from_utf8(v).ok())
@@ -666,6 +714,18 @@ fn parse_spectrum_slice_fast(
                                         });
                                     }
                                 }
+                                // ms level (outside <precursor>, at spectrum scope)
+                                b"MS:1000511" if !in_precursor => {
+                                    if let Some(l) = find_attr(attrs, b"value")
+                                        .and_then(|v| std::str::from_utf8(v).ok())
+                                        .and_then(|s| s.trim().parse::<u8>().ok())
+                                    {
+                                        ms_level = l;
+                                    }
+                                }
+                                // "MS1 spectrum" boolean cvParam -- fallback when
+                                // MS:1000511 is absent
+                                b"MS:1000579" if ms_level == 0 => ms_level = 1,
                                 // 64-bit float
                                 b"MS:1000523" => current_precision = Precision::F64,
                                 // 32-bit float
@@ -732,16 +792,25 @@ fn parse_spectrum_slice_fast(
         }
     }
 
-    build_record(
+    let mut record = build_record(
         id,
-        charge,
+        if polarity < 0 { -charge.abs() } else { charge },
         mz_array,
         intensity_array,
         parse_metadata,
         precursor_mz,
         retention_time_seconds,
         scan_number,
-    )
+        if ms_level == 0 { 2 } else { ms_level },
+    )?;
+    if parse_metadata {
+        if polarity != 0 { record.insert_metadata("IONMODE", if polarity < 0 { "Negative" } else { "Positive" }); }
+        for (key, value) in [("ISOLATION_TARGET", isolation_target), ("ISOLATION_LOWER", isolation_lower),
+                             ("ISOLATION_UPPER", isolation_upper), ("COLLISION_ENERGY", collision_energy)] {
+            if let Some(v) = value { record.insert_metadata(key, &v.to_string()); }
+        }
+    }
+    Some(record)
 }
 
 /// Scans `attrs` (the raw bytes after a tag's name, up to but not including
@@ -1126,6 +1195,74 @@ mod tests {
         )
     }
 
+    #[test]
+    fn both_parsers_preserve_negative_polarity_and_isolation_metadata() {
+        let xml = synthetic_spectrum_xml(7, 500.0, 1, 0.2, &[120.0, 250.0], &[10.0, 20.0])
+            .replace("<precursorList", "<cvParam accession=\"MS:1000129\"/><precursorList")
+            .replace("<precursor>", "<precursor><isolationWindow><cvParam accession=\"MS:1000827\" value=\"500.0\"/><cvParam accession=\"MS:1000828\" value=\"0.4\"/><cvParam accession=\"MS:1000829\" value=\"0.6\"/></isolationWindow>");
+        for parser in [parse_spectrum_slice_fast, parse_spectrum_slice_quickxml] {
+            let record = parser(xml.as_bytes(), 7, true).unwrap();
+            assert_eq!(record.get_charge(), -1);
+            assert_eq!(record.get_metadata("IONMODE"), Some("Negative"));
+            assert_eq!(record.get_metadata("ISOLATION_LOWER"), Some("0.4"));
+            assert_eq!(record.get_metadata("ISOLATION_UPPER"), Some("0.6"));
+        }
+    }
+
+    /// An MS1 survey scan: no `<precursor>`, an explicit `MS:1000511` level of 1.
+    fn synthetic_ms1_spectrum_xml(
+        scan: usize,
+        rt_minutes: f64,
+        mz: &[f64],
+        intensity: &[f64],
+    ) -> String {
+        let encode_array = |values: &[f64]| -> String {
+            let mut bytes = Vec::with_capacity(values.len() * 8);
+            for &v in values {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            let mut compressed = Vec::new();
+            {
+                let mut encoder = flate2::write::ZlibEncoder::new(
+                    &mut compressed,
+                    flate2::Compression::default(),
+                );
+                encoder.write_all(&bytes).unwrap();
+            }
+            BASE64.encode(&compressed)
+        };
+        format!(
+            r#"<spectrum id="controllerType=0 controllerNumber=1 scan={scan}" defaultArrayLength="{n}">
+    <cvParam accession="MS:1000511" name="ms level" value="1"/>
+    <cvParam accession="MS:1000579" name="MS1 spectrum" value=""/>
+    <scanList count="1">
+      <scan>
+        <cvParam accession="MS:1000016" name="scan start time" value="{rt_minutes}" unitAccession="UO:0000031"/>
+      </scan>
+    </scanList>
+    <binaryDataArrayList count="2">
+      <binaryDataArray>
+        <cvParam accession="MS:1000523" name="64-bit float"/>
+        <cvParam accession="MS:1000574" name="zlib compression"/>
+        <cvParam accession="MS:1000514" name="m/z array"/>
+        <binary>{mz_b64}</binary>
+      </binaryDataArray>
+      <binaryDataArray>
+        <cvParam accession="MS:1000523" name="64-bit float"/>
+        <cvParam accession="MS:1000574" name="zlib compression"/>
+        <cvParam accession="MS:1000515" name="intensity array"/>
+        <binary>{int_b64}</binary>
+      </binaryDataArray>
+    </binaryDataArrayList>
+  </spectrum>"#,
+            scan = scan,
+            n = mz.len(),
+            rt_minutes = rt_minutes,
+            mz_b64 = encode_array(mz),
+            int_b64 = encode_array(intensity),
+        )
+    }
+
     fn wrap_indexed_mzml(spectra_xml: &[String]) -> Vec<u8> {
         let header = format!(
             r#"<?xml version="1.0" encoding="ISO-8859-1"?>
@@ -1200,6 +1337,30 @@ mod tests {
         assert_eq!(records[0].get_metadata("SCANS"), Some("101"));
         // 12.5 minutes -> 750 seconds
         assert_eq!(records[0].get_metadata("RTINSECONDS"), Some("750"));
+    }
+
+    #[test]
+    fn ms1_survey_scans_are_parsed_with_level_1() {
+        let ms1 = synthetic_ms1_spectrum_xml(1, 5.0, &[300.0, 301.0, 302.0], &[100.0, 6.0, 1.0]);
+        let ms2a = synthetic_spectrum_xml(2, 300.10, 1, 5.01, &[80.0, 120.0], &[5.0, 9.0]);
+        let ms2b = synthetic_spectrum_xml(3, 450.20, 1, 5.20, &[90.0, 200.0], &[4.0, 7.0]);
+        let doc = wrap_indexed_mzml(&[ms1, ms2a, ms2b]);
+
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("oxidems_test_ms1_{}.mzML", std::process::id()));
+        std::fs::write(&path, &doc).unwrap();
+        let mut parser = MzmlParser::default();
+        let records = parser.parse_file(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].ms_level, 1);
+        assert_eq!(records[1].ms_level, 2);
+        assert_eq!(records[2].ms_level, 2);
+        // MS1 scan still carries its retention time (5 min -> 300 s).
+        assert_eq!(records[0].get_metadata("RTINSECONDS"), Some("300"));
+        assert_eq!(records[0].get_metadata("PEPMASS"), None);
+        assert_eq!(records[0].peaks().len(), 3);
     }
 
     #[test]

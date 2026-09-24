@@ -30,6 +30,10 @@ pub struct MassSpectralRecord {
     pub metadata: Vec<(CompactString, CompactString)>,
     spectrum: MassSpectrum,
     pub id: usize,
+    /// MS level from the source file (mzML `MS:1000511`). `1` = survey/precursor
+    /// scan, `2`+ = fragmentation. MGF has no level concept, so the MGF parser
+    /// and every other constructor leave this at the default `2`.
+    pub ms_level: u8,
     /// Byte offset in the source file where this spectrum's block starts.
     /// Only meaningful when parsed from a file; zero otherwise.
     pub source_byte_start: u64,
@@ -225,6 +229,20 @@ impl MSNSpectrum {
 
         (self.precursor_mz * z.abs().max(1.0)) - (HYDROGEN_MASS * z)
     }
+}
+
+/// A retained MS1 survey scan, kept alongside the MS2 spectra of an experiment so
+/// the fragmentation-tree workflow can score a candidate formula against the real
+/// precursor isotope envelope. In-memory only (not persisted / rkyv-archived);
+/// [`crate::clustering::cluster::experiment::SpectralExperiment`] frees these
+/// after annotation.
+#[derive(Debug, Clone)]
+pub struct Ms1Scan {
+    pub rt_seconds: f32,
+    /// Index into the experiment's `file_names` / `file_paths`.
+    pub file_index: usize,
+    /// Centroided peaks of the full survey scan, sorted by m/z.
+    pub peaks: Vec<Peak>,
 }
 
 #[derive(Debug, Clone)]
@@ -544,6 +562,7 @@ impl MassSpectralRecord {
             metadata: Vec::new(),
             source_byte_start: 0,
             source_byte_end: 0,
+            ms_level: 2,
         }
     }
 
@@ -563,6 +582,7 @@ impl MassSpectralRecord {
             metadata: Vec::new(),
             source_byte_start: 0,
             source_byte_end: 0,
+            ms_level: 2,
         }
     }
 
@@ -739,34 +759,43 @@ impl MassSpectralRecord {
     pub fn to_msn(&self) -> MSNSpectrum {
         let precursor_mz = self
             .get_metadata("PEPMASS")
-            .map(|mz_str| mz_str.split(" ").next().unwrap().parse::<f64>())
-            .unwrap_or(Ok(0.0));
+            .or_else(|| self.get_metadata("PRECURSOR_MZ"))
+            .or_else(|| self.get_metadata("PRECURSORMZ"))
+            .or_else(|| self.get_metadata("PRECURSOR_MASS"))
+            .or_else(|| self.get_metadata("PRECURSOR_MZ_VALUE"))
+            .and_then(|mz_str| {
+                mz_str.split_whitespace().next().and_then(|s| s.parse::<f64>().ok())
+            })
+            .unwrap_or(0.0);
+
         let rt_in_seconds = self
             .get_metadata("RTINSECONDS")
-            .map(|rt_str| rt_str.parse::<f32>())
-            .unwrap_or(Ok(0.0));
+            .or_else(|| self.get_metadata("RETENTION_TIME"))
+            .or_else(|| self.get_metadata("RETENTIONTIME"))
+            .or_else(|| self.get_metadata("RT"))
+            .and_then(|rt_str| rt_str.parse::<f32>().ok())
+            .unwrap_or(0.0);
+
         MSNSpectrum {
-            retention_time_in_seconds: rt_in_seconds.unwrap_or(0.0),
-            precursor_mz: precursor_mz.unwrap_or(0.0),
+            retention_time_in_seconds: rt_in_seconds,
+            precursor_mz,
             id: self.id as u64,
             spectrum: self.to_mass_spectrum(),
         }
     }
 
     pub fn to_hashed_msn(&self, config: &HashedSpectrumConfig) -> HashedMSNSpectrum {
-        let Some(precursor_mz) = self
+        let precursor_mz = self
             .get_metadata("PEPMASS")
-            .map(|mz_str| mz_str.parse::<f32>())
-        else {
-            return HashedMSNSpectrum {
-                spectrum: self.to_hashed(config),
-                precursor_mz: 0.0,
-            };
-        };
+            .or_else(|| self.get_metadata("PRECURSOR_MZ"))
+            .or_else(|| self.get_metadata("PRECURSORMZ"))
+            .or_else(|| self.get_metadata("PRECURSOR_MASS"))
+            .and_then(|mz_str| mz_str.split_whitespace().next().and_then(|s| s.parse::<f32>().ok()))
+            .unwrap_or(0.0);
 
         HashedMSNSpectrum {
             spectrum: self.to_hashed(config),
-            precursor_mz: precursor_mz.unwrap_or(0.0),
+            precursor_mz,
         }
     }
     pub fn to_hashed(&self, config: &HashedSpectrumConfig) -> HashedSpectrum {

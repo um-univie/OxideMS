@@ -3,7 +3,7 @@ use super::engine::{ClusterEngine, SpectrumMetadata, fast_dot_product};
 use super::flat_clusters::FlatClusters;
 use super::mz_partition::mz_charge_boundaries;
 use crate::{
-    MSNSpectrum, MassSpectralRecord, Peak, SpectrumHasher,
+    MSNSpectrum, MassSpectralRecord, Ms1Scan, Peak, SpectrumHasher,
     io::mgf::{LowMemRecord, MGF_SPECTRA_SIZE, MgfParser, MgfParserConfig, SpillKey},
     io::mzml::{MzmlParser, MzmlParserConfig},
     workflow::*,
@@ -54,6 +54,19 @@ pub struct SpectralExperiment {
     /// Set by the first [`ingest_file_low_mem`](Self::ingest_file_low_mem) call;
     /// where shard and partition files live.
     pub low_mem_spill_dir: Option<PathBuf>,
+    /// MS1 survey scans retained from mzML ingestion, in ingest order. Used by
+    /// [`Self::ms1_envelope_for`] to give the SIRIUS workflow the real precursor
+    /// isotope envelope. Empty for MGF input and when `retain_ms1` is false.
+    /// Callers should `std::mem::take` / clear this once annotation is done.
+    pub ms1_scans: Vec<Ms1Scan>,
+    /// Per `file_index`: indices into `ms1_scans` for that file, sorted by
+    /// retention time. Rebuilt from `ms1_scans` at the end of each ingest call
+    /// (`rebuild_ms1_index`); do not populate directly.
+    pub ms1_by_file: Vec<Vec<usize>>,
+    /// Whether mzML ingestion keeps MS1 survey scans (default true). Set false to
+    /// bound memory on very large DDA files at the cost of isotope scoring
+    /// falling back to the MS2-consensus window.
+    pub retain_ms1: bool,
 }
 
 /// Prints a partition-size distribution to stderr right after
@@ -203,6 +216,41 @@ fn parse_spectral_file(path: &str, parallel: bool) -> io::Result<Vec<MassSpectra
     }
 }
 
+/// Pulls the MS1 survey scans (`ms_level == 1`) out of a freshly parsed record
+/// list, converting them to [`Ms1Scan`] for `file_index`, and returns the
+/// remaining MS2+ records for the normal clustering pipeline. Runs before the
+/// MS2-tuned peak-filter workflow, which must not touch survey scans.
+fn split_off_ms1_scans(
+    records: Vec<MassSpectralRecord>,
+    file_index: usize,
+    retain_ms1: bool,
+) -> (Vec<Ms1Scan>, Vec<MassSpectralRecord>) {
+    if !retain_ms1 {
+        return (
+            Vec::new(),
+            records.into_iter().filter(|r| r.ms_level != 1).collect(),
+        );
+    }
+    let mut ms1 = Vec::new();
+    let mut msn = Vec::with_capacity(records.len());
+    for r in records {
+        if r.ms_level == 1 {
+            let rt = r
+                .get_metadata("RTINSECONDS")
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .unwrap_or(0.0);
+            ms1.push(Ms1Scan {
+                rt_seconds: rt,
+                file_index,
+                peaks: r.peaks().to_vec(),
+            });
+        } else {
+            msn.push(r);
+        }
+    }
+    (ms1, msn)
+}
+
 impl SpectralExperiment {
     pub fn default() -> Self {
         let mut workflow = WorkFlowManager::default();
@@ -217,6 +265,7 @@ impl SpectralExperiment {
         Self {
             workflow,
             filter_unknown_charge: true,
+            retain_ms1: true,
             ..Default::default()
         }
     }
@@ -270,6 +319,7 @@ impl SpectralExperiment {
             engine,
             parser: MgfParser::default(),
             filter_unknown_charge: true,
+            retain_ms1: true,
             ..Default::default()
         }
     }
@@ -318,6 +368,7 @@ impl SpectralExperiment {
             workflow,
             engine,
             filter_unknown_charge: true,
+            retain_ms1: true,
             ..Default::default()
         }
     }
@@ -588,7 +639,13 @@ impl SpectralExperiment {
         self.file_paths.extend(paths.iter().map(PathBuf::from));
 
         let start_time = std::time::Instant::now();
-        let results: Vec<(Vec<MSNSpectrum>, Vec<SpectrumMetadata>, usize, FilterReport)> = paths
+        let results: Vec<(
+            Vec<MSNSpectrum>,
+            Vec<SpectrumMetadata>,
+            usize,
+            FilterReport,
+            Vec<Ms1Scan>,
+        )> = paths
             .into_par_iter()
             .enumerate()
             .map(|(i, path)| {
@@ -597,26 +654,37 @@ impl SpectralExperiment {
             })
             .collect();
 
-        for (mut file_spectra, mut file_metadata, raw_count, report) in results {
+        for (mut file_spectra, mut file_metadata, raw_count, report, mut ms1) in results {
             self.total_spectra_ingested += raw_count;
             self.metadata.append(&mut file_metadata);
             self.spectra.append(&mut file_spectra);
             self.filter_report.merge(report);
+            self.ms1_scans.append(&mut ms1);
         }
         self.spectra
             .par_iter_mut()
             .enumerate()
             .for_each(|(index, spectrum)| spectrum.id = index as u64);
+        self.rebuild_ms1_index();
     }
 
     fn process_single_file(
         &self,
         path: &str,
         file_index: usize,
-    ) -> (Vec<MSNSpectrum>, Vec<SpectrumMetadata>, usize, FilterReport) {
-        let mut spectra = parse_spectral_file(path, false).unwrap();
+    ) -> (
+        Vec<MSNSpectrum>,
+        Vec<SpectrumMetadata>,
+        usize,
+        FilterReport,
+        Vec<Ms1Scan>,
+    ) {
+        let parsed = parse_spectral_file(path, false)
+            .unwrap_or_else(|e| panic!("failed to parse spectral file {path:?}: {e}"));
 
-        let raw_count = spectra.len();
+        let raw_count = parsed.len();
+        let (ms1_scans, mut spectra) =
+            split_off_ms1_scans(parsed, file_index, self.retain_ms1);
         let mut report = self.workflow.execute_with_report(&mut spectra);
 
         let unknown_charge_dropped = if self.filter_unknown_charge {
@@ -672,18 +740,27 @@ impl SpectralExperiment {
             })
             .collect();
 
-        (processed_spectra, local_metadata, raw_count, report)
+        (processed_spectra, local_metadata, raw_count, report, ms1_scans)
     }
 
     pub fn ingest_file(&mut self, file_path: &str) {
         let file_index = self.file_names.len();
         self.file_names.push(
-            strip_spectral_extension(file_path.split("/").last().unwrap()).to_string(),
+            strip_spectral_extension(
+                file_path
+                    .split("/")
+                    .last()
+                    .expect("str::split always yields at least one item"),
+            )
+            .to_string(),
         );
         self.file_paths.push(PathBuf::from(file_path));
 
-        let mut spectra = parse_spectral_file(file_path, true).unwrap();
-        self.total_spectra_ingested += spectra.len();
+        let parsed = parse_spectral_file(file_path, true)
+            .unwrap_or_else(|e| panic!("failed to parse spectral file {file_path:?}: {e}"));
+        self.total_spectra_ingested += parsed.len();
+        let (ms1, mut spectra) = split_off_ms1_scans(parsed, file_index, self.retain_ms1);
+        self.ms1_scans.extend(ms1);
         let mut report = self.workflow.execute_with_report(&mut spectra);
 
         let unknown_charge_dropped = if self.filter_unknown_charge {
@@ -736,7 +813,117 @@ impl SpectralExperiment {
             .map(|(_, _, _, msn_spectrum)| msn_spectrum)
             .collect();
 
-        self.spectra.extend(msn_spectra)
+        self.spectra.extend(msn_spectra);
+        self.rebuild_ms1_index();
+    }
+
+    /// Rebuilds [`Self::ms1_by_file`] from `ms1_scans`: one rt-sorted index list
+    /// per `file_index`. Cheap; called at the end of each ingest.
+    fn rebuild_ms1_index(&mut self) {
+        let n_files = self.file_names.len().max(
+            self.ms1_scans
+                .iter()
+                .map(|s| s.file_index + 1)
+                .max()
+                .unwrap_or(0),
+        );
+        let mut by_file: Vec<Vec<usize>> = vec![Vec::new(); n_files];
+        for (i, scan) in self.ms1_scans.iter().enumerate() {
+            if scan.file_index < n_files {
+                by_file[scan.file_index].push(i);
+            }
+        }
+        for list in &mut by_file {
+            list.sort_by(|&a, &b| {
+                self.ms1_scans[a]
+                    .rt_seconds
+                    .total_cmp(&self.ms1_scans[b].rt_seconds)
+            });
+        }
+        self.ms1_by_file = by_file;
+    }
+
+    /// The precursor isotope envelope for an MS2 event: peaks of the MS1 survey
+    /// scan that triggered it (greatest rt <= `rt_seconds` in the same file;
+    /// nearest by |Δrt| as a fallback), sliced to the isotope window around
+    /// `precursor_mz`. Empty when the file carried no MS1 scans — callers then
+    /// fall back to the MS2-consensus window.
+    pub fn ms1_envelope_for(
+        &self,
+        file_index: usize,
+        rt_seconds: f32,
+        precursor_mz: f64,
+        charge: i8,
+    ) -> Vec<Peak> {
+        let Some(idx_list) = self.ms1_by_file.get(file_index) else {
+            return Vec::new();
+        };
+        if idx_list.is_empty() {
+            return Vec::new();
+        }
+        // idx_list is sorted by rt; find the last scan at or before rt_seconds.
+        let pos = idx_list.partition_point(|&i| self.ms1_scans[i].rt_seconds <= rt_seconds);
+        let scan_idx = if pos > 0 {
+            idx_list[pos - 1]
+        } else {
+            // MS2 earlier than any survey scan (rare) — take the nearest.
+            *idx_list
+                .iter()
+                .min_by(|&&a, &&b| {
+                    (self.ms1_scans[a].rt_seconds - rt_seconds)
+                        .abs()
+                        .total_cmp(&(self.ms1_scans[b].rt_seconds - rt_seconds).abs())
+                })
+                .unwrap()
+        };
+
+        let z = charge.unsigned_abs().max(1) as f64;
+        let peaks = &self.ms1_scans[scan_idx].peaks;
+
+        // Anchor on the observed monoisotopic peak: the most intense survey-scan
+        // peak within 25 ppm of the reported precursor m/z. A wide DDA isolation
+        // window at low m/z catches several co-eluting ions, so slicing a fixed
+        // [prec-1, prec+4.5] band and hoping the precursor dominates does not
+        // work — anchoring does.
+        let ppm_tol = 25e-6 * precursor_mz;
+        let Some(anchor) = peaks
+            .iter()
+            .filter(|p| (p.mz - precursor_mz).abs() <= ppm_tol)
+            .max_by(|a, b| a.intensity.total_cmp(&b.intensity))
+            .copied()
+        else {
+            // Precursor not present in the survey scan (RT drift, calibration,
+            // isolation reported the window centre). Let the caller fall back to
+            // the MS2-consensus window.
+            return Vec::new();
+        };
+
+        // Keep the anchor plus any peak sitting on an isotope position
+        // (anchor + k·Δ, Δ ≈ 1.00335 / z, k = 1..=4) within 12 ppm, above 1% of
+        // the anchor. This drops the co-eluting ions a wide DDA isolation window
+        // pulls in, leaving a clean M, M+1, M+2… cluster.
+        let step = 1.003355 / z;
+        let mut env = vec![anchor];
+        for k in 1..=4 {
+            let target = anchor.mz + k as f64 * step;
+            if let Some(p) = peaks
+                .iter()
+                .filter(|p| {
+                    (p.mz - target).abs() / target < 12e-6 && p.intensity >= 0.01 * anchor.intensity
+                })
+                .max_by(|a, b| a.intensity.total_cmp(&b.intensity))
+            {
+                env.push(*p);
+            }
+        }
+        env
+    }
+
+    /// Frees the retained MS1 survey scans. Call once annotation is finished —
+    /// they are only needed during `annotate_cluster`.
+    pub fn clear_ms1(&mut self) {
+        self.ms1_scans = Vec::new();
+        self.ms1_by_file = Vec::new();
     }
 
     pub fn ingest_files(&mut self, folder_path: &str) {
@@ -779,6 +966,11 @@ impl SpectralExperiment {
     /// are parse-order based, not densely renumbered over kept spectra, and
     /// no corresponding `self.metadata` entries are populated (there is
     /// nothing yet for a spilled spectrum's id to index into).
+    ///
+    /// MS1 survey scans are **not** retained on this path — the mass-partitioned
+    /// spill has nowhere to co-locate them with the MS2 events they trigger — so
+    /// SIRIUS isotope scoring falls back to the MS2-consensus window. Use
+    /// [`ingest_file`](Self::ingest_file) when MS1 isotope evidence matters.
     pub fn ingest_file_low_mem(&mut self, file_path: &str, spill_dir: &Path) -> io::Result<()> {
         let file_index = self.file_names.len();
         self.file_names.push(
@@ -1407,13 +1599,27 @@ impl SpectralExperiment {
             if start >= end || end > mmap.len() {
                 continue;
             }
-            let Some(mut record) =
-                MgfParser::parse_block_slice(&mmap[start..end], member_id as u64, false)
-            else {
-                continue;
+
+            let is_mzml = self
+                .file_paths
+                .get(metadata.file_index)
+                .map(|p| p.to_string_lossy().to_lowercase().ends_with(".mzml"))
+                .unwrap_or(false);
+
+            let mut record = if is_mzml {
+                match crate::io::mzml::parse_spectrum_slice_fast(&mmap[start..end], member_id, false) {
+                    Some(r) => r,
+                    None => continue,
+                }
+            } else {
+                match MgfParser::parse_block_slice(&mmap[start..end], member_id as u64, false) {
+                    Some(r) => r,
+                    None => continue,
+                }
             };
+            let unstripped_peaks = record.peaks().to_vec();
             self.workflow.execute(std::slice::from_mut(&mut record));
-            if record.peaks().is_empty() {
+            if record.peaks().is_empty() && unstripped_peaks.is_empty() {
                 continue;
             }
 
@@ -1422,7 +1628,14 @@ impl SpectralExperiment {
             *charge_votes.entry(metadata.charge).or_insert(0) += 1;
             n_reconstructed += 1;
 
+            let pmz = metadata.precursor_mz;
+            let z = metadata.charge.abs().max(1) as f64;
+            let iso_peaks = unstripped_peaks
+                .into_iter()
+                .filter(|p| (p.mz >= pmz - (0.5 / z)) && (p.mz <= pmz + (4.5 / z)));
+
             raw_peaks.extend(record.peaks().iter().map(|p| (p.mz, p.intensity)));
+            raw_peaks.extend(iso_peaks.map(|p| (p.mz, p.intensity)));
         }
 
         if n_reconstructed == 0 {
@@ -1632,6 +1845,40 @@ mod low_mem_tests {
         assert_eq!(total_loaded, keys_after_second);
 
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn ms1_envelope_lookup_picks_the_triggering_survey_scan() {
+        let mut exp = SpectralExperiment::metabolomics();
+        exp.file_names.push("run".into());
+        // Two survey scans in one file, at 100 s and 200 s.
+        exp.ms1_scans.push(Ms1Scan {
+            rt_seconds: 100.0,
+            file_index: 0,
+            peaks: vec![Peak::new(400.0, 10.0), Peak::new(401.0, 2.0), Peak::new(900.0, 5.0)],
+        });
+        exp.ms1_scans.push(Ms1Scan {
+            rt_seconds: 200.0,
+            file_index: 0,
+            peaks: vec![Peak::new(400.0, 1.0), Peak::new(401.0, 9.0)],
+        });
+        exp.rebuild_ms1_index();
+
+        // MS2 at 150 s -> the 100 s survey scan; window drops the 900 m/z peak.
+        let env = exp.ms1_envelope_for(0, 150.0, 400.0, 1);
+        assert_eq!(env.len(), 2);
+        assert!((env[0].intensity - 10.0).abs() < 1e-6);
+
+        // MS2 at 250 s -> the 200 s survey scan (different intensities).
+        let env2 = exp.ms1_envelope_for(0, 250.0, 400.0, 1);
+        assert_eq!(env2.len(), 2);
+        assert!((env2[1].intensity - 9.0).abs() < 1e-6);
+
+        // MS2 before any survey scan -> nearest fallback, still returns peaks.
+        assert_eq!(exp.ms1_envelope_for(0, 10.0, 400.0, 1).len(), 2);
+
+        // A file with no MS1 -> empty.
+        assert!(exp.ms1_envelope_for(1, 150.0, 400.0, 1).is_empty());
     }
 }
 
