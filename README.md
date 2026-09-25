@@ -301,4 +301,7 @@ This module is under active development and the API is not yet stable.
 
 ## License
 
-See [LICENSE](LICENSE).
+OxideMS is MIT-licensed (see [LICENSE](LICENSE)), except four files in
+`src/sirius/` that are ported from SIRIUS and are licensed under the
+LGPL-3.0-or-later. [ATTRIBUTION.md](ATTRIBUTION.md) lists them along with all
+other third-party attributions.

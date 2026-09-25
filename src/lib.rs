@@ -3,6 +3,7 @@ pub mod clustering;
 pub mod feature_extraction;
 pub mod io;
 pub mod plotting;
+pub mod sirius;
 pub mod spectrum;
 pub mod workflow;
 pub use spectrum::*;
