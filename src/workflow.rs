@@ -36,9 +36,10 @@ use std::any::TypeId;
 const C13_MASS_DIFF: f64 = ISOTOPES[6][1].expect("C13 isotope entry").mass
     - ISOTOPES[6][0].expect("C12 isotope entry").mass;
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 
 /// Expresses a peak-matching tolerance in either absolute (Da) or relative (ppm) units.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum MassTolerance {
     /// Absolute tolerance in Daltons — constant regardless of m/z.
     Da(f64),

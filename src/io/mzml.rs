@@ -171,7 +171,7 @@ impl MzmlParser {
     /// indexed fast path if available and parseable, the `memchr` scan
     /// otherwise. Never fails outright -- a broken index just falls back to
     /// scanning, same as a plain (non-indexed) file would.
-    fn spectrum_spans(mmap: &[u8]) -> Vec<(usize, usize)> {
+    pub fn spectrum_spans(mmap: &[u8]) -> Vec<(usize, usize)> {
         if let Some(spans) = Self::indexed_spans(mmap) {
             return spans;
         }

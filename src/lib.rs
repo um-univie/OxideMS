@@ -1,5 +1,6 @@
 pub mod builder_macro;
 pub mod clustering;
+pub mod feature_extraction;
 pub mod io;
 pub mod plotting;
 pub mod spectrum;
