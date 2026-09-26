@@ -64,10 +64,9 @@ gpu = ["dep:wgpu", "dep:pollster"]
 # plotting = ["dep:plotters"]
 
 [profile.release]
-# debug = true
-strip=true
+debug = true
+strip = false
 opt-level = 3
-#codegen-units = 1
 
 
 
