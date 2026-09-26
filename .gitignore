@@ -20,3 +20,14 @@ Cargo.lock
 # The manuscript and its reproducing code live in their own repository,
 # not here. Nothing under publication/ belongs in this library's history.
 publication/
+
+# Presentation subdirectory (untracked)
+/presentation/
+
+# Local research scripts and notes are not versioned, except the generator
+# of src/sirius/sirius_scoring_tables.rs.
+.venv-ml/
+scratch/**
+!scratch/gen_sirius_scoring.py
+# Trained models and packed databases are build products, hundreds of MB each.
+models/
