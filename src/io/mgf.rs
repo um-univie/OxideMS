@@ -23,6 +23,58 @@ use std::{
 /// Used to pre-allocate memory when memory-mapping files.
 pub const MGF_SPECTRA_SIZE: usize = 5_000;
 
+/// Best guess for a precursor whose charge is missing or zero: magnitude 3
+/// or 2 if the matching isotope spacing is found next to the precursor,
+/// else 1, with the sign given by the polarity.
+pub(crate) fn recover_charge(peaks: &[Peak], precursor_mz: Option<f64>, is_negative: bool) -> i8 {
+    let mut detected_charge = 1i8;
+    if let Some(pmz) = precursor_mz {
+        let tol = 0.02;
+        let has_z3 = peaks.iter().any(|p| (p.mz - (pmz + 0.3344)).abs() < tol);
+        let has_z2 = peaks.iter().any(|p| (p.mz - (pmz + 0.5017)).abs() < tol);
+
+        if has_z3 {
+            detected_charge = 3;
+        } else if has_z2 {
+            detected_charge = 2;
+        }
+    }
+    if is_negative { -detected_charge } else { detected_charge }
+}
+
+/// Parses an MGF `CHARGE` value into `(charge, has_explicit_sign)`.
+///
+/// Accepts `2`, `2+`, `+2`, `1-`, `-1`, `2.0`, `2.0+` and takes the first
+/// entry of lists such as `2+ and 3+`. Returns 0 (unknown) for `0`, a
+/// non-integral value or anything unparseable, so the caller can recover it.
+pub(crate) fn parse_mgf_charge(val: &str) -> (i8, bool) {
+    let first = val
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .find(|t| !t.is_empty())
+        .unwrap_or("");
+    let (body, sign) = if let Some(b) = first.strip_suffix('+').or_else(|| first.strip_prefix('+')) {
+        (b, Some(1i8))
+    } else if let Some(b) = first.strip_suffix('-').or_else(|| first.strip_prefix('-')) {
+        (b, Some(-1i8))
+    } else {
+        (first, None)
+    };
+    let Ok(value) = body.parse::<f64>() else {
+        return (0, false);
+    };
+    if !value.is_finite() || value.fract() != 0.0 || value.abs() > i8::MAX as f64 {
+        return (0, false);
+    }
+    let magnitude = value.abs() as i8;
+    if magnitude == 0 {
+        return (0, false);
+    }
+    match sign {
+        Some(s) => (s * magnitude, true),
+        None => (magnitude, false),
+    }
+}
+
 /// Width (Da) of each mass bucket in [`parse_file_low_mem`](MgfParser::parse_file_low_mem)'s
 /// shard pool. 25 Da — many multiples of a typical `mz_tolerance` (20
 /// ppm ~= 0.03 Da at 1500 Da) so a clustering partition's narrow mass window
@@ -138,7 +190,10 @@ impl MgfParser {
     pub(crate) fn parse_block_slice(raw_block: &[u8], index: u64, parse_metadata: bool) -> Option<MassSpectralRecord> {
         let mut peaks = Vec::with_capacity(100);
         let mut metadata = Vec::with_capacity(10);
-        let mut charge = 0;
+        let mut charge: i8 = 0;
+        let mut charge_signed = false;
+        let mut precursor_mz: Option<f64> = None;
+        let mut is_negative = false;
 
         for mut line in raw_block.split(|&b| b == b'\n') {
             // Strip trailing carriage return if Windows-formatted
@@ -156,24 +211,23 @@ impl MgfParser {
                 // Fast path for CHARGE
                 if key.eq_ignore_ascii_case(b"CHARGE") {
                     let val_str = unsafe { std::str::from_utf8_unchecked(val) };
-                    charge = if val_str.ends_with('+') {
-                        let num = val_str[..val_str.len() - 1].parse::<i8>().unwrap_or(1);
-                        if num == 0 { 1 } else { num }
-                    } else if val_str.ends_with('-') {
-                        let num = val_str[..val_str.len() - 1].parse::<i8>().unwrap_or(1);
-                        if num == 0 { -1 } else { -num.abs() }
-                    } else {
-                        let num = val_str.parse::<i8>().unwrap_or(1);
-                        if num == 0 { 1 } else { num }
-                    };
-
-                    if parse_metadata {
-                        metadata.push((
-                            CompactString::new("CHARGE"),
-                            CompactString::new(charge.to_string()),
-                        ));
-                    }
+                    (charge, charge_signed) = parse_mgf_charge(val_str);
                     continue;
+                }
+
+                // Needed for charge recovery below, so read them even when
+                // metadata is not kept.
+                if key.eq_ignore_ascii_case(b"PEPMASS") {
+                    let val_str = unsafe { std::str::from_utf8_unchecked(val) };
+                    precursor_mz = val_str.split_whitespace().next().and_then(|v| v.parse::<f64>().ok());
+                } else if key.eq_ignore_ascii_case(b"IONMODE")
+                    || key.eq_ignore_ascii_case(b"ION_MODE")
+                    || key.eq_ignore_ascii_case(b"POLARITY")
+                {
+                    let v = unsafe { std::str::from_utf8_unchecked(val) }.trim();
+                    if v.eq_ignore_ascii_case("negative") || v.eq_ignore_ascii_case("neg") || v == "-" {
+                        is_negative = true;
+                    }
                 }
 
                 if parse_metadata {
@@ -204,44 +258,20 @@ impl MgfParser {
         } else {
             peaks.shrink_to_fit();
 
-            // Recover charge if missing or zero:
-            // 1. Check IONMODE / POLARITY metadata (positive -> +1, negative -> -1)
-            // 2. Check precursor isotope envelope in peaks
-            // 3. Fall back to 1 (singly charged)
+            // Recover charge if missing, zero or unparseable:
+            // 1. Magnitude from the precursor isotope envelope in peaks, else 1
+            // 2. Sign from IONMODE / POLARITY metadata
+            // An unsigned CHARGE (e.g. "1") also takes its sign from IONMODE.
             if charge == 0 {
-                let is_negative = metadata.iter().any(|(k, v)| {
-                    (k == "IONMODE" || k == "ION_MODE" || k == "POLARITY")
-                        && (v.eq_ignore_ascii_case("negative")
-                            || v.eq_ignore_ascii_case("neg")
-                            || v == "-")
-                });
-
-                let sign: i8 = if is_negative { -1 } else { 1 };
-
-                let precursor_mz = metadata.iter().find(|(k, _)| k == "PEPMASS").and_then(|(_, v)| {
-                    v.split_whitespace().next()?.parse::<f64>().ok()
-                });
-
-                let mut detected_charge = 1i8;
-                if let Some(pmz) = precursor_mz {
-                    let tol = 0.02;
-                    let has_z3 = peaks.iter().any(|p| (p.mz - (pmz + 0.3344)).abs() < tol);
-                    let has_z2 = peaks.iter().any(|p| (p.mz - (pmz + 0.5017)).abs() < tol);
-
-                    if has_z3 {
-                        detected_charge = 3;
-                    } else if has_z2 {
-                        detected_charge = 2;
-                    }
-                }
-
-                charge = sign * detected_charge;
-                if parse_metadata {
-                    metadata.push((
-                        CompactString::new("CHARGE"),
-                        CompactString::new(charge.to_string()),
-                    ));
-                }
+                charge = recover_charge(&peaks, precursor_mz, is_negative);
+            } else if !charge_signed && is_negative {
+                charge = -charge;
+            }
+            if parse_metadata {
+                metadata.push((
+                    CompactString::new("CHARGE"),
+                    CompactString::new(charge.to_string()),
+                ));
             }
 
             let mut spec = MassSpectralRecord::new(peaks, charge, index as usize);
@@ -796,6 +826,74 @@ mod mgf_parser_tests {
         END IONS\n\
     ";
     const FILE_NAME: &str = "test_files/test2.mgf";
+
+    fn block_charge(block: &str, parse_metadata: bool) -> i8 {
+        MgfParser::parse_block_slice(block.as_bytes(), 0, parse_metadata)
+            .unwrap()
+            .get_charge()
+    }
+
+    #[test]
+    fn charge_formats_parse() {
+        for (raw, expected) in [
+            ("2", (2, false)),
+            ("2+", (2, true)),
+            ("+2", (2, true)),
+            ("1-", (-1, true)),
+            ("-1", (-1, true)),
+            ("2.0", (2, false)),
+            ("2.0+", (2, true)),
+            ("1.0-", (-1, true)),
+            (" 3+ ", (3, true)),
+            ("2+ and 3+", (2, true)),
+            ("2+,3+", (2, true)),
+            ("0", (0, false)),
+            ("0+", (0, false)),
+            ("1.5", (0, false)),
+            ("", (0, false)),
+            ("NaN", (0, false)),
+            ("abc", (0, false)),
+            ("300", (0, false)),
+        ] {
+            assert_eq!(parse_mgf_charge(raw), expected, "CHARGE={raw:?}");
+        }
+    }
+
+    #[test]
+    fn zero_or_missing_charge_takes_sign_from_ionmode() {
+        let neg_zero = "BEGIN IONS\nPEPMASS=300.0\nIONMODE=Negative\nCHARGE=0\n100.0 10.0\nEND IONS\n";
+        let neg_missing = "BEGIN IONS\nPEPMASS=300.0\nIONMODE=negative\n100.0 10.0\nEND IONS\n";
+        let pos_zero = "BEGIN IONS\nPEPMASS=300.0\nIONMODE=Positive\nCHARGE=0\n100.0 10.0\nEND IONS\n";
+        for parse_metadata in [true, false] {
+            assert_eq!(block_charge(neg_zero, parse_metadata), -1);
+            assert_eq!(block_charge(neg_missing, parse_metadata), -1);
+            assert_eq!(block_charge(pos_zero, parse_metadata), 1);
+        }
+    }
+
+    #[test]
+    fn unsigned_charge_takes_sign_from_ionmode_but_explicit_sign_wins() {
+        let unsigned = "BEGIN IONS\nPEPMASS=300.0\nCHARGE=1.0\nIONMODE=negative\n100.0 10.0\nEND IONS\n";
+        let explicit = "BEGIN IONS\nPEPMASS=300.0\nCHARGE=1+\nIONMODE=negative\n100.0 10.0\nEND IONS\n";
+        assert_eq!(block_charge(unsigned, true), -1);
+        assert_eq!(block_charge(explicit, true), 1);
+    }
+
+    #[test]
+    fn zero_charge_is_recovered_from_isotope_envelope_without_metadata() {
+        let z2 = "BEGIN IONS\nPEPMASS=500.0\nCHARGE=0\n100.0 10.0\n500.0 50.0\n500.5017 25.0\nEND IONS\n";
+        assert_eq!(block_charge(z2, true), 2);
+        assert_eq!(block_charge(z2, false), 2);
+    }
+
+    #[test]
+    fn recovered_charge_is_written_to_metadata_once() {
+        let block = "BEGIN IONS\nPEPMASS=300.0\nIONMODE=negative\nCHARGE=0\n100.0 10.0\nEND IONS\n";
+        let rec = MgfParser::parse_block_slice(block.as_bytes(), 0, true).unwrap();
+        let charges: Vec<_> = rec.metadata().iter().filter(|(k, _)| k == "CHARGE").collect();
+        assert_eq!(charges.len(), 1);
+        assert_eq!(charges[0].1, "-1");
+    }
 
     #[test]
     fn test_sequential_with_metadata() {

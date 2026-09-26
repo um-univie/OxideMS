@@ -506,6 +506,7 @@ fn parse_spectrum_slice_quickxml(
     let mut record = build_record(
         id,
         if polarity < 0 { -charge.abs() } else { charge },
+        polarity,
         mz_array,
         intensity_array,
         parse_metadata,
@@ -552,6 +553,7 @@ fn attr_value_eq(e: &quick_xml::events::BytesStart, key: &[u8], expected: &[u8])
 fn build_record(
     id: usize,
     charge: i8,
+    polarity: i8,
     mz_array: Vec<f64>,
     intensity_array: Vec<f32>,
     parse_metadata: bool,
@@ -569,6 +571,13 @@ fn build_record(
         .zip(intensity_array)
         .map(|(mz, intensity)| Peak::new(mz, intensity))
         .collect();
+    // Many metabolomics mzML files carry no charge cvParam; recover it like
+    // the MGF parser does, but only when the polarity is actually known.
+    let charge = if charge == 0 && polarity != 0 && ms_level >= 2 {
+        crate::io::mgf::recover_charge(&peaks, precursor_mz, polarity < 0)
+    } else {
+        charge
+    };
     let mut record = MassSpectralRecord::new(peaks, charge, id);
     record.ms_level = ms_level;
 
@@ -869,6 +878,7 @@ pub fn parse_spectrum_slice_fast(
     let mut record = build_record(
         id,
         if polarity < 0 { -charge.abs() } else { charge },
+        polarity,
         mz_array,
         intensity_array,
         parse_metadata,
@@ -1267,6 +1277,22 @@ mod tests {
             mz_b64 = encode_array(mz),
             int_b64 = encode_array(intensity),
         )
+    }
+
+    #[test]
+    fn missing_charge_is_recovered_only_when_polarity_is_known() {
+        let base = synthetic_spectrum_xml(7, 500.0, 1, 0.2, &[120.0, 250.0], &[10.0, 20.0])
+            .replace(r#"<cvParam accession="MS:1000041" name="charge state" value="1"/>"#, "");
+        assert!(!base.contains("MS:1000041"));
+        let negative = base.replace("<precursorList", "<cvParam accession=\"MS:1000129\"/><precursorList");
+        let positive = base.replace("<precursorList", "<cvParam accession=\"MS:1000130\"/><precursorList");
+        for parser in [parse_spectrum_slice_fast, parse_spectrum_slice_quickxml] {
+            for parse_metadata in [true, false] {
+                assert_eq!(parser(negative.as_bytes(), 7, parse_metadata).unwrap().get_charge(), -1);
+                assert_eq!(parser(positive.as_bytes(), 7, parse_metadata).unwrap().get_charge(), 1);
+                assert_eq!(parser(base.as_bytes(), 7, parse_metadata).unwrap().get_charge(), 0);
+            }
+        }
     }
 
     #[test]
