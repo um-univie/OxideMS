@@ -972,16 +972,23 @@ impl SpectralExperiment {
     /// SIRIUS isotope scoring falls back to the MS2-consensus window. Use
     /// [`ingest_file`](Self::ingest_file) when MS1 isotope evidence matters.
     pub fn ingest_file_low_mem(&mut self, file_path: &str, spill_dir: &Path) -> io::Result<()> {
+        // The streaming parser only understands MGF; anything else would be
+        // scanned for BEGIN IONS and silently yield no spectra.
+        if !file_path.to_ascii_lowercase().ends_with(".mgf") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("low-mem ingestion only supports MGF input, got {file_path:?}"),
+            ));
+        }
         let file_index = self.file_names.len();
         self.file_names.push(
-            file_path
-                .split("/")
-                .last()
-                .expect("str::split always yields at least one item")
-                .split(".mgf")
-                .next()
-                .expect("str::split always yields at least one item")
-                .to_string(),
+            strip_spectral_extension(
+                file_path
+                    .split("/")
+                    .last()
+                    .expect("str::split always yields at least one item"),
+            )
+            .to_string(),
         );
 
         let (keys, total_parsed) = self.parser.parse_file_low_mem(
