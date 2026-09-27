@@ -464,6 +464,11 @@ impl SpectrumHasher {
 
         for peak in peaks {
             let mz = peak.mz;
+            // Out-of-range peaks would otherwise saturate into the first or
+            // last bin and create spurious overlap between spectra.
+            if mz < self.min_mz || mz > self.max_mz {
+                continue;
+            }
             let abs_bin = if is_ppm {
                 mz.ln() / self.bin_denominator
             } else {
@@ -491,6 +496,11 @@ impl SpectrumHasher {
 
         for peak in peaks {
             let mz = peak.mz.to_native();
+            // Out-of-range peaks would otherwise saturate into the first or
+            // last bin and create spurious overlap between spectra.
+            if mz < self.min_mz || mz > self.max_mz {
+                continue;
+            }
             let abs_bin = if is_ppm {
                 mz.ln() / self.bin_denominator
             } else {
@@ -1033,6 +1043,33 @@ impl SpectrumComparison {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hashed_cosine(hasher: &SpectrumHasher, a: &[Peak], b: &[Peak]) -> f32 {
+        let mut va = vec![0.0f32; hasher.hash_len];
+        let mut vb = vec![0.0f32; hasher.hash_len];
+        hasher.into_vector_native(a, true, &mut va);
+        hasher.into_vector_native(b, true, &mut vb);
+        va.iter().zip(&vb).map(|(x, y)| x * y).sum()
+    }
+
+    #[test]
+    fn hasher_ignores_peaks_outside_its_range() {
+        let hasher = SpectrumHasher::new(50.0, 1500.0, MassTolerance::Da(0.05), 800);
+        // Only the out-of-range peaks (below 50 / above 1500) could overlap.
+        let a = vec![Peak::new(41.0, 100.0), Peak::new(1600.0, 100.0), Peak::new(300.0, 10.0)];
+        let b = vec![Peak::new(48.0, 100.0), Peak::new(1900.0, 100.0), Peak::new(700.0, 10.0)];
+        let cos = hashed_cosine(&hasher, &a, &b);
+        assert!(cos.abs() < 1e-6, "out-of-range peaks created overlap: cosine {cos}");
+    }
+
+    #[test]
+    fn hasher_keeps_peaks_on_the_range_edges() {
+        let hasher = SpectrumHasher::new(50.0, 1500.0, MassTolerance::Da(0.05), 800);
+        let edges = vec![Peak::new(50.0, 1.0), Peak::new(1500.0, 1.0)];
+        let mut v = vec![0.0f32; hasher.hash_len];
+        hasher.into_vector_native(&edges, false, &mut v);
+        assert_eq!(v.iter().filter(|x| **x != 0.0).count(), 2);
+    }
 
     #[test]
     fn test_spectrum_creation() {

@@ -854,8 +854,8 @@ impl ClusterEngine {
 
     /// Updates the hasher m/z range and re-initializes the internal lookup tables.
     ///
-    /// Must match the `FilterMZ` bounds in the workflow — peaks outside this range
-    /// are clamped to edge bins and will produce incorrect similarity scores.
+    /// Should match the `FilterMZ` bounds in the workflow — peaks outside this
+    /// range are ignored when hashing.
     pub fn set_mz_range(&mut self, min_mz: f64, max_mz: f64) {
         self.hasher.min_mz = min_mz;
         self.hasher.max_mz = max_mz;
