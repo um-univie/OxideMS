@@ -862,6 +862,14 @@ impl ClusterEngine {
         self.hasher.recalculate_lookup_table();
     }
 
+    /// Updates the fragment tolerance (the hasher's bin width) and
+    /// re-initializes the internal lookup tables. Assigning
+    /// `hasher.tolerance` directly leaves the bins at the old width.
+    pub fn set_fragment_tolerance(&mut self, tolerance: MassTolerance) {
+        self.hasher.tolerance = tolerance;
+        self.hasher.recalculate_lookup_table();
+    }
+
     /// Partitions and refines a set of spectra into manageable batches for clustering.
     ///
     /// This method performs two main steps:
