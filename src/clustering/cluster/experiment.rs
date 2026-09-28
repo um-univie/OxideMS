@@ -68,6 +68,17 @@ pub struct SpectralExperiment {
     /// bound memory on very large DDA files at the cost of isotope scoring
     /// falling back to the MS2-consensus window.
     pub retain_ms1: bool,
+    /// Also write every spectrum that ended up in no cluster to the results
+    /// CSV, with cluster -1: singletons, and spectra removed by the workflow
+    /// or the unknown-charge filter. Must be set before ingestion, since
+    /// filtered spectra are only recorded while it is on. MS1 survey scans
+    /// and MGF blocks without any peak line are never written.
+    pub emit_unclustered: bool,
+    /// Spectra removed during ingestion; only filled with `emit_unclustered`.
+    pub filtered_metadata: Vec<SpectrumMetadata>,
+    /// Low-mem spectra alone in their precursor window, which never reach a
+    /// partition; only filled with `emit_unclustered`.
+    pub lone_metadata: Vec<SpectrumMetadata>,
 }
 
 /// Prints a partition-size distribution to stderr right after
@@ -197,7 +208,7 @@ struct OutputRow {
     retention_time: f32,
 }
 
-/// Writes one results row. The identifier is a USI with the scan number when
+/// Writes one results row, with cluster -1 for `None`. The identifier is a USI with the scan number when
 /// the spectrum had one, else with its position in the file (`index:`), which
 /// is always unique within a file; `index` and `title` disambiguate repeated
 /// scan numbers.
@@ -205,7 +216,7 @@ fn write_result_row(
     writer: &mut impl Write,
     file_name: &str,
     row: &OutputRow,
-    cluster: usize,
+    cluster: Option<usize>,
 ) -> io::Result<()> {
     match row.scan_number {
         Some(scan) => write!(writer, "mzspec:USI000000:{file_name}:scan:{scan}")?,
@@ -219,8 +230,38 @@ fn write_result_row(
         row.charge,
         row.precursor_mz,
         row.retention_time,
-        cluster,
+        cluster.map_or(-1, |c| c as i64),
     )
+}
+
+/// Splits a low-mem partition's rows into one list per cluster plus, when
+/// `keep_unclustered` is set, the rows of spectra in no cluster (sorted by
+/// file and position, so the output does not depend on hash order).
+fn rows_by_cluster(
+    mut lookup: HashMap<u64, OutputRow>,
+    clusters: &FlatClusters,
+    keep_unclustered: bool,
+) -> (Vec<Vec<OutputRow>>, Vec<OutputRow>) {
+    let clustered = clusters
+        .iter()
+        .map(|cluster| {
+            cluster
+                .iter()
+                .map(|id| {
+                    lookup
+                        .remove(&(*id as u64))
+                        .expect("every clustered id is a record of this partition")
+                })
+                .collect()
+        })
+        .collect();
+    let mut unclustered: Vec<OutputRow> = if keep_unclustered {
+        lookup.into_values().collect()
+    } else {
+        Vec::new()
+    };
+    unclustered.sort_by_key(|row| (row.file_index, row.index));
+    (clustered, unclustered)
 }
 
 impl From<&SpectrumMetadata> for OutputRow {
@@ -711,6 +752,7 @@ impl SpectralExperiment {
             usize,
             FilterReport,
             Vec<Ms1Scan>,
+            Vec<SpectrumMetadata>,
         )> = paths
             .into_par_iter()
             .enumerate()
@@ -720,7 +762,8 @@ impl SpectralExperiment {
             })
             .collect();
 
-        for (mut file_spectra, mut file_metadata, raw_count, report, mut ms1) in results {
+        for (mut file_spectra, mut file_metadata, raw_count, report, mut ms1, mut filtered) in results {
+            self.filtered_metadata.append(&mut filtered);
             self.total_spectra_ingested += raw_count;
             self.metadata.append(&mut file_metadata);
             self.spectra.append(&mut file_spectra);
@@ -744,6 +787,7 @@ impl SpectralExperiment {
         usize,
         FilterReport,
         Vec<Ms1Scan>,
+        Vec<SpectrumMetadata>,
     ) {
         let parsed = parse_spectral_file(path, false)
             .unwrap_or_else(|e| panic!("failed to parse spectral file {path:?}: {e}"));
@@ -763,6 +807,7 @@ impl SpectralExperiment {
         };
         report.record("unknown_charge", unknown_charge_dropped);
 
+        let filtered = self.filtered_rows(&spectra, file_index);
         let mut local_metadata = Vec::new();
         let processed_spectra: Vec<MSNSpectrum> = spectra
             .into_iter()
@@ -808,7 +853,21 @@ impl SpectralExperiment {
             })
             .collect();
 
-        (processed_spectra, local_metadata, raw_count, report, ms1_scans)
+        (processed_spectra, local_metadata, raw_count, report, ms1_scans, filtered)
+    }
+
+    /// Metadata rows for the spectra of one file that the workflow emptied or
+    /// the unknown-charge filter will drop, if `emit_unclustered` is set.
+    /// Records carry their position in the file as `id` at this point.
+    fn filtered_rows(&self, spectra: &[MassSpectralRecord], file_index: usize) -> Vec<SpectrumMetadata> {
+        if !self.emit_unclustered {
+            return Vec::new();
+        }
+        spectra
+            .iter()
+            .filter(|s| s.peaks().is_empty() || (self.filter_unknown_charge && s.get_charge() == 0))
+            .map(|s| SpectrumMetadata::from_record(s, s.id, file_index))
+            .collect()
     }
 
     pub fn ingest_file(&mut self, file_path: &str) {
@@ -842,6 +901,8 @@ impl SpectralExperiment {
         report.record("unknown_charge", unknown_charge_dropped);
         self.filter_report.merge(report);
 
+        let filtered = self.filtered_rows(&spectra, file_index);
+        self.filtered_metadata.extend(filtered);
         let current_index = self.metadata.len();
 
         let msn_spectra: Vec<MSNSpectrum> = spectra
@@ -1057,7 +1118,7 @@ impl SpectralExperiment {
             .to_string(),
         );
 
-        let (keys, total_parsed) = self.parser.parse_file_low_mem(
+        let (keys, total_parsed, filtered) = self.parser.parse_file_low_mem(
             file_path,
             file_index,
             spill_dir,
@@ -1065,7 +1126,9 @@ impl SpectralExperiment {
             self.filter_unknown_charge,
             self.engine.hasher.min_mz,
             self.engine.hasher.max_mz,
+            self.emit_unclustered,
         )?;
+        self.filtered_metadata.extend(filtered);
         self.total_spectra_ingested += total_parsed;
         self.low_mem_spill_dir = Some(spill_dir.to_path_buf());
         self.low_mem_keys.extend(keys);
@@ -1151,6 +1214,27 @@ impl SpectralExperiment {
         let shard_files: Vec<File> = (0..num_shards)
             .map(|shard_idx| File::open(spill_dir.join(format!("shard_{shard_idx:06}.bin"))))
             .collect::<io::Result<Vec<File>>>()?;
+
+        if self.emit_unclustered {
+            for w in boundaries.windows(2).filter(|w| w[1] - w[0] == 1) {
+                let key = &sorted[w[0]];
+                let mut buf = vec![0u8; key.len as usize];
+                shard_files[key.shard as usize].read_exact_at(&mut buf, key.offset + 4)?;
+                let record: LowMemRecord = rkyv::from_bytes::<LowMemRecord, rkyv::rancor::Error>(&buf)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                self.lone_metadata.push(SpectrumMetadata {
+                    precursor_mz: record.msn.precursor_mz,
+                    retention_time_in_seconds: record.msn.retention_time_in_seconds,
+                    file_index: record.file_index,
+                    scan_number: record.scan_number,
+                    index: record.index,
+                    title: record.title.into(),
+                    charge: record.msn.charge(),
+                    source_byte_start: 0,
+                    source_byte_end: 0,
+                });
+            }
+        }
 
         let partition_paths: Vec<(PathBuf, usize)> = valid_windows
             .par_iter()
@@ -1248,7 +1332,8 @@ impl SpectralExperiment {
 
         type ClusterRow = OutputRow;
 
-        let process_partition = |partition_path: &Path| -> io::Result<Vec<Vec<ClusterRow>>> {
+        let keep_unclustered = self.emit_unclustered;
+        let process_partition = |partition_path: &Path| -> io::Result<(Vec<Vec<ClusterRow>>, Vec<ClusterRow>)> {
             let records = Self::load_partition(partition_path)?;
             let mut lookup: HashMap<u64, ClusterRow> = HashMap::with_capacity(records.len());
             let mut msn_spectra = Vec::with_capacity(records.len());
@@ -1276,15 +1361,7 @@ impl SpectralExperiment {
                 .cluster()
                 .expect("clustering I/O failure (e.g. low-mem spill read)");
 
-            Ok(clusters
-                .iter()
-                .map(|cluster| {
-                    cluster
-                        .iter()
-                        .map(|id| lookup[&(*id as u64)].clone())
-                        .collect::<Vec<ClusterRow>>()
-                })
-                .collect())
+            Ok(rows_by_cluster(lookup, &clusters, keep_unclustered))
         };
 
         // Mirrors ClusterEngine::cluster()'s own fast_batches/slow_batches
@@ -1303,7 +1380,7 @@ impl SpectralExperiment {
             .into_iter()
             .partition(|&(_, n_spectra)| n_spectra < batch_size_threshold);
 
-        let mut per_partition: Vec<io::Result<Vec<Vec<ClusterRow>>>> = small_partitions
+        let mut per_partition: Vec<io::Result<(Vec<Vec<ClusterRow>>, Vec<ClusterRow>)>> = small_partitions
             .par_iter()
             .map(|(partition_path, _n_spectra)| process_partition(partition_path))
             .collect();
@@ -1325,15 +1402,19 @@ impl SpectralExperiment {
 
         let mut counter = 0usize;
         let mut total_clustered = 0usize;
-        for partition_clusters in per_partition {
-            for cluster in partition_clusters? {
+        let mut unclustered = Vec::new();
+        for partition_result in per_partition {
+            let (partition_clusters, partition_unclustered) = partition_result?;
+            unclustered.extend(partition_unclustered);
+            for cluster in partition_clusters {
                 counter += 1;
                 for row in cluster {
                     total_clustered += 1;
-                    write_result_row(&mut writer, &self.file_names[row.file_index], &row, counter)?;
+                    write_result_row(&mut writer, &self.file_names[row.file_index], &row, Some(counter))?;
                 }
             }
         }
+        self.write_unclustered_rows(&mut writer, unclustered)?;
         writer.flush()?;
         Ok((total_clustered, counter))
     }
@@ -1362,7 +1443,13 @@ impl SpectralExperiment {
         let overall_start = Instant::now();
 
         type ClusterRow = OutputRow;
-        type PartitionOutput = (Vec<Vec<ClusterRow>>, Vec<ClusterQualityMetrics>, PartitionStats);
+        type PartitionOutput = (
+            Vec<Vec<ClusterRow>>,
+            Vec<ClusterRow>,
+            Vec<ClusterQualityMetrics>,
+            PartitionStats,
+        );
+        let keep_unclustered = self.emit_unclustered;
 
         // A partition over `approximate_threshold` triggers the approximate
         // graph-DBSCAN path, which internally parallelizes its own matmul /
@@ -1444,17 +1531,9 @@ impl SpectralExperiment {
                 |id| id_to_pos[&(id as u64)],
             );
 
-            let rows = clusters
-                .iter()
-                .map(|cluster| {
-                    cluster
-                        .iter()
-                        .map(|id| lookup[&(*id as u64)].clone())
-                        .collect::<Vec<ClusterRow>>()
-                })
-                .collect();
+            let (rows, unclustered) = rows_by_cluster(lookup, &clusters, keep_unclustered);
 
-            Ok((rows, quality, (n_spectra, elapsed_ms, approximate)))
+            Ok((rows, unclustered, quality, (n_spectra, elapsed_ms, approximate)))
         };
 
         let (small, large): (Vec<(usize, &(PathBuf, usize))>, Vec<(usize, &(PathBuf, usize))>) =
@@ -1499,18 +1578,21 @@ impl SpectralExperiment {
         let mut total_clustered = 0usize;
         let mut all_quality = Vec::new();
         let mut partition_stats: Vec<PartitionStats> = Vec::with_capacity(per_partition.len());
+        let mut unclustered = Vec::new();
         for partition_result in per_partition {
-            let (partition_clusters, quality, stats) = partition_result?;
+            let (partition_clusters, partition_unclustered, quality, stats) = partition_result?;
+            unclustered.extend(partition_unclustered);
             partition_stats.push(stats);
             all_quality.extend(quality);
             for cluster in partition_clusters {
                 counter += 1;
                 for row in cluster {
                     total_clustered += 1;
-                    write_result_row(&mut writer, &self.file_names[row.file_index], &row, counter)?;
+                    write_result_row(&mut writer, &self.file_names[row.file_index], &row, Some(counter))?;
                 }
             }
         }
+        self.write_unclustered_rows(&mut writer, unclustered)?;
         writer.flush()?;
         log_partition_timing_summary(&partition_stats, overall_start.elapsed());
         Ok((total_clustered, counter, all_quality))
@@ -1565,6 +1647,21 @@ impl SpectralExperiment {
     /// is a result ("no cluster met the threshold"), whereas a missing file is
     /// indistinguishable from a crash for anything downstream. The two low-mem
     /// paths have always behaved this way; this one used to return early.
+    /// Writes `rows` (spectra left out of every cluster), the low-mem spectra
+    /// alone in their precursor window and then the spectra removed during
+    /// ingestion, all with cluster -1, if `emit_unclustered` is set.
+    fn write_unclustered_rows(&self, writer: &mut impl Write, rows: Vec<OutputRow>) -> io::Result<()> {
+        if !self.emit_unclustered {
+            return Ok(());
+        }
+        let lone = self.lone_metadata.iter().map(OutputRow::from);
+        let filtered = self.filtered_metadata.iter().map(OutputRow::from);
+        for row in rows.into_iter().chain(lone).chain(filtered) {
+            write_result_row(writer, &self.file_names[row.file_index], &row, None)?;
+        }
+        Ok(())
+    }
+
     pub fn write_results(&self, clusters: &FlatClusters, output_file_name: &str) {
         let mut file = std::fs::File::create(output_file_name)
             .unwrap_or_else(|e| panic!("cannot create output file {output_file_name:?}: {e}"));
@@ -1582,9 +1679,27 @@ impl SpectralExperiment {
                     .get(*spectrum)
                     .expect("clustered id has a metadata entry");
                 let row = OutputRow::from(metadata);
-                write_result_row(&mut writer, &self.file_names[metadata.file_index], &row, counter)
+                write_result_row(&mut writer, &self.file_names[metadata.file_index], &row, Some(counter))
                     .unwrap_or_else(|e| panic!("failed writing row to {output_file_name:?}: {e}"));
             }
+        }
+
+        if self.emit_unclustered {
+            let mut clustered = vec![false; self.metadata.len()];
+            for cluster in clusters.iter() {
+                for &spectrum in cluster {
+                    clustered[spectrum] = true;
+                }
+            }
+            let unclustered = self
+                .metadata
+                .iter()
+                .zip(&clustered)
+                .filter(|(_, is_clustered)| !**is_clustered)
+                .map(|(metadata, _)| OutputRow::from(metadata))
+                .collect();
+            self.write_unclustered_rows(&mut writer, unclustered)
+                .unwrap_or_else(|e| panic!("failed writing row to {output_file_name:?}: {e}"));
         }
     }
 
@@ -2017,6 +2132,57 @@ BEGIN IONS\nTITLE=B_noscan\nPEPMASS=300.0\nCHARGE=1+\n110.0 1000\n170.0 800\n230
         let mut experiment = SpectralExperiment::metabolomics();
         experiment.engine.epsilon = 0.1;
         experiment
+    }
+
+    const EMIT_ALL_MGF: &str = "\
+BEGIN IONS\nTITLE=P1\nPEPMASS=300.0\nCHARGE=1+\nSCANS=10\n100.0 1000\n150.0 800\n200.0 600\nEND IONS\n\
+BEGIN IONS\nTITLE=filtered\nPEPMASS=300.0\nCHARGE=1+\nSCANS=11\n100.0 1000\n150.0 800\nEND IONS\n\
+BEGIN IONS\nTITLE=P2\nPEPMASS=300.0\nCHARGE=1+\nSCANS=12\n100.0 1000\n150.0 800\n200.0 600\nEND IONS\n\
+BEGIN IONS\nTITLE=single\nPEPMASS=450.0\nCHARGE=1+\nSCANS=13\n110.0 1000\n170.0 800\n230.0 600\nEND IONS\n";
+
+    fn emit_all_expected() -> Vec<String> {
+        normalize_clusters(vec![
+            "mzspec:USI000000:emit:scan:10,0,P1,1,300,0,C1".to_string(),
+            "mzspec:USI000000:emit:scan:12,2,P2,1,300,0,C1".to_string(),
+            "mzspec:USI000000:emit:scan:11,1,filtered,1,300,0,-1".to_string(),
+            "mzspec:USI000000:emit:scan:13,3,single,1,450,0,-1".to_string(),
+        ])
+    }
+
+    #[test]
+    fn emit_unclustered_writes_every_spectrum_once() {
+        let dir = std::env::temp_dir().join(format!("oxidems_emit_all_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mgf = dir.join("emit.mgf");
+        std::fs::write(&mgf, EMIT_ALL_MGF).unwrap();
+
+        let mut experiment = metabolomics_experiment();
+        experiment.emit_unclustered = true;
+        experiment.ingest_file(mgf.to_str().unwrap());
+        experiment.prepare_clustering();
+        let clusters = experiment.cluster();
+        let out = dir.join("normal.csv");
+        experiment.write_results(&clusters, out.to_str().unwrap());
+        let normal = normalize_clusters(data_rows(&std::fs::read_to_string(&out).unwrap()));
+        assert_eq!(normal, emit_all_expected(), "normal path");
+
+        let mut experiment = metabolomics_experiment();
+        experiment.emit_unclustered = true;
+        experiment.ingest_file_low_mem(mgf.to_str().unwrap(), &dir.join("spill")).unwrap();
+        let out = dir.join("low_mem.csv");
+        experiment.cluster_and_write_low_mem(out.to_str().unwrap()).unwrap();
+        let low_mem = normalize_clusters(data_rows(&std::fs::read_to_string(&out).unwrap()));
+        assert_eq!(low_mem, emit_all_expected(), "low-mem path");
+
+        // Off by default: only clustered spectra.
+        let mut experiment = metabolomics_experiment();
+        experiment.ingest_file(mgf.to_str().unwrap());
+        experiment.prepare_clustering();
+        let clusters = experiment.cluster();
+        experiment.write_results(&clusters, out.to_str().unwrap());
+        assert_eq!(data_rows(&std::fs::read_to_string(&out).unwrap()).len(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

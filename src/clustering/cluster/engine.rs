@@ -731,6 +731,28 @@ pub struct SpectrumMetadata {
     pub source_byte_end: u64,
 }
 
+impl SpectrumMetadata {
+    /// Metadata for `record`, the `index`-th spectrum of file `file_index`.
+    pub fn from_record(
+        record: &crate::spectrum::MassSpectralRecord,
+        index: usize,
+        file_index: usize,
+    ) -> Self {
+        let msn = record.to_msn();
+        Self {
+            precursor_mz: msn.precursor_mz,
+            retention_time_in_seconds: msn.retention_time_in_seconds,
+            file_index,
+            scan_number: record.get_metadata("SCANS").and_then(|v| v.parse::<usize>().ok()),
+            index,
+            title: record.get_metadata("TITLE").unwrap_or("").into(),
+            charge: record.get_charge(),
+            source_byte_start: record.source_byte_start,
+            source_byte_end: record.source_byte_end,
+        }
+    }
+}
+
 /// The main engine for orchestrating large-scale spectral clustering.
 ///
 /// `ClusterEngine` manages memory buffers and configurations for high-performance

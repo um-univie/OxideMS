@@ -3,6 +3,7 @@
 //! MGF is a plain-text format commonly used in mass spectrometry to store peak lists.
 //! This implementation utilizes memory-mapping and parallel processing for maximum throughput.
 
+use crate::clustering::cluster::engine::SpectrumMetadata;
 use crate::spectrum::{MSNSpectrum, MassSpectralRecord, Peak};
 use crate::workflow::WorkFlowManager;
 use rkyv::{Archive, Deserialize, Serialize};
@@ -457,7 +458,8 @@ impl MgfParser {
         filter_unknown_charge: bool,
         mass_bucket_min_da: f64,
         mass_bucket_max_da: f64,
-    ) -> io::Result<(Vec<SpillKey>, usize)> {
+        collect_filtered: bool,
+    ) -> io::Result<(Vec<SpillKey>, usize, Vec<SpectrumMetadata>)> {
         let file = File::open(file_name)?;
 
         // Map the file into virtual memory
@@ -497,11 +499,13 @@ impl MgfParser {
         let num_chunks = (rayon::current_num_threads() * 4).max(1);
         let chunk_size = n.div_ceil(num_chunks).max(1);
 
-        let shard_results: Vec<io::Result<(Vec<SpillKey>, usize)>> = start_indices
+        type ChunkResult = (Vec<SpillKey>, usize, Vec<SpectrumMetadata>);
+        let shard_results: Vec<io::Result<ChunkResult>> = start_indices
             .par_chunks(chunk_size)
             .enumerate()
-            .map(|(chunk_idx, chunk)| -> io::Result<(Vec<SpillKey>, usize)> {
+            .map(|(chunk_idx, chunk)| -> io::Result<ChunkResult> {
                 let mut shard_keys = Vec::with_capacity(chunk.len());
+                let mut filtered = Vec::new();
                 let mut parsed_ok = 0usize;
                 let chunk_start = chunk_idx * chunk_size;
 
@@ -526,10 +530,12 @@ impl MgfParser {
                     for op in workflow.operations() {
                         op.operate(std::slice::from_mut(&mut record), false);
                     }
-                    if record.peaks().is_empty() {
-                        continue;
-                    }
-                    if filter_unknown_charge && record.get_charge() == 0 {
+                    if record.peaks().is_empty()
+                        || (filter_unknown_charge && record.get_charge() == 0)
+                    {
+                        if collect_filtered {
+                            filtered.push(SpectrumMetadata::from_record(&record, global_i, file_index));
+                        }
                         continue;
                     }
 
@@ -576,7 +582,7 @@ impl MgfParser {
                         len: bytes.len() as u32,
                     });
                 }
-                Ok((shard_keys, parsed_ok))
+                Ok((shard_keys, parsed_ok, filtered))
             })
             .collect();
 
@@ -593,12 +599,14 @@ impl MgfParser {
 
         let mut keys = Vec::with_capacity(n);
         let mut total_parsed = 0usize;
+        let mut filtered = Vec::new();
         for shard_result in shard_results {
-            let (shard_keys, parsed_ok) = shard_result?;
+            let (shard_keys, parsed_ok, shard_filtered) = shard_result?;
             keys.extend(shard_keys);
             total_parsed += parsed_ok;
+            filtered.extend(shard_filtered);
         }
-        Ok((keys, total_parsed))
+        Ok((keys, total_parsed, filtered))
     }
 
     /// Opens this parser's low-mem shard pool: a small, fixed number of
