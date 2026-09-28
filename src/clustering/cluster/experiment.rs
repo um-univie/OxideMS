@@ -8,6 +8,7 @@ use crate::{
     io::mzml::{MzmlParser, MzmlParserConfig},
     workflow::*,
 };
+use compact_str::CompactString;
 use memmap2::Mmap;
 use nohash_hasher::IntMap;
 use rayon::prelude::*;
@@ -179,6 +180,71 @@ fn log_partition_timing_summary(stats: &[PartitionStats], overall_elapsed: std::
 /// the same `Vec<MassSpectralRecord>`, so callers can treat any mix of
 /// these formats identically once parsed.
 const SPECTRAL_FILE_EXTENSIONS: [&str; 3] = ["mgf", "mzml", "mzML"];
+
+/// Column header of the cluster results CSV.
+const RESULTS_CSV_COLUMNS: &str =
+    "identifier,index,title,precursor_charge,precursor_mz,retention_time,cluster";
+
+/// The per-spectrum fields of one cluster results CSV row.
+#[derive(Clone, Debug)]
+struct OutputRow {
+    file_index: usize,
+    scan_number: Option<usize>,
+    index: usize,
+    title: CompactString,
+    charge: i8,
+    precursor_mz: f64,
+    retention_time: f32,
+}
+
+/// Writes one results row. The identifier is a USI with the scan number when
+/// the spectrum had one, else with its position in the file (`index:`), which
+/// is always unique within a file; `index` and `title` disambiguate repeated
+/// scan numbers.
+fn write_result_row(
+    writer: &mut impl Write,
+    file_name: &str,
+    row: &OutputRow,
+    cluster: usize,
+) -> io::Result<()> {
+    match row.scan_number {
+        Some(scan) => write!(writer, "mzspec:USI000000:{file_name}:scan:{scan}")?,
+        None => write!(writer, "mzspec:USI000000:{file_name}:index:{}", row.index)?,
+    }
+    writeln!(
+        writer,
+        ",{},{},{},{},{},{}",
+        row.index,
+        csv_field(&row.title),
+        row.charge,
+        row.precursor_mz,
+        row.retention_time,
+        cluster,
+    )
+}
+
+impl From<&SpectrumMetadata> for OutputRow {
+    fn from(m: &SpectrumMetadata) -> Self {
+        OutputRow {
+            file_index: m.file_index,
+            scan_number: m.scan_number,
+            index: m.index,
+            title: m.title.clone(),
+            charge: m.charge,
+            precursor_mz: m.precursor_mz,
+            retention_time: m.retention_time_in_seconds,
+        }
+    }
+}
+
+/// Quotes a CSV field if it contains a delimiter, quote or line break.
+fn csv_field(value: &str) -> std::borrow::Cow<'_, str> {
+    if value.contains([',', '"', '\n', '\r']) {
+        std::borrow::Cow::Owned(format!("\"{}\"", value.replace('"', "\"\"")))
+    } else {
+        std::borrow::Cow::Borrowed(value)
+    }
+}
 
 fn has_known_spectral_extension(path: &str) -> bool {
     SPECTRAL_FILE_EXTENSIONS
@@ -712,14 +778,14 @@ impl SpectralExperiment {
             .map(|(local_idx, s)| {
                 // SCANS is sometimes a range/list (MSn-to-pseudo-MS2 spectra
                 // merged from several underlying scans), which doesn't parse
-                // as a plain integer -- fall back to a per-record unique id
-                // rather than a constant, or every such spectrum in the file
-                // would collapse onto the same scan_number (see also
-                // mgf.rs::parse_file_low_mem).
+                // as a plain integer; the output identifier then falls back
+                // to `index` (see also mgf.rs::parse_file_low_mem).
                 let scan_number = s
                     .get_metadata("SCANS")
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or(local_idx);
+                    .and_then(|v| v.parse::<usize>().ok());
+                // The parser numbers records by their position in the file.
+                let index = s.id;
+                let title = CompactString::new(s.get_metadata("TITLE").unwrap_or(""));
                 let source_byte_start = s.source_byte_start;
                 let source_byte_end = s.source_byte_end;
                 let mut msn = s.to_msn();
@@ -731,6 +797,8 @@ impl SpectralExperiment {
                     retention_time_in_seconds: msn.retention_time_in_seconds,
                     charge: msn.charge(),
                     scan_number,
+                    index,
+                    title,
                     file_index,
                     source_byte_start,
                     source_byte_end,
@@ -788,29 +856,27 @@ impl SpectralExperiment {
             })
             .enumerate()
             .map(|(index, mut s)| {
+                // The parser numbers records by their position in the file.
+                let file_position = s.id;
+                // See the note on the analogous SCANS parse above.
+                let scan_number = s.get_metadata("SCANS").and_then(|v| v.parse::<usize>().ok());
+                let title = CompactString::new(s.get_metadata("TITLE").unwrap_or(""));
+                let (source_byte_start, source_byte_end) = (s.source_byte_start, s.source_byte_end);
                 s.id = current_index + index;
-                (
-                    // See the fallback note on the analogous SCANS parse above.
-                    s.get_metadata("SCANS")
-                        .and_then(|v| v.parse::<usize>().ok())
-                        .unwrap_or(current_index + index),
-                    s.source_byte_start,
-                    s.source_byte_end,
-                    s.to_msn(),
-                )
-            })
-            .inspect(|(scan_number, source_byte_start, source_byte_end, msn)| {
+                let msn = s.to_msn();
                 self.metadata.push(SpectrumMetadata {
                     precursor_mz: msn.precursor_mz,
                     retention_time_in_seconds: msn.retention_time_in_seconds,
                     charge: msn.charge(),
-                    scan_number: *scan_number,
+                    scan_number,
+                    index: file_position,
+                    title,
                     file_index,
-                    source_byte_start: *source_byte_start,
-                    source_byte_end: *source_byte_end,
+                    source_byte_start,
+                    source_byte_end,
                 });
+                msn
             })
-            .map(|(_, _, _, msn_spectrum)| msn_spectrum)
             .collect();
 
         self.spectra.extend(msn_spectra);
@@ -1180,7 +1246,7 @@ impl SpectralExperiment {
     ) -> io::Result<(usize, usize)> {
         let partition_paths = self.finalize_low_mem_partitions()?;
 
-        type ClusterRow = (usize, usize, i8, f64, f32); // file_index, scan_number, charge, precursor_mz, rt
+        type ClusterRow = OutputRow;
 
         let process_partition = |partition_path: &Path| -> io::Result<Vec<Vec<ClusterRow>>> {
             let records = Self::load_partition(partition_path)?;
@@ -1189,13 +1255,15 @@ impl SpectralExperiment {
             for r in records {
                 lookup.insert(
                     r.msn.id,
-                    (
-                        r.file_index,
-                        r.scan_number,
-                        r.msn.charge(),
-                        r.msn.precursor_mz,
-                        r.msn.retention_time_in_seconds,
-                    ),
+                    OutputRow {
+                        file_index: r.file_index,
+                        scan_number: r.scan_number,
+                        index: r.index,
+                        title: CompactString::from(r.title),
+                        charge: r.msn.charge(),
+                        precursor_mz: r.msn.precursor_mz,
+                        retention_time: r.msn.retention_time_in_seconds,
+                    },
                 );
                 msn_spectra.push(r.msn);
             }
@@ -1213,7 +1281,7 @@ impl SpectralExperiment {
                 .map(|cluster| {
                     cluster
                         .iter()
-                        .map(|id| lookup[&(*id as u64)])
+                        .map(|id| lookup[&(*id as u64)].clone())
                         .collect::<Vec<ClusterRow>>()
                 })
                 .collect())
@@ -1247,7 +1315,7 @@ impl SpectralExperiment {
         let mut writer = BufWriter::new(file);
         write!(
             writer,
-            "# RedshiftMS (OxideMS core v{}) {}\n# eps = {}\n# hash_len = {}\n# total_spectra_parsed = {}\nidentifier,precursor_charge,precursor_mz,retention_time,cluster\n",
+            "# RedshiftMS (OxideMS core v{}) {}\n# eps = {}\n# hash_len = {}\n# total_spectra_parsed = {}\n{RESULTS_CSV_COLUMNS}\n",
             env!("CARGO_PKG_VERSION"),
             if self.engine.exact { "(exact)" } else { "" },
             self.engine.epsilon,
@@ -1260,18 +1328,9 @@ impl SpectralExperiment {
         for partition_clusters in per_partition {
             for cluster in partition_clusters? {
                 counter += 1;
-                for (file_index, scan_number, charge, precursor_mz, rt) in cluster {
+                for row in cluster {
                     total_clustered += 1;
-                    writeln!(
-                        writer,
-                        "mzspec:USI000000:{}:scan:{},{},{},{},{}",
-                        &self.file_names[file_index],
-                        scan_number,
-                        charge,
-                        precursor_mz,
-                        rt,
-                        counter,
-                    )?;
+                    write_result_row(&mut writer, &self.file_names[row.file_index], &row, counter)?;
                 }
             }
         }
@@ -1302,7 +1361,7 @@ impl SpectralExperiment {
         let completed = AtomicUsize::new(0);
         let overall_start = Instant::now();
 
-        type ClusterRow = (usize, usize, i8, f64, f32); // file_index, scan_number, charge, precursor_mz, rt
+        type ClusterRow = OutputRow;
         type PartitionOutput = (Vec<Vec<ClusterRow>>, Vec<ClusterQualityMetrics>, PartitionStats);
 
         // A partition over `approximate_threshold` triggers the approximate
@@ -1332,13 +1391,15 @@ impl SpectralExperiment {
             for r in records {
                 lookup.insert(
                     r.msn.id,
-                    (
-                        r.file_index,
-                        r.scan_number,
-                        r.msn.charge(),
-                        r.msn.precursor_mz,
-                        r.msn.retention_time_in_seconds,
-                    ),
+                    OutputRow {
+                        file_index: r.file_index,
+                        scan_number: r.scan_number,
+                        index: r.index,
+                        title: CompactString::from(r.title),
+                        charge: r.msn.charge(),
+                        precursor_mz: r.msn.precursor_mz,
+                        retention_time: r.msn.retention_time_in_seconds,
+                    },
                 );
                 id_to_pos.insert(r.msn.id, msn_spectra.len());
                 msn_spectra.push(r.msn);
@@ -1388,7 +1449,7 @@ impl SpectralExperiment {
                 .map(|cluster| {
                     cluster
                         .iter()
-                        .map(|id| lookup[&(*id as u64)])
+                        .map(|id| lookup[&(*id as u64)].clone())
                         .collect::<Vec<ClusterRow>>()
                 })
                 .collect();
@@ -1426,7 +1487,7 @@ impl SpectralExperiment {
         let mut writer = BufWriter::new(file);
         write!(
             writer,
-            "# RedshiftMS (OxideMS core v{}) {}\n# eps = {}\n# hash_len = {}\n# total_spectra_parsed = {}\nidentifier,precursor_charge,precursor_mz,retention_time,cluster\n",
+            "# RedshiftMS (OxideMS core v{}) {}\n# eps = {}\n# hash_len = {}\n# total_spectra_parsed = {}\n{RESULTS_CSV_COLUMNS}\n",
             env!("CARGO_PKG_VERSION"),
             if self.engine.exact { "(exact)" } else { "" },
             self.engine.epsilon,
@@ -1444,18 +1505,9 @@ impl SpectralExperiment {
             all_quality.extend(quality);
             for cluster in partition_clusters {
                 counter += 1;
-                for (file_index, scan_number, charge, precursor_mz, rt) in cluster {
+                for row in cluster {
                     total_clustered += 1;
-                    writeln!(
-                        writer,
-                        "mzspec:USI000000:{}:scan:{},{},{},{},{}",
-                        &self.file_names[file_index],
-                        scan_number,
-                        charge,
-                        precursor_mz,
-                        rt,
-                        counter,
-                    )?;
+                    write_result_row(&mut writer, &self.file_names[row.file_index], &row, counter)?;
                 }
             }
         }
@@ -1517,7 +1569,7 @@ impl SpectralExperiment {
         let mut file = std::fs::File::create(output_file_name)
             .unwrap_or_else(|e| panic!("cannot create output file {output_file_name:?}: {e}"));
         let mut writer = std::io::BufWriter::new(&mut file);
-        writer.write(format!("# RedshiftMS (OxideMS core v{}) {}\n# eps = {}\n# hash_len = {}\n# total_spectra_parsed = {}\nidentifier,precursor_charge,precursor_mz,retention_time,cluster\n", env!("CARGO_PKG_VERSION"), if self.engine.exact {"(exact)"} else {""},  self.engine.epsilon, self.engine.hash_size(), self.total_spectra_ingested).as_bytes())
+        writer.write(format!("# RedshiftMS (OxideMS core v{}) {}\n# eps = {}\n# hash_len = {}\n# total_spectra_parsed = {}\n{RESULTS_CSV_COLUMNS}\n", env!("CARGO_PKG_VERSION"), if self.engine.exact {"(exact)"} else {""},  self.engine.epsilon, self.engine.hash_size(), self.total_spectra_ingested).as_bytes())
             .unwrap_or_else(|e| panic!("failed writing header to {output_file_name:?}: {e}"));
         let mut counter = 0;
         for cluster in clusters.iter() {
@@ -1529,22 +1581,8 @@ impl SpectralExperiment {
                     .metadata
                     .get(*spectrum)
                     .expect("clustered id has a metadata entry");
-                let precursor_charge = metadata.charge;
-                let precursor_mz = metadata.precursor_mz;
-                let retention_time = metadata.retention_time_in_seconds;
-                writer
-                    .write(
-                        format!(
-                            "mzspec:USI000000:{}:scan:{},{},{},{},{}\n",
-                            &self.file_names[metadata.file_index],
-                            metadata.scan_number,
-                            precursor_charge,
-                            precursor_mz,
-                            retention_time,
-                            counter,
-                        )
-                        .as_bytes(),
-                    )
+                let row = OutputRow::from(metadata);
+                write_result_row(&mut writer, &self.file_names[metadata.file_index], &row, counter)
                     .unwrap_or_else(|e| panic!("failed writing row to {output_file_name:?}: {e}"));
             }
         }
@@ -1924,4 +1962,96 @@ pub fn calculate_cluster_recall(exact_labels: &[ClusterLabel], lsh_labels: &[Clu
     }
 
     true_positives as f32 / total_true_pairs as f32
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+
+    const DUPLICATE_SCANS_MGF: &str = "\
+BEGIN IONS\nTITLE=A1\nPEPMASS=300.0\nCHARGE=1+\nSCANS=5\n100.0 1000\n150.0 800\n200.0 600\nEND IONS\n\
+BEGIN IONS\nTITLE=A2, copy\nPEPMASS=300.0\nCHARGE=1+\nSCANS=5\n100.0 1000\n150.0 800\n200.0 600\nEND IONS\n\
+BEGIN IONS\nTITLE=B1\nPEPMASS=300.0\nCHARGE=1+\nSCANS=1\n110.0 1000\n170.0 800\n230.0 600\nEND IONS\n\
+BEGIN IONS\nTITLE=B_noscan\nPEPMASS=300.0\nCHARGE=1+\n110.0 1000\n170.0 800\n230.0 600\nEND IONS\n";
+
+    fn data_rows(csv: &str) -> Vec<String> {
+        let mut lines = csv.lines().filter(|l| !l.starts_with('#'));
+        assert_eq!(lines.next(), Some(RESULTS_CSV_COLUMNS));
+        let mut rows: Vec<String> = lines.map(str::to_string).collect();
+        rows.sort();
+        rows
+    }
+
+    fn expected_rows() -> Vec<String> {
+        let mut rows = vec![
+            "mzspec:USI000000:dup:scan:5,0,A1,1,300,0,C1".to_string(),
+            "mzspec:USI000000:dup:scan:5,1,\"A2, copy\",1,300,0,C1".to_string(),
+            "mzspec:USI000000:dup:scan:1,2,B1,1,300,0,C2".to_string(),
+            "mzspec:USI000000:dup:index:3,3,B_noscan,1,300,0,C2".to_string(),
+        ];
+        rows.sort();
+        rows
+    }
+
+    /// Cluster ids are arbitrary, so compare rows with the cluster column
+    /// replaced by C1/C2 in order of first appearance of each id in sorted rows.
+    fn normalize_clusters(mut rows: Vec<String>) -> Vec<String> {
+        rows.sort();
+        let mut seen: Vec<String> = Vec::new();
+        let mut rows: Vec<String> = rows
+            .into_iter()
+            .map(|row| {
+                let (head, cluster) = row.rsplit_once(',').unwrap();
+                let pos = seen.iter().position(|c| c == cluster).unwrap_or_else(|| {
+                    seen.push(cluster.to_string());
+                    seen.len() - 1
+                });
+                format!("{head},C{}", pos + 1)
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    fn metabolomics_experiment() -> SpectralExperiment {
+        let mut experiment = SpectralExperiment::metabolomics();
+        experiment.engine.epsilon = 0.1;
+        experiment
+    }
+
+    #[test]
+    fn csv_field_quotes_only_when_needed() {
+        assert_eq!(csv_field("plain"), "plain");
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
+        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+    }
+
+    #[test]
+    fn identifiers_are_unique_with_duplicate_or_missing_scans() {
+        let dir = std::env::temp_dir().join(format!("oxidems_output_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mgf = dir.join("dup.mgf");
+        std::fs::write(&mgf, DUPLICATE_SCANS_MGF).unwrap();
+
+        // Normal path
+        let mut experiment = metabolomics_experiment();
+        experiment.ingest_file(mgf.to_str().unwrap());
+        experiment.prepare_clustering();
+        let clusters = experiment.cluster();
+        let out = dir.join("normal.csv");
+        experiment.write_results(&clusters, out.to_str().unwrap());
+        let normal = normalize_clusters(data_rows(&std::fs::read_to_string(&out).unwrap()));
+        assert_eq!(normal, normalize_clusters(expected_rows()));
+
+        // Low-mem path
+        let mut experiment = metabolomics_experiment();
+        let spill = dir.join("spill");
+        experiment.ingest_file_low_mem(mgf.to_str().unwrap(), &spill).unwrap();
+        let out = dir.join("low_mem.csv");
+        experiment.cluster_and_write_low_mem(out.to_str().unwrap()).unwrap();
+        let low_mem = normalize_clusters(data_rows(&std::fs::read_to_string(&out).unwrap()));
+        assert_eq!(low_mem, normalize_clusters(expected_rows()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

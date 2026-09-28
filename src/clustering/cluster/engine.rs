@@ -712,8 +712,14 @@ pub struct SpectrumMetadata {
     pub retention_time_in_seconds: f32,
     /// Index of the source file.
     pub file_index: usize,
-    /// The scan identifier within the source file.
-    pub scan_number: usize,
+    /// The scan number from the source file (MGF `SCANS`, mzML `scan=`), if
+    /// it had a parseable one. Not guaranteed unique within a file.
+    pub scan_number: Option<usize>,
+    /// 0-based position of the spectrum in its source file, counted before
+    /// any filtering. Unique within a file.
+    pub index: usize,
+    /// The spectrum's `TITLE`, or empty if it had none.
+    pub title: compact_str::CompactString,
     /// The charge state of the precursor ion.
     pub charge: i8,
     /// Byte offset in the source file where this spectrum's block starts.

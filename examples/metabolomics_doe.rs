@@ -159,9 +159,9 @@ fn run_config(
         {
             let scan_number = s
                 .get_metadata("SCANS")
-                .unwrap_or("0")
-                .parse::<usize>()
-                .unwrap_or(0);
+                .and_then(|v| v.parse::<usize>().ok());
+            let index = s.id;
+            let title = s.get_metadata("TITLE").unwrap_or("").into();
             let source_byte_start = s.source_byte_start;
             let source_byte_end = s.source_byte_end;
             let msn = s.to_msn();
@@ -170,6 +170,8 @@ fn run_config(
                 retention_time_in_seconds: msn.retention_time_in_seconds,
                 charge: msn.charge(),
                 scan_number,
+                index,
+                title,
                 file_index: file_idx,
                 source_byte_start,
                 source_byte_end,

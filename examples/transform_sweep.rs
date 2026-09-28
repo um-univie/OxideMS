@@ -111,7 +111,7 @@ fn main() {
     let file_scan: Vec<(usize, usize)> = experiment
         .metadata
         .iter()
-        .map(|m| (m.file_index, m.scan_number))
+        .map(|m| (m.file_index, m.scan_number.unwrap_or(m.index)))
         .collect();
     let file_names = experiment.file_names.clone();
     let spectra = experiment.spectra.clone();

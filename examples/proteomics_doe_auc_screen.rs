@@ -177,7 +177,7 @@ fn score_ms_db(
     let identity_of = |id: usize| -> Option<&String> {
         let meta = experiment.metadata.get(id)?;
         let fname = experiment.file_names.get(meta.file_index)?;
-        ground_truth.get(&(fname.clone(), meta.scan_number))
+        ground_truth.get(&(fname.clone(), meta.scan_number?))
     };
 
     // --- purity ---

@@ -102,16 +102,20 @@ fn main() {
         if fields.len() < 5 {
             continue;
         }
+        // Read the numeric columns from the right: newer RedshiftMS output
+        // adds `index,title` after the identifier, and a title may itself
+        // contain commas.
+        let n = fields.len();
         let identifier = fields[0];
-        let mz: f64 = match fields[2].parse() {
+        let mz: f64 = match fields[n - 3].parse() {
             Ok(v) => v,
             Err(_) => continue,
         };
-        let rt: f32 = match fields[3].parse() {
+        let rt: f32 = match fields[n - 2].parse() {
             Ok(v) => v,
             Err(_) => continue,
         };
-        let cluster: i64 = match fields[4].parse() {
+        let cluster: i64 = match fields[n - 1].parse() {
             Ok(v) => v,
             Err(_) => continue,
         };

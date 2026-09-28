@@ -535,22 +535,19 @@ impl MgfParser {
 
                     // SCANS is sometimes a range/list (e.g. MSn-to-pseudo-MS2
                     // spectra merged from several underlying scans, "185-238,
-                    // 737-739,..."), which doesn't parse as a plain integer.
-                    // Falling back to a constant would collapse every such
-                    // spectrum in the file onto the same scan_number, and
-                    // since the output `identifier` column is keyed on
-                    // (file, scan_number), that breaks its per-spectrum
-                    // uniqueness. record_id is already unique per parsed
-                    // block, so it's a safe fallback.
+                    // 737-739,..."), which doesn't parse as a plain integer;
+                    // the output identifier then falls back to `index`.
                     let scan_number = record
                         .get_metadata("SCANS")
-                        .and_then(|s| s.parse::<usize>().ok())
-                        .unwrap_or(record_id as usize);
+                        .and_then(|s| s.parse::<usize>().ok());
+                    let title = record.get_metadata("TITLE").unwrap_or("").to_string();
                     let msn = record.to_msn();
                     let neutral_mass = msn.get_neutral_mass();
                     let low_mem_record = LowMemRecord {
                         msn,
                         scan_number,
+                        index: global_i,
+                        title,
                         file_index,
                     };
                     let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&low_mem_record)
@@ -682,7 +679,10 @@ pub struct SpillKey {
 #[derive(Clone, Debug, Archive, Serialize, Deserialize)]
 pub struct LowMemRecord {
     pub msn: MSNSpectrum,
-    pub scan_number: usize,
+    pub scan_number: Option<usize>,
+    /// 0-based position of the spectrum in its source file.
+    pub index: usize,
+    pub title: String,
     pub file_index: usize,
 }
 
