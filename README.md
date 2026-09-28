@@ -31,6 +31,15 @@ oxidems_lib = { git = "https://github.com/um-univie/OxideMS", branch = "main" }
 # oxidems_lib = { git = "...", features = ["ml"] }    # Burn-based machine learning
 ```
 
+The default `sirius` feature builds the SIRIUS-style annotation stack
+(`oxidems_lib::sirius`), which pulls in candle, good_lp and the sibling
+`oxidane` crate (a path dependency). Clustering-only users
+should turn it off:
+
+```toml
+oxidems_lib = { git = "https://github.com/um-univie/OxideMS", branch = "main", default-features = false }
+```
+
 ---
 
 ## Parsing
@@ -176,7 +185,11 @@ println!(
 exp.write_results(&clusters, "results.csv");
 ```
 
-The output CSV contains one row per spectrum with columns: `identifier`, `precursor_charge`, `precursor_mz`, `retention_time`, `cluster`.
+The output CSV contains one row per clustered spectrum with columns: `identifier`, `index`, `title`, `precursor_charge`, `precursor_mz`, `retention_time`, `cluster`.
+
+- `identifier` is `mzspec:USI000000:<file>:scan:<SCANS>`, or `...:index:<index>` for a spectrum without a parseable scan number. Scan numbers can repeat within a file; `index` (the 0-based position of the spectrum in its file, counted before filtering) cannot.
+- `title` is the spectrum's `TITLE`, quoted if it contains a comma.
+- Set `exp.emit_unclustered = true` before ingesting to also write singletons and spectra removed by preprocessing, with `cluster` = -1, so every input spectrum gets a row.
 
 ### How clustering works
 
@@ -201,7 +214,13 @@ exp.engine.epsilon = 0.05;                                // cosine distance thr
 exp.engine.min_neighbors = 2;                             // DBSCAN minimum neighbours
 exp.engine.mz_tolerance = MassTolerance::Da(0.02);        // precursor m/z window for partitioning
 exp.engine.exact = false;                                 // use approximate (hashed) mode
+exp.engine.set_mz_range(40.0, 2000.0);                    // hashed fragment range; match the workflow's FilterMZ
+exp.engine.set_fragment_tolerance(MassTolerance::Da(0.05)); // hashed fragment bin width
 ```
+
+Change the hasher through `set_mz_range`, `set_fragment_tolerance` and
+`set_hash_size`: assigning `engine.hasher` fields directly leaves its bin
+lookup table stale. Fragments outside the hasher's m/z range are ignored.
 
 ### Quality metrics
 
