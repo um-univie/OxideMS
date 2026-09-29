@@ -321,28 +321,44 @@ fn prune_packed(similarity: &mut [f32], n: usize, min_similarity: f32, shared: &
 /// [`ClusterEngine::representative_floor`] is set.
 pub(crate) type Assignment = (usize, u64, f32);
 
-/// Settings for [`with_representatives`].
+/// What happens to a batch's clusters after DBSCAN and the mass split
+/// ([`finish_clusters`]).
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct RepresentativeFloor {
-    pub min_cosine: f32,
+pub(crate) struct ClusterPost {
+    /// Split clusters by complete linkage at this similarity, so every pair
+    /// within a cluster reaches it ([`ClusterEngine::complete_linkage`]).
+    pub complete_linkage: Option<f32>,
+    /// See [`ClusterEngine::representative_floor`].
+    pub representative_floor: Option<f32>,
+    /// Fragment tolerance for the exact cosine.
     pub tolerance: MassTolerance,
+    /// Pairs sharing fewer peaks count as unlinked; see [`SharedPeaks`].
+    pub min_shared_peaks: usize,
 }
 
-/// Picks a representative for every cluster of one batch and enforces a
-/// minimum cosine to it.
+/// Applies [`ClusterPost`] to one batch's clusters.
 ///
-/// The representative is the medoid, the member with the highest summed
-/// cosine to the others, computed exactly on the preprocessed peaks at the
-/// fragment tolerance. Members below `min_cosine` to it are split off and
-/// the split-off group is treated the same way; a spectrum left on its own
-/// is unclustered. Each emitted cluster lists its representative first.
-/// Without a floor, assignments pass through with a NaN cosine.
-fn with_representatives(
+/// Both steps work on the exact cosine between members, computed on the
+/// preprocessed peaks at the fragment tolerance (not the hashed vectors the
+/// clustering itself used), with pairs failing `min_shared_peaks` treated as
+/// unlinked:
+///
+/// 1. With `complete_linkage`, each cluster is split by complete-linkage
+///    agglomerative clustering cut at that similarity: every pair in a
+///    resulting cluster reaches it, and a spectrum that could join several
+///    such groups goes wherever the agglomeration puts it.
+/// 2. With `representative_floor`, each cluster gets its medoid as
+///    representative, listed first, and members below the floor to it are
+///    split off and treated the same way.
+///
+/// A spectrum left on its own is unclustered. Without either step,
+/// assignments pass through with a NaN representative cosine.
+fn finish_clusters(
     (assignments, n_clusters): (Vec<(usize, u64)>, usize),
     spectra: &[MSNSpectrum],
-    floor: Option<RepresentativeFloor>,
+    post: Option<ClusterPost>,
 ) -> (Vec<Assignment>, usize) {
-    let Some(floor) = floor else {
+    let Some(post) = post else {
         return (
             assignments.into_iter().map(|(c, id)| (c, id, f32::NAN)).collect(),
             n_clusters,
@@ -357,28 +373,39 @@ fn with_representatives(
     let mut out = Vec::new();
     let mut next_cluster = 0;
     for group in groups.iter().filter(|g| g.len() >= 2) {
-        for (members, cosines) in split_by_representative(group, spectra, floor) {
-            for (&member, cosine) in members.iter().zip(cosines) {
-                out.push((next_cluster, spectra[member].id, cosine));
+        let k = group.len();
+        let sim = exact_similarities(group, spectra, post);
+        let parts = match post.complete_linkage {
+            Some(threshold) => complete_linkage_clusters(&sim, k, threshold),
+            None => vec![(0..k).collect()],
+        };
+        for part in parts.into_iter().filter(|p| p.len() >= 2) {
+            let emitted: Vec<(Vec<usize>, Vec<f32>)> = match post.representative_floor {
+                Some(floor) => split_by_representative(&part, &sim, k, floor),
+                None => {
+                    let n = part.len();
+                    vec![(part, vec![f32::NAN; n])]
+                }
+            };
+            for (members, cosines) in emitted {
+                for (&local, cosine) in members.iter().zip(cosines) {
+                    out.push((next_cluster, spectra[group[local]].id, cosine));
+                }
+                next_cluster += 1;
             }
-            next_cluster += 1;
         }
     }
     (out, next_cluster)
 }
 
-/// See [`with_representatives`]. Returns `(members, cosine to the first)`
-/// per resulting cluster of two or more; `members` index into `spectra`.
-fn split_by_representative(
-    members: &[usize],
-    spectra: &[MSNSpectrum],
-    floor: RepresentativeFloor,
-) -> Vec<(Vec<usize>, Vec<f32>)> {
+/// Row-major `k * k` exact cosines between `members` (indices into
+/// `spectra`); pairs failing `post.min_shared_peaks` are set to 0.
+fn exact_similarities(members: &[usize], spectra: &[MSNSpectrum], post: ClusterPost) -> Vec<f32> {
     let k = members.len();
     let soas: Vec<_> = members
         .iter()
         .map(|&m| {
-            let mut soa = spectra[m].spectrum.to_soa(floor.tolerance);
+            let mut soa = spectra[m].spectrum.to_soa(post.tolerance);
             soa.l2_normalize();
             soa
         })
@@ -387,19 +414,103 @@ fn split_by_representative(
     for a in 0..k {
         sim[a * k + a] = 1.0;
         for b in (a + 1)..k {
-            let cosine = crate::clustering::similarities::branching_cosine_sim(
-                &soas[a].mz_bins,
-                &soas[a].intensities,
-                &soas[b].mz_bins,
-                &soas[b].intensities,
-            );
+            let shared_ok = post.min_shared_peaks == 0
+                || matched_peaks(
+                    &spectra[members[a]].spectrum.peaks,
+                    &spectra[members[b]].spectrum.peaks,
+                    post.tolerance,
+                ) >= post.min_shared_peaks;
+            let cosine = if shared_ok {
+                crate::clustering::similarities::branching_cosine_sim(
+                    &soas[a].mz_bins,
+                    &soas[a].intensities,
+                    &soas[b].mz_bins,
+                    &soas[b].intensities,
+                )
+            } else {
+                0.0
+            };
             sim[a * k + b] = cosine;
             sim[b * k + a] = cosine;
         }
     }
+    sim
+}
 
+/// Complete-linkage agglomerative clustering of `k` items with row-major
+/// similarities `sim`, cut at `threshold`: returns groups in which every
+/// pair has similarity >= `threshold`.
+///
+/// Uses the nearest-neighbour chain algorithm, which gives the same
+/// hierarchy as naive agglomeration for complete linkage (it is reducible)
+/// in O(k^2) time instead of O(k^3). It finds merges in no global order, so
+/// the full hierarchy is built and then cut: complete linkage is monotone
+/// (a merge is never more similar than the merges below it), so the groups
+/// at `threshold` are exactly those joined by merges reaching it.
+fn complete_linkage_clusters(sim: &[f32], k: usize, threshold: f32) -> Vec<Vec<usize>> {
+    // Cluster-to-cluster similarity: the minimum over member pairs. Row `i`
+    // stands for the cluster that item `i` was the surviving index of.
+    let mut s = sim.to_vec();
+    let mut active = vec![true; k];
+    let mut remaining = k;
+    let mut chain: Vec<usize> = Vec::new();
+    let mut groups = UnionFind::new(k);
+
+    while remaining > 1 {
+        if chain.is_empty() {
+            chain.push(active.iter().position(|&a| a).expect("remaining > 1"));
+        }
+        let a = *chain.last().expect("chain is non-empty");
+        let previous = chain.len().checked_sub(2).map(|i| chain[i]);
+        // Nearest (most similar) active neighbour of `a`; ties go to the
+        // previous chain element so the chain cannot cycle.
+        let mut best = previous;
+        let mut best_sim = previous.map_or(f32::NEG_INFINITY, |p| s[a * k + p]);
+        for c in (0..k).filter(|&c| active[c] && c != a) {
+            if s[a * k + c] > best_sim {
+                best = Some(c);
+                best_sim = s[a * k + c];
+            }
+        }
+        let b = best.expect("another active cluster exists");
+        if Some(b) != previous {
+            chain.push(b);
+            continue;
+        }
+        // `a` and `b` are reciprocal nearest neighbours: merge them.
+        chain.pop();
+        chain.pop();
+        if best_sim >= threshold {
+            groups.union(a, b);
+        }
+        let (keep, gone) = if a < b { (a, b) } else { (b, a) };
+        for c in (0..k).filter(|&c| active[c] && c != keep && c != gone) {
+            let merged = s[keep * k + c].min(s[gone * k + c]);
+            s[keep * k + c] = merged;
+            s[c * k + keep] = merged;
+        }
+        active[gone] = false;
+        remaining -= 1;
+    }
+
+    let mut by_root: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
+    for i in 0..k {
+        by_root.entry(groups.find(i)).or_default().push(i);
+    }
+    by_root.into_values().collect()
+}
+
+/// See [`finish_clusters`]. `part` holds local indices into the `k * k`
+/// matrix `sim`; returns `(members, cosine to the first)` per resulting
+/// cluster of two or more.
+fn split_by_representative(
+    part: &[usize],
+    sim: &[f32],
+    k: usize,
+    floor: f32,
+) -> Vec<(Vec<usize>, Vec<f32>)> {
     let mut out = Vec::new();
-    let mut todo = vec![(0..k).collect::<Vec<usize>>()];
+    let mut todo = vec![part.to_vec()];
     while let Some(group) = todo.pop() {
         if group.len() < 2 {
             continue;
@@ -413,13 +524,13 @@ fn split_by_representative(
         }
         let (keep, rest): (Vec<usize>, Vec<usize>) = group
             .iter()
-            .partition(|&&x| x == medoid || sim[medoid * k + x] >= floor.min_cosine);
+            .partition(|&&x| x == medoid || sim[medoid * k + x] >= floor);
         if keep.len() >= 2 {
             let ordered: Vec<usize> = std::iter::once(medoid)
                 .chain(keep.into_iter().filter(|&x| x != medoid))
                 .collect();
             let cosines = ordered.iter().map(|&x| sim[medoid * k + x]).collect();
-            out.push((ordered.into_iter().map(|x| members[x]).collect(), cosines));
+            out.push((ordered, cosines));
         }
         if !rest.is_empty() {
             todo.push(rest);
@@ -1023,6 +1134,10 @@ pub struct ClusterEngine {
     /// members whose exact cosine to it is below this value are split off.
     /// `Some(0.0)` picks representatives without splitting.
     pub representative_floor: Option<f32>,
+    /// Split every cluster by complete linkage at the similarity threshold,
+    /// so all pairs within a cluster reach it (not just a chain of pairs, as
+    /// with DBSCAN alone). See [`finish_clusters`].
+    pub complete_linkage: bool,
     /// Enable/disable GPU offloading.
     pub use_gpu: bool,
     /// Print timing and progress information to stdout.
@@ -1053,6 +1168,7 @@ impl Default for ClusterEngine {
             min_neighbors: MIN_NEIGHBORS,
             min_shared_peaks: 0,
             representative_floor: None,
+            complete_linkage: false,
             use_gpu: false,
             verbose: false,
             fast_batches: Vec::new(),
@@ -1121,6 +1237,7 @@ impl ClusterEngine {
             min_neighbors: self.min_neighbors,
             min_shared_peaks: self.min_shared_peaks,
             representative_floor: self.representative_floor,
+            complete_linkage: self.complete_linkage,
             use_gpu: false,
             verbose: false,
             fast_batches: Vec::new(),
@@ -1130,10 +1247,15 @@ impl ClusterEngine {
         }
     }
 
-    fn representative_floor(&self) -> Option<RepresentativeFloor> {
-        self.representative_floor.map(|min_cosine| RepresentativeFloor {
-            min_cosine,
+    /// Post-processing settings for one batch, `None` if there is nothing
+    /// to do. Complete linkage cuts at the batch's own threshold, which
+    /// differs from `1 - epsilon` under `adaptive_alpha`.
+    fn cluster_post(&self, spectra: &[MSNSpectrum]) -> Option<ClusterPost> {
+        (self.complete_linkage || self.representative_floor.is_some()).then(|| ClusterPost {
+            complete_linkage: self.complete_linkage.then(|| self.batch_threshold(spectra)),
+            representative_floor: self.representative_floor,
             tolerance: self.hasher.tolerance,
+            min_shared_peaks: self.min_shared_peaks,
         })
     }
 
@@ -1439,7 +1561,6 @@ impl ClusterEngine {
         let precursor_mz_tolerance = self.mz_tolerance;
         let min_neighbors = self.min_neighbors;
         let hasher = &self.hasher;
-        let representative_floor = self.representative_floor();
 
         let batch_results: Vec<_> = if self.exact {
             batches
@@ -1458,7 +1579,7 @@ impl ClusterEngine {
                         let shared =
                             SharedPeaks::new(spectra, hasher.tolerance, self.min_shared_peaks);
 
-                        if n_spectra == 2 && min_neighbors == 2 && representative_floor.is_none() {
+                        if n_spectra == 2 && min_neighbors == 2 && self.cluster_post(spectra).is_none() {
                             let mut s0 = spectra[0].spectrum.to_soa(hasher.tolerance);
                             s0.l2_normalize();
                             let mut s1 = spectra[1].spectrum.to_soa(hasher.tolerance);
@@ -1559,10 +1680,10 @@ impl ClusterEngine {
                             bits: bit_matrix_buffer,
                             words_per_vertex,
                         };
-                        with_representatives(
+                        finish_clusters(
                             collect_and_refine(labels, spectra, precursor_mz_tolerance, &links),
                             spectra,
-                            representative_floor,
+                            self.cluster_post(spectra),
                         )
                     },
                 )
@@ -1631,7 +1752,7 @@ impl ClusterEngine {
                                 bits: bit_matrix_buffer,
                                 words_per_vertex,
                             };
-                            return with_representatives(
+                            return finish_clusters(
                                 collect_and_refine(
                                     labels,
                                     spectra,
@@ -1639,7 +1760,7 @@ impl ClusterEngine {
                                     &links,
                                 ),
                                 spectra,
-                                representative_floor,
+                                self.cluster_post(spectra),
                             );
                         }
 
@@ -1695,10 +1816,10 @@ impl ClusterEngine {
                             n: n_spectra,
                             min_similarity: threshold,
                         };
-                        with_representatives(
+                        finish_clusters(
                             collect_and_refine(labels, spectra, precursor_mz_tolerance, &links),
                             spectra,
-                            representative_floor,
+                            self.cluster_post(spectra),
                         )
                     },
                 )
@@ -1787,10 +1908,10 @@ impl ClusterEngine {
                     bits: &bit_matrix,
                     words_per_vertex,
                 };
-                let result = with_representatives(
+                let result = finish_clusters(
                     collect_and_refine(labels, spectra, precursor_mz_tolerance, &links),
                     spectra,
-                    self.representative_floor(),
+                    self.cluster_post(spectra),
                 );
                 self.dense_bit_matrix = bit_matrix;
                 return result;
@@ -1810,10 +1931,10 @@ impl ClusterEngine {
             },
             None => BatchLinks::Unavailable,
         };
-        with_representatives(
+        finish_clusters(
             collect_and_refine(dbscan_labels, spectra, precursor_mz_tolerance, &links),
             spectra,
-            self.representative_floor(),
+            self.cluster_post(spectra),
         )
     }
 
@@ -2512,7 +2633,7 @@ mod representative_tests {
     }
 
     /// cos(A, B) = 0.75, cos(A, C) = cos(B, C) = 4 / sqrt(20) ~ 0.894, so C
-    /// is the medoid.
+    /// is the medoid, and A - C - B is a chain rather than a clique at 0.8.
     fn spectra() -> Vec<MSNSpectrum> {
         vec![
             spectrum(10, &[200.0, 300.0, 400.0, 500.0]),
@@ -2521,16 +2642,28 @@ mod representative_tests {
         ]
     }
 
-    fn floor(min_cosine: f32) -> RepresentativeFloor {
-        RepresentativeFloor {
-            min_cosine,
+    fn post(complete_linkage: Option<f32>, representative_floor: Option<f32>) -> ClusterPost {
+        ClusterPost {
+            complete_linkage,
+            representative_floor,
             tolerance: MassTolerance::Da(0.05),
+            min_shared_peaks: 0,
         }
+    }
+
+    fn clusters_of(post: ClusterPost) -> Vec<Vec<u64>> {
+        let (assignments, n) = finish_clusters((vec![(0, 10), (0, 11), (0, 12)], 1), &spectra(), Some(post));
+        let mut groups = vec![Vec::new(); n];
+        for (cluster, id, _) in assignments {
+            groups[cluster].push(id);
+        }
+        groups
     }
 
     #[test]
     fn medoid_comes_first_and_members_above_the_floor_stay() {
-        let parts = split_by_representative(&[0, 1, 2], &spectra(), floor(0.85));
+        let sim = exact_similarities(&[0, 1, 2], &spectra(), post(None, Some(0.85)));
+        let parts = split_by_representative(&[0, 1, 2], &sim, 3, 0.85);
         assert_eq!(parts.len(), 1);
         let (members, cosines) = &parts[0];
         assert_eq!(members, &vec![2, 0, 1]);
@@ -2544,17 +2677,99 @@ mod representative_tests {
     fn members_below_the_floor_are_split_off_and_lone_spectra_unclustered() {
         // A and B fall below 0.9 to C and, at 0.75, below it to each other,
         // so nothing stays clustered.
-        assert!(split_by_representative(&[0, 1, 2], &spectra(), floor(0.9)).is_empty());
-        let (assignments, n) = with_representatives((vec![(0, 10), (0, 11), (0, 12)], 1), &spectra(), Some(floor(0.9)));
-        assert_eq!((assignments.len(), n), (0, 0));
+        assert!(clusters_of(post(None, Some(0.9))).is_empty());
     }
 
     #[test]
-    fn without_a_floor_assignments_pass_through() {
-        let (assignments, n) = with_representatives((vec![(0, 10), (0, 11)], 1), &spectra(), None);
+    fn without_post_processing_assignments_pass_through() {
+        let (assignments, n) = finish_clusters((vec![(0, 10), (0, 11)], 1), &spectra(), None);
         assert_eq!(n, 1);
         assert_eq!(assignments.iter().map(|a| (a.0, a.1)).collect::<Vec<_>>(), vec![(0, 10), (0, 11)]);
         assert!(assignments.iter().all(|a| a.2.is_nan()));
+    }
+
+    #[test]
+    fn complete_linkage_splits_a_chain_into_a_clique() {
+        // Single linkage at 0.8 keeps A - C - B together; complete linkage
+        // cannot, since cos(A, B) = 0.75. C joins one of them.
+        let groups = clusters_of(post(Some(0.8), None));
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+        assert!(groups[0].contains(&12));
+        // At 0.7 all three pairs qualify.
+        assert_eq!(clusters_of(post(Some(0.7), None)).iter().map(Vec::len).collect::<Vec<_>>(), vec![3]);
+    }
+
+    /// Naive complete-linkage agglomeration: repeatedly merge the two
+    /// clusters whose least similar pair is most similar, while that reaches
+    /// the threshold.
+    fn naive_complete_linkage(sim: &[f32], k: usize, threshold: f32) -> Vec<Vec<usize>> {
+        let mut clusters: Vec<Vec<usize>> = (0..k).map(|i| vec![i]).collect();
+        loop {
+            let mut best: Option<(usize, usize, f32)> = None;
+            for x in 0..clusters.len() {
+                for y in (x + 1)..clusters.len() {
+                    let link = clusters[x]
+                        .iter()
+                        .flat_map(|&a| clusters[y].iter().map(move |&b| sim[a * k + b]))
+                        .fold(f32::INFINITY, f32::min);
+                    if best.is_none_or(|(_, _, s)| link > s) {
+                        best = Some((x, y, link));
+                    }
+                }
+            }
+            match best {
+                Some((x, y, link)) if link >= threshold => {
+                    let moved = clusters.remove(y);
+                    clusters[x].extend(moved);
+                }
+                _ => return clusters,
+            }
+        }
+    }
+
+    fn normalized(mut groups: Vec<Vec<usize>>) -> Vec<Vec<usize>> {
+        for g in groups.iter_mut() {
+            g.sort();
+        }
+        groups.sort();
+        groups
+    }
+
+    #[test]
+    fn nn_chain_matches_naive_complete_linkage() {
+        // Deterministic pseudo-random symmetric similarity matrices without ties.
+        let mut state: u64 = 0x5eed;
+        let mut next = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 33) as f32) / ((1u64 << 31) as f32)
+        };
+        for trial in 0..200 {
+            let k = 2 + trial % 12;
+            let mut sim = vec![1.0f32; k * k];
+            for a in 0..k {
+                for b in (a + 1)..k {
+                    let v = next();
+                    sim[a * k + b] = v;
+                    sim[b * k + a] = v;
+                }
+            }
+            for threshold in [0.2f32, 0.5, 0.7, 0.9] {
+                let fast = complete_linkage_clusters(&sim, k, threshold);
+                for group in &fast {
+                    for &a in group {
+                        for &b in group {
+                            assert!(sim[a * k + b] >= threshold, "trial {trial}: not a clique");
+                        }
+                    }
+                }
+                assert_eq!(
+                    normalized(fast),
+                    normalized(naive_complete_linkage(&sim, k, threshold)),
+                    "trial {trial}, threshold {threshold}"
+                );
+            }
+        }
     }
 }
 
@@ -2579,6 +2794,7 @@ mod settings_copy_tests {
         engine.min_neighbors = 3;
         engine.min_shared_peaks = 4;
         engine.representative_floor = Some(0.85);
+        engine.complete_linkage = true;
 
         let copy = engine.settings_copy();
         assert!(matches!(copy.mz_tolerance, MassTolerance::Da(t) if t == 0.02));
@@ -2593,5 +2809,6 @@ mod settings_copy_tests {
         assert!(copy.exact);
         assert_eq!((copy.min_neighbors, copy.min_shared_peaks), (3, 4));
         assert_eq!(copy.representative_floor, Some(0.85));
+        assert!(copy.complete_linkage);
     }
 }

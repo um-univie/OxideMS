@@ -202,6 +202,7 @@ The output CSV contains one row per clustered spectrum with columns: `identifier
    - *Exact mode* (`engine.exact = true`): sparse matrix multiplication over m/z-binned spectra via `faer`. More accurate, higher memory use.
 
 3. **DBSCAN** — standard density-based clustering with configurable `epsilon` (cosine distance threshold) and `min_neighbors`.
+   With `min_neighbors = 2` this links a whole chain of spectra through pairs above the threshold (single linkage). Set `engine.complete_linkage` to split each cluster by complete-linkage agglomerative clustering on the exact cosine, so every pair in a cluster reaches the threshold.
 
 4. **Post-hoc refinement** — after DBSCAN, clusters whose precursor m/z span exceeds the engine tolerance are split using agglomerative hierarchical clustering, reducing false positives.
 
@@ -216,6 +217,7 @@ exp.engine.epsilon = 0.05;                                // cosine distance thr
 exp.engine.min_neighbors = 2;                             // DBSCAN minimum neighbours
 exp.engine.min_shared_peaks = 4;                          // pairs must also share >= 4 fragment peaks (0 = off)
 exp.engine.representative_floor = Some(0.9);              // medoid per cluster; split off members below cosine 0.9
+exp.engine.complete_linkage = true;                       // every pair in a cluster must reach 1 - epsilon
 exp.engine.mz_tolerance = MassTolerance::Da(0.02);        // precursor m/z window for partitioning
 exp.engine.exact = false;                                 // use approximate (hashed) mode
 exp.engine.set_mz_range(40.0, 2000.0);                    // hashed fragment range; match the workflow's FilterMZ
