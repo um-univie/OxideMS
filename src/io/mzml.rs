@@ -291,6 +291,7 @@ fn parse_spectrum_slice_quickxml(
     let mut buf = Vec::new();
 
     let mut scan_number: Option<usize> = None;
+    let mut native_id: Option<String> = None;
     let mut precursor_mz: Option<f64> = None;
     let mut charge: i8 = 0;
     let mut polarity: i8 = 0;
@@ -325,6 +326,7 @@ fn parse_spectrum_slice_quickxml(
                                 b"id" => {
                                     if let Ok(id_str) = std::str::from_utf8(&attr.value) {
                                         scan_number = extract_scan_number(id_str);
+                                        native_id = Some(id_str.to_string());
                                     }
                                 }
                                 b"defaultArrayLength" => {
@@ -513,6 +515,7 @@ fn parse_spectrum_slice_quickxml(
         precursor_mz,
         retention_time_seconds,
         scan_number,
+        native_id.as_deref(),
         if ms_level == 0 { 2 } else { ms_level },
     )?;
     if parse_metadata {
@@ -560,6 +563,7 @@ fn build_record(
     precursor_mz: Option<f64>,
     retention_time_seconds: Option<f64>,
     scan_number: Option<usize>,
+    native_id: Option<&str>,
     ms_level: u8,
 ) -> Option<MassSpectralRecord> {
     if mz_array.is_empty() || mz_array.len() != intensity_array.len() {
@@ -590,6 +594,11 @@ fn build_record(
         }
         if let Some(scan) = scan_number {
             record.insert_metadata("SCANS", &scan.to_string());
+        }
+        // mzML has no title; the nativeID (e.g. "controllerType=0
+        // controllerNumber=1 scan=1234") identifies the spectrum uniquely.
+        if let Some(id) = native_id {
+            record.insert_metadata("TITLE", id);
         }
     } else {
         // PEPMASS/RTINSECONDS/charge are load-bearing for downstream code
@@ -637,6 +646,7 @@ pub fn parse_spectrum_slice_fast(
     let mut pos = 0usize;
 
     let mut scan_number: Option<usize> = None;
+    let mut native_id: Option<String> = None;
     let mut precursor_mz: Option<f64> = None;
     let mut charge: i8 = 0;
     let mut polarity: i8 = 0;
@@ -715,6 +725,7 @@ pub fn parse_spectrum_slice_fast(
                         if let Some(v) = find_attr(attrs, b"id") {
                             if let Ok(s) = std::str::from_utf8(v) {
                                 scan_number = extract_scan_number(s);
+                                native_id = Some(s.to_string());
                             }
                         }
                         if let Some(v) = find_attr(attrs, b"defaultArrayLength") {
@@ -885,6 +896,7 @@ pub fn parse_spectrum_slice_fast(
         precursor_mz,
         retention_time_seconds,
         scan_number,
+        native_id.as_deref(),
         if ms_level == 0 { 2 } else { ms_level },
     )?;
     if parse_metadata {
@@ -1297,6 +1309,19 @@ mod tests {
                 assert_eq!(charge(&z2), 2);
                 assert_eq!(charge(&negative(z2.clone())), -2);
             }
+        }
+    }
+
+    #[test]
+    fn both_parsers_keep_the_native_id_as_title() {
+        let xml = synthetic_spectrum_xml(7, 500.0, 1, 0.2, &[120.0, 250.0], &[10.0, 20.0]);
+        let id_start = xml.find("id=\"").unwrap() + 4;
+        let native_id = &xml[id_start..id_start + xml[id_start..].find('"').unwrap()];
+        assert!(native_id.contains("scan=7"), "{native_id}");
+        for parser in [parse_spectrum_slice_fast, parse_spectrum_slice_quickxml] {
+            let record = parser(xml.as_bytes(), 7, true).unwrap();
+            assert_eq!(record.get_metadata("TITLE"), Some(native_id));
+            assert_eq!(record.get_metadata("SCANS"), Some("7"));
         }
     }
 
