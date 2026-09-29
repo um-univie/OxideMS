@@ -316,6 +316,118 @@ fn prune_packed(similarity: &mut [f32], n: usize, min_similarity: f32, shared: &
     }
 }
 
+/// A clustered spectrum: `(cluster, spectrum id, cosine to its cluster's
+/// representative)`. The cosine is NaN unless
+/// [`ClusterEngine::representative_floor`] is set.
+pub(crate) type Assignment = (usize, u64, f32);
+
+/// Settings for [`with_representatives`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RepresentativeFloor {
+    pub min_cosine: f32,
+    pub tolerance: MassTolerance,
+}
+
+/// Picks a representative for every cluster of one batch and enforces a
+/// minimum cosine to it.
+///
+/// The representative is the medoid, the member with the highest summed
+/// cosine to the others, computed exactly on the preprocessed peaks at the
+/// fragment tolerance. Members below `min_cosine` to it are split off and
+/// the split-off group is treated the same way; a spectrum left on its own
+/// is unclustered. Each emitted cluster lists its representative first.
+/// Without a floor, assignments pass through with a NaN cosine.
+fn with_representatives(
+    (assignments, n_clusters): (Vec<(usize, u64)>, usize),
+    spectra: &[MSNSpectrum],
+    floor: Option<RepresentativeFloor>,
+) -> (Vec<Assignment>, usize) {
+    let Some(floor) = floor else {
+        return (
+            assignments.into_iter().map(|(c, id)| (c, id, f32::NAN)).collect(),
+            n_clusters,
+        );
+    };
+    let position: std::collections::HashMap<u64, usize> =
+        spectra.iter().enumerate().map(|(i, s)| (s.id, i)).collect();
+    let mut groups: Vec<Vec<usize>> = vec![Vec::new(); n_clusters];
+    for (cluster, id) in assignments {
+        groups[cluster].push(position[&id]);
+    }
+    let mut out = Vec::new();
+    let mut next_cluster = 0;
+    for group in groups.iter().filter(|g| g.len() >= 2) {
+        for (members, cosines) in split_by_representative(group, spectra, floor) {
+            for (&member, cosine) in members.iter().zip(cosines) {
+                out.push((next_cluster, spectra[member].id, cosine));
+            }
+            next_cluster += 1;
+        }
+    }
+    (out, next_cluster)
+}
+
+/// See [`with_representatives`]. Returns `(members, cosine to the first)`
+/// per resulting cluster of two or more; `members` index into `spectra`.
+fn split_by_representative(
+    members: &[usize],
+    spectra: &[MSNSpectrum],
+    floor: RepresentativeFloor,
+) -> Vec<(Vec<usize>, Vec<f32>)> {
+    let k = members.len();
+    let soas: Vec<_> = members
+        .iter()
+        .map(|&m| {
+            let mut soa = spectra[m].spectrum.to_soa(floor.tolerance);
+            soa.l2_normalize();
+            soa
+        })
+        .collect();
+    let mut sim = vec![0.0f32; k * k];
+    for a in 0..k {
+        sim[a * k + a] = 1.0;
+        for b in (a + 1)..k {
+            let cosine = crate::clustering::similarities::branching_cosine_sim(
+                &soas[a].mz_bins,
+                &soas[a].intensities,
+                &soas[b].mz_bins,
+                &soas[b].intensities,
+            );
+            sim[a * k + b] = cosine;
+            sim[b * k + a] = cosine;
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut todo = vec![(0..k).collect::<Vec<usize>>()];
+    while let Some(group) = todo.pop() {
+        if group.len() < 2 {
+            continue;
+        }
+        let summed = |a: usize| group.iter().map(|&x| sim[a * k + x]).sum::<f32>();
+        let mut medoid = group[0];
+        for &candidate in &group[1..] {
+            if summed(candidate) > summed(medoid) {
+                medoid = candidate;
+            }
+        }
+        let (keep, rest): (Vec<usize>, Vec<usize>) = group
+            .iter()
+            .partition(|&&x| x == medoid || sim[medoid * k + x] >= floor.min_cosine);
+        if keep.len() >= 2 {
+            let ordered: Vec<usize> = std::iter::once(medoid)
+                .chain(keep.into_iter().filter(|&x| x != medoid))
+                .collect();
+            let cosines = ordered.iter().map(|&x| sim[medoid * k + x]).collect();
+            out.push((ordered.into_iter().map(|x| members[x]).collect(), cosines));
+        }
+        if !rest.is_empty() {
+            todo.push(rest);
+        }
+    }
+    out
+}
+
 /// Disjoint-set over `0..n`, used to find the connected components of one
 /// mass interval.
 struct UnionFind {
@@ -907,6 +1019,10 @@ pub struct ClusterEngine {
     /// Minimum fragment peaks a pair must share to become an edge, on top of
     /// the cosine threshold; 0 turns the check off. See [`SharedPeaks`].
     pub min_shared_peaks: usize,
+    /// When set, every cluster gets a representative (its medoid) and
+    /// members whose exact cosine to it is below this value are split off.
+    /// `Some(0.0)` picks representatives without splitting.
+    pub representative_floor: Option<f32>,
     /// Enable/disable GPU offloading.
     pub use_gpu: bool,
     /// Print timing and progress information to stdout.
@@ -936,6 +1052,7 @@ impl Default for ClusterEngine {
             exact: false,
             min_neighbors: MIN_NEIGHBORS,
             min_shared_peaks: 0,
+            representative_floor: None,
             use_gpu: false,
             verbose: false,
             fast_batches: Vec::new(),
@@ -975,6 +1092,13 @@ impl ClusterEngine {
     pub fn set_hash_size(&mut self, hash_len: usize) {
         self.hasher.hash_len = hash_len;
         self.hasher.recalculate_lookup_table();
+    }
+
+    fn representative_floor(&self) -> Option<RepresentativeFloor> {
+        self.representative_floor.map(|min_cosine| RepresentativeFloor {
+            min_cosine,
+            tolerance: self.hasher.tolerance,
+        })
     }
 
     /// Updates the hasher m/z range and re-initializes the internal lookup tables.
@@ -1191,7 +1315,7 @@ impl ClusterEngine {
     ///
     /// Returns an [`std::io::Error`] if any internal processing fails.
     pub fn cluster(&mut self) -> Result<FlatClusters, std::io::Error> {
-        let mut cluster_assignments: Vec<(usize, u64)> = Vec::new();
+        let mut cluster_assignments: Vec<Assignment> = Vec::new();
         let mut cluster_offset = 0usize;
 
         let start = std::time::Instant::now();
@@ -1270,7 +1394,7 @@ impl ClusterEngine {
     }
 
     /// Processes all fast batches in parallel, returning aggregated assignments and cluster count.
-    fn process_fast_batches(&self, batches: Vec<MassSpectrumBatch>) -> (Vec<(usize, u64)>, usize) {
+    fn process_fast_batches(&self, batches: Vec<MassSpectrumBatch>) -> (Vec<Assignment>, usize) {
         if batches.is_empty() {
             return (Vec::new(), 0);
         }
@@ -1279,6 +1403,7 @@ impl ClusterEngine {
         let precursor_mz_tolerance = self.mz_tolerance;
         let min_neighbors = self.min_neighbors;
         let hasher = &self.hasher;
+        let representative_floor = self.representative_floor();
 
         let batch_results: Vec<_> = if self.exact {
             batches
@@ -1297,7 +1422,7 @@ impl ClusterEngine {
                         let shared =
                             SharedPeaks::new(spectra, hasher.tolerance, self.min_shared_peaks);
 
-                        if n_spectra == 2 && min_neighbors == 2 {
+                        if n_spectra == 2 && min_neighbors == 2 && representative_floor.is_none() {
                             let mut s0 = spectra[0].spectrum.to_soa(hasher.tolerance);
                             s0.l2_normalize();
                             let mut s1 = spectra[1].spectrum.to_soa(hasher.tolerance);
@@ -1309,7 +1434,13 @@ impl ClusterEngine {
                                 &s1.intensities,
                             );
                             return if sim >= threshold && shared.as_ref().is_none_or(|s| s.ok(0, 1)) {
-                                (vec![(0_usize, spectra[0].id), (0_usize, spectra[1].id)], 1)
+                                (
+                                    vec![
+                                        (0_usize, spectra[0].id, f32::NAN),
+                                        (0_usize, spectra[1].id, f32::NAN),
+                                    ],
+                                    1,
+                                )
                             } else {
                                 (vec![], 0)
                             };
@@ -1392,7 +1523,11 @@ impl ClusterEngine {
                             bits: bit_matrix_buffer,
                             words_per_vertex,
                         };
-                        collect_and_refine(labels, spectra, precursor_mz_tolerance, &links)
+                        with_representatives(
+                            collect_and_refine(labels, spectra, precursor_mz_tolerance, &links),
+                            spectra,
+                            representative_floor,
+                        )
                     },
                 )
                 .collect()
@@ -1460,11 +1595,15 @@ impl ClusterEngine {
                                 bits: bit_matrix_buffer,
                                 words_per_vertex,
                             };
-                            return collect_and_refine(
-                                labels,
+                            return with_representatives(
+                                collect_and_refine(
+                                    labels,
+                                    spectra,
+                                    precursor_mz_tolerance,
+                                    &links,
+                                ),
                                 spectra,
-                                precursor_mz_tolerance,
-                                &links,
+                                representative_floor,
                             );
                         }
 
@@ -1520,7 +1659,11 @@ impl ClusterEngine {
                             n: n_spectra,
                             min_similarity: threshold,
                         };
-                        collect_and_refine(labels, spectra, precursor_mz_tolerance, &links)
+                        with_representatives(
+                            collect_and_refine(labels, spectra, precursor_mz_tolerance, &links),
+                            spectra,
+                            representative_floor,
+                        )
                     },
                 )
                 .collect()
@@ -1540,7 +1683,7 @@ impl ClusterEngine {
 
     /// Dispatches a single slow batch to the appropriate algorithm and returns
     /// cluster assignments with the number of clusters produced.
-    fn cluster_slow_batch(&mut self, spectra: &[MSNSpectrum]) -> (Vec<(usize, u64)>, usize) {
+    fn cluster_slow_batch(&mut self, spectra: &[MSNSpectrum]) -> (Vec<Assignment>, usize) {
         let n_spectra = spectra.len();
         let hash_size = self.hash_size();
         let epsilon = 1.0 - self.batch_threshold(spectra);
@@ -1608,8 +1751,11 @@ impl ClusterEngine {
                     bits: &bit_matrix,
                     words_per_vertex,
                 };
-                let result =
-                    collect_and_refine(labels, spectra, precursor_mz_tolerance, &links);
+                let result = with_representatives(
+                    collect_and_refine(labels, spectra, precursor_mz_tolerance, &links),
+                    spectra,
+                    self.representative_floor(),
+                );
                 self.dense_bit_matrix = bit_matrix;
                 return result;
             }
@@ -1628,7 +1774,11 @@ impl ClusterEngine {
             },
             None => BatchLinks::Unavailable,
         };
-        collect_and_refine(dbscan_labels, spectra, precursor_mz_tolerance, &links)
+        with_representatives(
+            collect_and_refine(dbscan_labels, spectra, precursor_mz_tolerance, &links),
+            spectra,
+            self.representative_floor(),
+        )
     }
 
     /// Clusters a large batch using windowed mass-bounded graph DBSCAN.
@@ -1795,25 +1945,31 @@ impl ClusterEngine {
     }
 
     /// Sorts cluster assignments and packs them into a [`FlatClusters`].
-    fn build_flat_clusters(mut cluster_assignments: Vec<(usize, u64)>) -> FlatClusters {
-        cluster_assignments.par_sort_unstable_by_key(|p| p.0);
+    fn build_flat_clusters(mut cluster_assignments: Vec<Assignment>) -> FlatClusters {
+        // Stable, so a representative stays first within its cluster.
+        cluster_assignments.par_sort_by_key(|p| p.0);
         let mut data = Vec::with_capacity(cluster_assignments.len());
         let mut offsets = Vec::with_capacity(cluster_assignments.len() / 5);
+        let has_representatives = cluster_assignments.iter().any(|a| !a.2.is_nan());
+        let mut rep_cosine = Vec::new();
 
         if !cluster_assignments.is_empty() {
             let mut current_cluster = cluster_assignments[0].0;
             offsets.push(0);
-            for (cluster_id, spectrum_id) in cluster_assignments {
+            for (cluster_id, spectrum_id, cosine) in cluster_assignments {
                 if cluster_id != current_cluster {
                     offsets.push(data.len());
                     current_cluster = cluster_id;
                 }
                 data.push(spectrum_id as usize);
+                if has_representatives {
+                    rep_cosine.push(cosine);
+                }
             }
             offsets.push(data.len());
         }
 
-        FlatClusters { data, offsets }
+        FlatClusters { data, offsets, rep_cosine }
     }
 
     /// Internal method to compute DBSCAN labels using a dense similarity matrix.
@@ -2298,5 +2454,70 @@ mod shared_peak_tests {
                 assert_eq!(clustered_ids(engine), expected, "{name}, min_shared_peaks = {min_shared}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod representative_tests {
+    use super::*;
+    use crate::spectrum::MassSpectrum;
+    use crate::Peak;
+
+    fn spectrum(id: u64, mzs: &[f64]) -> MSNSpectrum {
+        MSNSpectrum {
+            precursor_mz: 800.0,
+            retention_time_in_seconds: 0.0,
+            id,
+            spectrum: MassSpectrum {
+                peaks: mzs.iter().map(|&mz| Peak::new(mz, 1.0)).collect(),
+                charge: 1,
+            },
+        }
+    }
+
+    /// cos(A, B) = 0.75, cos(A, C) = cos(B, C) = 4 / sqrt(20) ~ 0.894, so C
+    /// is the medoid.
+    fn spectra() -> Vec<MSNSpectrum> {
+        vec![
+            spectrum(10, &[200.0, 300.0, 400.0, 500.0]),
+            spectrum(11, &[200.0, 300.0, 400.0, 600.0]),
+            spectrum(12, &[200.0, 300.0, 400.0, 500.0, 600.0]),
+        ]
+    }
+
+    fn floor(min_cosine: f32) -> RepresentativeFloor {
+        RepresentativeFloor {
+            min_cosine,
+            tolerance: MassTolerance::Da(0.05),
+        }
+    }
+
+    #[test]
+    fn medoid_comes_first_and_members_above_the_floor_stay() {
+        let parts = split_by_representative(&[0, 1, 2], &spectra(), floor(0.85));
+        assert_eq!(parts.len(), 1);
+        let (members, cosines) = &parts[0];
+        assert_eq!(members, &vec![2, 0, 1]);
+        assert!((cosines[0] - 1.0).abs() < 1e-6);
+        for c in &cosines[1..] {
+            assert!((c - 0.894).abs() < 1e-3, "{c}");
+        }
+    }
+
+    #[test]
+    fn members_below_the_floor_are_split_off_and_lone_spectra_unclustered() {
+        // A and B fall below 0.9 to C and, at 0.75, below it to each other,
+        // so nothing stays clustered.
+        assert!(split_by_representative(&[0, 1, 2], &spectra(), floor(0.9)).is_empty());
+        let (assignments, n) = with_representatives((vec![(0, 10), (0, 11), (0, 12)], 1), &spectra(), Some(floor(0.9)));
+        assert_eq!((assignments.len(), n), (0, 0));
+    }
+
+    #[test]
+    fn without_a_floor_assignments_pass_through() {
+        let (assignments, n) = with_representatives((vec![(0, 10), (0, 11)], 1), &spectra(), None);
+        assert_eq!(n, 1);
+        assert_eq!(assignments.iter().map(|a| (a.0, a.1)).collect::<Vec<_>>(), vec![(0, 10), (0, 11)]);
+        assert!(assignments.iter().all(|a| a.2.is_nan()));
     }
 }

@@ -26,6 +26,11 @@ pub(super) struct Node {
 pub struct FlatClusters {
     pub data: Vec<usize>,
     pub offsets: Vec<usize>,
+    /// Cosine of each member (aligned with `data`) to its cluster's
+    /// representative, which is listed first in its cluster. Empty unless
+    /// the engine picked representatives
+    /// ([`ClusterEngine::representative_floor`](super::engine::ClusterEngine::representative_floor)).
+    pub rep_cosine: Vec<f32>,
 }
 
 impl FlatClusters {
@@ -175,6 +180,7 @@ impl FlatClusters {
         FlatClusters {
             data: new_data,
             offsets: new_offsets,
+            rep_cosine: Vec::new(),
         }
     }
 

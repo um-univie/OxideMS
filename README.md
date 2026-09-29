@@ -190,6 +190,7 @@ The output CSV contains one row per clustered spectrum with columns: `identifier
 
 - `identifier` is `mzspec:USI000000:<file>:scan:<SCANS>`, or `...:index:<index>` for a spectrum without a parseable scan number. Scan numbers can repeat within a file; `index` (the 0-based position of the spectrum in its file, counted before filtering) cannot.
 - `title` is the spectrum's `TITLE`, quoted if it contains a comma.
+- With `exp.engine.representative_floor` set, each cluster lists its representative (the medoid) first and two more columns follow: `representative` (`true` for it) and `rep_cosine` (each member's exact cosine to it). Members below the floor are split off; a spectrum left alone is unclustered.
 - Set `exp.emit_unclustered = true` before ingesting to also write singletons and spectra removed by preprocessing, with `cluster` = -1, so every input spectrum gets a row.
 
 ### How clustering works
@@ -214,6 +215,7 @@ let mut exp = SpectralExperiment::proteomics();
 exp.engine.epsilon = 0.05;                                // cosine distance threshold
 exp.engine.min_neighbors = 2;                             // DBSCAN minimum neighbours
 exp.engine.min_shared_peaks = 4;                          // pairs must also share >= 4 fragment peaks (0 = off)
+exp.engine.representative_floor = Some(0.9);              // medoid per cluster; split off members below cosine 0.9
 exp.engine.mz_tolerance = MassTolerance::Da(0.02);        // precursor m/z window for partitioning
 exp.engine.exact = false;                                 // use approximate (hashed) mode
 exp.engine.set_mz_range(40.0, 2000.0);                    // hashed fragment range; match the workflow's FilterMZ

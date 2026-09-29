@@ -205,9 +205,25 @@ struct OutputRow {
     charge: i8,
     precursor_mz: f64,
     retention_time: f32,
+    /// `(is the cluster's representative, cosine to it)`, when the engine
+    /// picked representatives.
+    rep: Option<(bool, f32)>,
 }
 
-/// Writes one results row, with cluster -1 for `None`. The identifier is a USI with the scan number when
+/// Extra columns written when the engine picks representatives.
+const REPRESENTATIVE_CSV_COLUMNS: &str = ",representative,rep_cosine";
+
+/// `(is representative, cosine)` of the member at `position` in
+/// `clusters.data`, which is its cluster's `index_in_cluster`-th member.
+fn representative_of(clusters: &FlatClusters, position: usize, index_in_cluster: usize) -> Option<(bool, f32)> {
+    clusters
+        .rep_cosine
+        .get(position)
+        .map(|&cosine| (index_in_cluster == 0, cosine))
+}
+
+/// Writes one results row, with cluster -1 for `None`. With `with_rep`, the
+/// representative columns follow (empty for unclustered rows). The identifier is a USI with the scan number when
 /// the spectrum had one, else with its position in the file (`index:`), which
 /// is always unique within a file; `index` and `title` disambiguate repeated
 /// scan numbers.
@@ -216,12 +232,13 @@ fn write_result_row(
     file_name: &str,
     row: &OutputRow,
     cluster: Option<usize>,
+    with_rep: bool,
 ) -> io::Result<()> {
     match row.scan_number {
         Some(scan) => write!(writer, "mzspec:USI000000:{file_name}:scan:{scan}")?,
         None => write!(writer, "mzspec:USI000000:{file_name}:index:{}", row.index)?,
     }
-    writeln!(
+    write!(
         writer,
         ",{},{},{},{},{},{}",
         row.index,
@@ -230,7 +247,12 @@ fn write_result_row(
         row.precursor_mz,
         row.retention_time,
         cluster.map_or(-1, |c| c as i64),
-    )
+    )?;
+    match (with_rep, row.rep) {
+        (false, _) => writeln!(writer),
+        (true, Some((is_rep, cosine))) => writeln!(writer, ",{is_rep},{cosine:.4}"),
+        (true, None) => writeln!(writer, ",,"),
+    }
 }
 
 /// Splits a low-mem partition's rows into one list per cluster plus, when
@@ -241,15 +263,20 @@ fn rows_by_cluster(
     clusters: &FlatClusters,
     keep_unclustered: bool,
 ) -> (Vec<Vec<OutputRow>>, Vec<OutputRow>) {
+    let mut position = 0;
     let clustered = clusters
         .iter()
         .map(|cluster| {
             cluster
                 .iter()
-                .map(|id| {
-                    lookup
+                .enumerate()
+                .map(|(k, id)| {
+                    let mut row = lookup
                         .remove(&(*id as u64))
-                        .expect("every clustered id is a record of this partition")
+                        .expect("every clustered id is a record of this partition");
+                    row.rep = representative_of(clusters, position, k);
+                    position += 1;
+                    row
                 })
                 .collect()
         })
@@ -273,6 +300,7 @@ impl From<&SpectrumMetadata> for OutputRow {
             charge: m.charge,
             precursor_mz: m.precursor_mz,
             retention_time: m.retention_time_in_seconds,
+            rep: None,
         }
     }
 }
@@ -1265,6 +1293,7 @@ impl SpectralExperiment {
         engine.exact = self.engine.exact;
         engine.min_neighbors = self.engine.min_neighbors;
         engine.min_shared_peaks = self.engine.min_shared_peaks;
+        engine.representative_floor = self.engine.representative_floor;
         engine.hasher = SpectrumHasher::new(
             self.engine.hasher.min_mz,
             self.engine.hasher.max_mz,
@@ -1312,6 +1341,7 @@ impl SpectralExperiment {
                         charge: r.msn.charge(),
                         precursor_mz: r.msn.precursor_mz,
                         retention_time: r.msn.retention_time_in_seconds,
+                        rep: None,
                     },
                 );
                 msn_spectra.push(r.msn);
@@ -1356,12 +1386,13 @@ impl SpectralExperiment {
         let mut writer = BufWriter::new(file);
         write!(
             writer,
-            "# RedshiftMS (OxideMS core v{}) {}\n# eps = {}\n# hash_len = {}\n# total_spectra_parsed = {}\n{RESULTS_CSV_COLUMNS}\n",
+            "# RedshiftMS (OxideMS core v{}) {}\n# eps = {}\n# hash_len = {}\n# total_spectra_parsed = {}\n{RESULTS_CSV_COLUMNS}{}\n",
             env!("CARGO_PKG_VERSION"),
             if self.engine.exact { "(exact)" } else { "" },
             self.engine.epsilon,
             self.engine.hash_size(),
-            self.total_spectra_ingested
+            self.total_spectra_ingested,
+            self.representative_columns(),
         )?;
 
         let mut counter = 0usize;
@@ -1374,7 +1405,7 @@ impl SpectralExperiment {
                 counter += 1;
                 for row in cluster {
                     total_clustered += 1;
-                    write_result_row(&mut writer, &self.file_names[row.file_index], &row, Some(counter))?;
+                    write_result_row(&mut writer, &self.file_names[row.file_index], &row, Some(counter), self.writes_representatives())?;
                 }
             }
         }
@@ -1450,6 +1481,7 @@ impl SpectralExperiment {
                         charge: r.msn.charge(),
                         precursor_mz: r.msn.precursor_mz,
                         retention_time: r.msn.retention_time_in_seconds,
+                        rep: None,
                     },
                 );
                 id_to_pos.insert(r.msn.id, msn_spectra.len());
@@ -1530,12 +1562,13 @@ impl SpectralExperiment {
         let mut writer = BufWriter::new(file);
         write!(
             writer,
-            "# RedshiftMS (OxideMS core v{}) {}\n# eps = {}\n# hash_len = {}\n# total_spectra_parsed = {}\n{RESULTS_CSV_COLUMNS}\n",
+            "# RedshiftMS (OxideMS core v{}) {}\n# eps = {}\n# hash_len = {}\n# total_spectra_parsed = {}\n{RESULTS_CSV_COLUMNS}{}\n",
             env!("CARGO_PKG_VERSION"),
             if self.engine.exact { "(exact)" } else { "" },
             self.engine.epsilon,
             self.engine.hash_size(),
-            self.total_spectra_ingested
+            self.total_spectra_ingested,
+            self.representative_columns(),
         )?;
 
         let mut counter = 0usize;
@@ -1552,7 +1585,7 @@ impl SpectralExperiment {
                 counter += 1;
                 for row in cluster {
                     total_clustered += 1;
-                    write_result_row(&mut writer, &self.file_names[row.file_index], &row, Some(counter))?;
+                    write_result_row(&mut writer, &self.file_names[row.file_index], &row, Some(counter), self.writes_representatives())?;
                 }
             }
         }
@@ -1614,6 +1647,15 @@ impl SpectralExperiment {
     /// Writes `rows` (spectra left out of every cluster), the low-mem spectra
     /// alone in their precursor window and then the spectra removed during
     /// ingestion, all with cluster -1, if `emit_unclustered` is set.
+    /// Whether rows carry the representative columns.
+    fn writes_representatives(&self) -> bool {
+        self.engine.representative_floor.is_some()
+    }
+
+    fn representative_columns(&self) -> &'static str {
+        if self.writes_representatives() { REPRESENTATIVE_CSV_COLUMNS } else { "" }
+    }
+
     fn write_unclustered_rows(&self, writer: &mut impl Write, rows: Vec<OutputRow>) -> io::Result<()> {
         if !self.emit_unclustered {
             return Ok(());
@@ -1621,7 +1663,7 @@ impl SpectralExperiment {
         let lone = self.lone_metadata.iter().map(OutputRow::from);
         let filtered = self.filtered_metadata.iter().map(OutputRow::from);
         for row in rows.into_iter().chain(lone).chain(filtered) {
-            write_result_row(writer, &self.file_names[row.file_index], &row, None)?;
+            write_result_row(writer, &self.file_names[row.file_index], &row, None, self.writes_representatives())?;
         }
         Ok(())
     }
@@ -1630,20 +1672,23 @@ impl SpectralExperiment {
         let mut file = std::fs::File::create(output_file_name)
             .unwrap_or_else(|e| panic!("cannot create output file {output_file_name:?}: {e}"));
         let mut writer = std::io::BufWriter::new(&mut file);
-        writer.write(format!("# RedshiftMS (OxideMS core v{}) {}\n# eps = {}\n# hash_len = {}\n# total_spectra_parsed = {}\n{RESULTS_CSV_COLUMNS}\n", env!("CARGO_PKG_VERSION"), if self.engine.exact {"(exact)"} else {""},  self.engine.epsilon, self.engine.hash_size(), self.total_spectra_ingested).as_bytes())
+        writer.write(format!("# RedshiftMS (OxideMS core v{}) {}\n# eps = {}\n# hash_len = {}\n# total_spectra_parsed = {}\n{RESULTS_CSV_COLUMNS}{}\n", env!("CARGO_PKG_VERSION"), if self.engine.exact {"(exact)"} else {""},  self.engine.epsilon, self.engine.hash_size(), self.total_spectra_ingested, self.representative_columns()).as_bytes())
             .unwrap_or_else(|e| panic!("failed writing header to {output_file_name:?}: {e}"));
         let mut counter = 0;
+        let mut position = 0;
         for cluster in clusters.iter() {
             counter += 1;
-            for spectrum in cluster {
+            for (k, spectrum) in cluster.iter().enumerate() {
                 // Every clustered id came from self.spectra, which is
                 // ingested in lockstep with self.metadata.
                 let metadata = self
                     .metadata
                     .get(*spectrum)
                     .expect("clustered id has a metadata entry");
-                let row = OutputRow::from(metadata);
-                write_result_row(&mut writer, &self.file_names[metadata.file_index], &row, Some(counter))
+                let mut row = OutputRow::from(metadata);
+                row.rep = representative_of(clusters, position, k);
+                position += 1;
+                write_result_row(&mut writer, &self.file_names[metadata.file_index], &row, Some(counter), self.writes_representatives())
                     .unwrap_or_else(|e| panic!("failed writing row to {output_file_name:?}: {e}"));
             }
         }
@@ -2202,6 +2247,37 @@ BEGIN IONS\nTITLE=U2\nPEPMASS=300.0\n100.0 1000\n150.0 800\n200.0 600\nEND IONS\
         let csv = std::fs::read_to_string(&out).unwrap();
         assert!(csv.lines().filter(|l| l.contains(",U")).all(|l| l.ends_with(",-1")));
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn representative_columns_mark_the_medoid_and_its_cosines() {
+        let dir = std::env::temp_dir().join(format!("oxidems_representative_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mgf = dir.join("reps.mgf");
+        std::fs::write(&mgf, UNKNOWN_CHARGE_MGF.replace("CHARGE=0\n", "CHARGE=1+\n").replace("TITLE=U2\nPEPMASS=300.0\n", "TITLE=U2\nPEPMASS=300.0\nCHARGE=1+\n")).unwrap();
+        let out = dir.join("out.csv");
+        for low_mem in [false, true] {
+            let mut experiment = metabolomics_experiment();
+            experiment.engine.representative_floor = Some(0.9);
+            if low_mem {
+                experiment.ingest_file_low_mem(mgf.to_str().unwrap(), &dir.join("spill")).unwrap();
+                experiment.cluster_and_write_low_mem(out.to_str().unwrap()).unwrap();
+            } else {
+                experiment.ingest_file(mgf.to_str().unwrap());
+                experiment.prepare_clustering();
+                let clusters = experiment.cluster();
+                experiment.write_results(&clusters, out.to_str().unwrap());
+            }
+            let csv = std::fs::read_to_string(&out).unwrap();
+            let mut lines = csv.lines().filter(|l| !l.starts_with('#'));
+            assert_eq!(lines.next(), Some(format!("{RESULTS_CSV_COLUMNS}{REPRESENTATIVE_CSV_COLUMNS}").as_str()));
+            let rows: Vec<Vec<&str>> = lines.map(|l| l.split(',').collect()).collect();
+            // Four identical spectra: one cluster, one representative.
+            assert_eq!(rows.len(), 4, "low_mem = {low_mem}");
+            assert_eq!(rows.iter().filter(|r| r[7] == "true").count(), 1);
+            assert!(rows.iter().all(|r| r[8] == "1.0000"));
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
