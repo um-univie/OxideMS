@@ -213,6 +213,7 @@ use oxidems_lib::workflow::MassTolerance;
 let mut exp = SpectralExperiment::proteomics();
 exp.engine.epsilon = 0.05;                                // cosine distance threshold
 exp.engine.min_neighbors = 2;                             // DBSCAN minimum neighbours
+exp.engine.min_shared_peaks = 4;                          // pairs must also share >= 4 fragment peaks (0 = off)
 exp.engine.mz_tolerance = MassTolerance::Da(0.02);        // precursor m/z window for partitioning
 exp.engine.exact = false;                                 // use approximate (hashed) mode
 exp.engine.set_mz_range(40.0, 2000.0);                    // hashed fragment range; match the workflow's FilterMZ

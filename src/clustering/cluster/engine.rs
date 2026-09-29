@@ -230,6 +230,92 @@ impl BatchLinks<'_> {
     }
 }
 
+/// Minimum number of shared fragment peaks a candidate edge needs, on top
+/// of passing the cosine threshold ([`ClusterEngine::min_shared_peaks`]).
+///
+/// A high cosine that rests on two or three matched peaks says little: any
+/// pair of sparse spectra sharing their base peak scores well. The check
+/// counts peaks matched one-to-one within the fragment tolerance on the
+/// preprocessed peaks, so it is exact rather than a count of shared hash
+/// buckets, and it only runs on pairs that already passed the cosine.
+pub(crate) struct SharedPeaks<'a> {
+    spectra: &'a [MSNSpectrum],
+    tolerance: MassTolerance,
+    min: usize,
+}
+
+impl<'a> SharedPeaks<'a> {
+    /// `None` when the check is off (`min == 0`).
+    pub(crate) fn new(spectra: &'a [MSNSpectrum], tolerance: MassTolerance, min: usize) -> Option<Self> {
+        (min > 0).then_some(Self { spectra, tolerance, min })
+    }
+
+    pub(crate) fn ok(&self, i: usize, j: usize) -> bool {
+        matched_peaks(&self.spectra[i].spectrum.peaks, &self.spectra[j].spectrum.peaks, self.tolerance)
+            >= self.min
+    }
+}
+
+/// Peaks of two m/z-sorted lists matched one-to-one within `tolerance`.
+pub(crate) fn matched_peaks(a: &[crate::Peak], b: &[crate::Peak], tolerance: MassTolerance) -> usize {
+    let (mut i, mut j, mut matched) = (0, 0, 0);
+    while i < a.len() && j < b.len() {
+        let (x, y) = (a[i].mz, b[j].mz);
+        if (x - y).abs() <= tolerance.tolerance_at(x.max(y)) {
+            matched += 1;
+            i += 1;
+            j += 1;
+        } else if x < y {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    matched
+}
+
+/// Clears the bits of pairs failing `shared` in a symmetric bit matrix
+/// (diagonal untouched).
+fn prune_bits(bits: &mut [usize], n: usize, words_per_vertex: usize, shared: &SharedPeaks) {
+    for i in 0..n {
+        let mut j = i + 1;
+        while let Some(next) = bits[i * words_per_vertex..(i + 1) * words_per_vertex].next_set_bit(j) {
+            if next >= n {
+                break;
+            }
+            if !shared.ok(i, next) {
+                bits[i * words_per_vertex..(i + 1) * words_per_vertex].unset_bit(next);
+                bits[next * words_per_vertex..(next + 1) * words_per_vertex].unset_bit(i);
+            }
+            j = next + 1;
+        }
+    }
+}
+
+/// Zeroes the entries of pairs at or above `min_similarity` that fail
+/// `shared`, in a row-major `n * n` matrix with the upper triangle populated.
+fn prune_upper_triangular(similarity: &mut [f32], n: usize, min_similarity: f32, shared: &SharedPeaks) {
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if similarity[i * n + j] >= min_similarity && !shared.ok(i, j) {
+                similarity[i * n + j] = 0.0;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn prune_packed(similarity: &mut [f32], n: usize, min_similarity: f32, shared: &SharedPeaks) {
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let idx = super::dbscan::packed_upper_idx(i, j, n);
+            if similarity[idx] >= min_similarity && !shared.ok(i, j) {
+                similarity[idx] = 0.0;
+            }
+        }
+    }
+}
+
 /// Disjoint-set over `0..n`, used to find the connected components of one
 /// mass interval.
 struct UnionFind {
@@ -299,6 +385,7 @@ fn windowed_dense_labels(
     mz_tolerance: MassTolerance,
     epsilon: f32,
     bit_matrix: &mut Vec<usize>,
+    shared: Option<&SharedPeaks>,
 ) -> (Vec<ClusterLabel>, usize) {
     let n_spectra = spectra.len();
     let words_per_vertex = n_spectra.div_ceil(WORDSIZE);
@@ -317,7 +404,10 @@ fn windowed_dense_labels(
         usize::MAX,
     );
 
-    for edge in &edges {
+    for edge in edges
+        .iter()
+        .filter(|e| shared.is_none_or(|s| s.ok(e.source_id, e.target_id)))
+    {
         bit_matrix[edge.source_id * words_per_vertex..(edge.source_id + 1) * words_per_vertex]
             .set_bit(edge.target_id);
         bit_matrix[edge.target_id * words_per_vertex..(edge.target_id + 1) * words_per_vertex]
@@ -351,6 +441,7 @@ fn dense_labels_mass_filtered(
     min_similarity: f32,
     window_ends: &[usize],
     bit_matrix: &mut Vec<usize>,
+    shared: Option<&SharedPeaks>,
 ) -> (Vec<ClusterLabel>, usize) {
     let words_per_vertex = n_spectra.div_ceil(WORDSIZE);
     bit_matrix.clear();
@@ -359,7 +450,9 @@ fn dense_labels_mass_filtered(
     for i in 0..n_spectra {
         bit_matrix[i * words_per_vertex..(i + 1) * words_per_vertex].set_bit(i);
         for j in (i + 1)..window_ends[i] {
-            if similarity_matrix[i * n_spectra + j] >= min_similarity {
+            if similarity_matrix[i * n_spectra + j] >= min_similarity
+                && shared.is_none_or(|s| s.ok(i, j))
+            {
                 bit_matrix[i * words_per_vertex..(i + 1) * words_per_vertex].set_bit(j);
                 bit_matrix[j * words_per_vertex..(j + 1) * words_per_vertex].set_bit(i);
             }
@@ -811,6 +904,9 @@ pub struct ClusterEngine {
     pub exact: bool,
     /// Minimum neighbors for a DBSCAN core point.
     pub min_neighbors: usize,
+    /// Minimum fragment peaks a pair must share to become an edge, on top of
+    /// the cosine threshold; 0 turns the check off. See [`SharedPeaks`].
+    pub min_shared_peaks: usize,
     /// Enable/disable GPU offloading.
     pub use_gpu: bool,
     /// Print timing and progress information to stdout.
@@ -839,6 +935,7 @@ impl Default for ClusterEngine {
             hasher: SpectrumHasher::new(101.0, 1500.0, MassTolerance::Da(0.05), hash_size),
             exact: false,
             min_neighbors: MIN_NEIGHBORS,
+            min_shared_peaks: 0,
             use_gpu: false,
             verbose: false,
             fast_batches: Vec::new(),
@@ -1197,6 +1294,8 @@ impl ClusterEngine {
                         let spectra = batch.batch.as_slice();
                         let n_spectra = spectra.len();
                         let threshold = self.batch_threshold(spectra);
+                        let shared =
+                            SharedPeaks::new(spectra, hasher.tolerance, self.min_shared_peaks);
 
                         if n_spectra == 2 && min_neighbors == 2 {
                             let mut s0 = spectra[0].spectrum.to_soa(hasher.tolerance);
@@ -1209,7 +1308,7 @@ impl ClusterEngine {
                                 &s1.mz_bins,
                                 &s1.intensities,
                             );
-                            return if sim >= threshold {
+                            return if sim >= threshold && shared.as_ref().is_none_or(|s| s.ok(0, 1)) {
                                 (vec![(0_usize, spectra[0].id), (0_usize, spectra[1].id)], 1)
                             } else {
                                 (vec![], 0)
@@ -1270,7 +1369,9 @@ impl ClusterEngine {
                                 if hi >= window_ends[lo] {
                                     continue;
                                 }
-                                if sparse_sim.val_of_col(col)[idx] >= threshold {
+                                if sparse_sim.val_of_col(col)[idx] >= threshold
+                                    && shared.as_ref().is_none_or(|s| s.ok(row, col))
+                                {
                                     bit_matrix_buffer
                                         [row * words_per_vertex..(row + 1) * words_per_vertex]
                                         .set_bit(col);
@@ -1304,6 +1405,8 @@ impl ClusterEngine {
                         let spectra = batch.batch.as_slice();
                         let n_spectra = spectra.len();
                         let threshold = self.batch_threshold(spectra);
+                        let shared =
+                            SharedPeaks::new(spectra, hasher.tolerance, self.min_shared_peaks);
 
                         spectral_buffer.resize(n_spectra * hash_size, 0.0);
                         spectral_buffer.fill(0.0);
@@ -1331,6 +1434,7 @@ impl ClusterEngine {
                                         precursor_mz_tolerance,
                                         1.0 - threshold,
                                         bit_matrix_buffer,
+                                        shared.as_ref(),
                                     )
                                 } else {
                                     compute_similarity_matrix(
@@ -1349,6 +1453,7 @@ impl ClusterEngine {
                                         threshold,
                                         &window_ends,
                                         bit_matrix_buffer,
+                                        shared.as_ref(),
                                     )
                                 };
                             let links = BatchLinks::Bits {
@@ -1381,6 +1486,9 @@ impl ClusterEngine {
                                     n_spectra as i32,
                                 );
                             }
+                            if let Some(shared) = &shared {
+                                prune_upper_triangular(similarity_matrix_buffer, n_spectra, threshold, shared);
+                            }
                             dbscan_upper_triangular(
                                 similarity_matrix_buffer,
                                 n_spectra,
@@ -1396,6 +1504,9 @@ impl ClusterEngine {
                                 spectral_buffer,
                                 hash_size,
                             );
+                            if let Some(shared) = &shared {
+                                prune_upper_triangular(similarity_matrix_buffer, n_spectra, threshold, shared);
+                            }
                             dbscan_upper_triangular(
                                 similarity_matrix_buffer,
                                 n_spectra,
@@ -1434,6 +1545,7 @@ impl ClusterEngine {
         let hash_size = self.hash_size();
         let epsilon = 1.0 - self.batch_threshold(spectra);
         let precursor_mz_tolerance = self.mz_tolerance;
+        let shared = SharedPeaks::new(spectra, self.hasher.tolerance, self.min_shared_peaks);
 
         // Paths that build their own edge list hand it over; the dense path
         // leaves its similarity matrix in `self.similarity_matrix_buffer`,
@@ -1470,6 +1582,7 @@ impl ClusterEngine {
                         self.mz_tolerance,
                         epsilon,
                         &mut bit_matrix,
+                        shared.as_ref(),
                     )
                 } else {
                     compute_similarity_matrix_parallel(
@@ -1488,6 +1601,7 @@ impl ClusterEngine {
                         1.0 - epsilon,
                         &window_ends,
                         &mut bit_matrix,
+                        shared.as_ref(),
                     )
                 };
                 let links = BatchLinks::Bits {
@@ -1499,7 +1613,8 @@ impl ClusterEngine {
                 self.dense_bit_matrix = bit_matrix;
                 return result;
             }
-            let (labels, matrix_valid) = self.compute_dense_dbscan(n_spectra, hash_size);
+            let (labels, matrix_valid) =
+                self.compute_dense_dbscan(n_spectra, hash_size, shared.as_ref());
             dense_matrix_valid = matrix_valid;
             labels
         };
@@ -1561,6 +1676,10 @@ impl ClusterEngine {
             // exactly the ANN problem IVF exists for.
             self.approximate_threshold,
         );
+        let mut edges = edges;
+        if let Some(shared) = SharedPeaks::new(spectra, self.hasher.tolerance, self.min_shared_peaks) {
+            edges.retain(|e| shared.ok(e.source_id, e.target_id));
+        }
         let links = BatchLinks::from_edges(n_spectra, &edges);
         (
             graph_dbscan(n_spectra, &edges, epsilon, MIN_NEIGHBORS),
@@ -1663,6 +1782,10 @@ impl ClusterEngine {
             )
             .flatten()
             .collect();
+        let mut edges = edges;
+        if let Some(shared) = SharedPeaks::new(spectra, self.hasher.tolerance, self.min_shared_peaks) {
+            edges.retain(|e| shared.ok(e.source_id, e.target_id));
+        }
 
         let links = BatchLinks::from_edges(n_spectra, &edges);
         (
@@ -1704,6 +1827,7 @@ impl ClusterEngine {
         &mut self,
         n_spectra: usize,
         hash_size: usize,
+        shared: Option<&SharedPeaks>,
     ) -> (Vec<ClusterLabel>, bool) {
         let min_sim = 1.0 - self.epsilon;
 
@@ -1711,8 +1835,11 @@ impl ClusterEngine {
         if self.use_gpu {
             if let Some(ref gpu_ctx) = self.gpu {
                 if n_spectra <= gpu_ctx.max_m {
-                    let packed =
+                    let mut packed =
                         gpu_ctx.compute(&self.spectral_buffer[..n_spectra * hash_size], n_spectra);
+                    if let Some(shared) = shared {
+                        prune_packed(&mut packed, n_spectra, min_sim, shared);
+                    }
                     return (
                         dbscan_upper_triangular_packed(
                             &packed,
@@ -1745,6 +1872,9 @@ impl ClusterEngine {
                     n_spectra as i32,
                 );
             }
+            if let Some(shared) = shared {
+                prune_upper_triangular(&mut self.similarity_matrix_buffer, n_spectra, min_sim, shared);
+            }
             return (
                 dbscan_upper_triangular(
                     &self.similarity_matrix_buffer,
@@ -1763,6 +1893,9 @@ impl ClusterEngine {
                 &self.spectral_buffer,
                 hash_size,
             );
+            if let Some(shared) = shared {
+                prune_upper_triangular(&mut self.similarity_matrix_buffer, n_spectra, min_sim, shared);
+            }
 
             (
                 dbscan_upper_triangular(
@@ -1903,6 +2036,7 @@ mod connectivity_tests {
             MassTolerance::Da(0.01),
             0.1,
             &mut bits,
+            None,
         );
         assert_eq!(labels[0], labels[1], "the close pair still clusters");
         assert!(matches!(labels[0], ClusterLabel::Cluster(_)));
@@ -1931,6 +2065,7 @@ mod connectivity_tests {
             MassTolerance::Da(0.01),
             0.1,
             &mut bits,
+            None,
         );
         assert_eq!(labels[0], labels[1]);
         assert_eq!(labels[1], labels[2]);
@@ -2008,6 +2143,7 @@ mod connectivity_tests {
             tolerance,
             epsilon,
             &mut bits_a,
+            None,
         );
 
         let mut similarity = Vec::new();
@@ -2024,6 +2160,7 @@ mod connectivity_tests {
             1.0 - epsilon,
             &window_ends,
             &mut bits_b,
+            None,
         );
 
         assert_eq!(bits_a, bits_b, "the two strategies built different adjacency");
@@ -2078,5 +2215,88 @@ mod connectivity_tests {
         // even though nothing links them.
         assert_eq!(n_clusters, 1);
         assert_eq!(assignments.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod shared_peak_tests {
+    use super::*;
+    use crate::spectrum::MassSpectrum;
+    use crate::Peak;
+
+    fn spectrum(id: u64, peaks: &[(f64, f32)]) -> MSNSpectrum {
+        MSNSpectrum {
+            precursor_mz: 800.0,
+            retention_time_in_seconds: 0.0,
+            id,
+            spectrum: MassSpectrum {
+                peaks: peaks.iter().map(|&(mz, i)| Peak::new(mz, i)).collect(),
+                charge: 1,
+            },
+        }
+    }
+
+    /// A and its copy share four peaks; B shares only A's two dominant peaks,
+    /// so its cosine to A is high but rests on two matches.
+    fn batch() -> Vec<MSNSpectrum> {
+        let a = [(200.0, 1000.0), (300.0, 1000.0), (400.0, 5.0), (500.0, 5.0)];
+        let b = [(200.0, 1000.0), (300.0, 1000.0), (450.0, 5.0), (550.0, 5.0)];
+        vec![spectrum(0, &a), spectrum(1, &a), spectrum(2, &b)]
+    }
+
+    fn clustered_ids(mut engine: ClusterEngine) -> Vec<Vec<usize>> {
+        engine.split_on_mz_and_charge(batch()).unwrap();
+        let clusters = engine.cluster().unwrap();
+        let mut groups: Vec<Vec<usize>> = clusters
+            .iter()
+            .filter(|c| c.len() > 1)
+            .map(|c| {
+                let mut ids = c.to_vec();
+                ids.sort();
+                ids
+            })
+            .collect();
+        groups.sort();
+        groups
+    }
+
+    #[test]
+    fn matched_peaks_counts_one_to_one_within_tolerance() {
+        let p = |v: &[f64]| v.iter().map(|&mz| Peak::new(mz, 1.0)).collect::<Vec<_>>();
+        let tol = MassTolerance::Da(0.05);
+        assert_eq!(matched_peaks(&p(&[100.0, 200.0, 300.0]), &p(&[100.02, 200.2, 300.0]), tol), 2);
+        assert_eq!(matched_peaks(&p(&[100.0, 100.03]), &p(&[100.01]), tol), 1);
+        assert_eq!(matched_peaks(&p(&[]), &p(&[100.0]), tol), 0);
+    }
+
+    /// Every path that forms edges applies the check the same way.
+    #[test]
+    fn every_edge_path_applies_min_shared_peaks() {
+        let paths: [(&str, fn(&mut ClusterEngine)); 5] = [
+            ("fast hashed", |_| {}),
+            ("fast exact", |e| e.exact = true),
+            ("slow hashed", |e| e.batch_size_threshold = 0),
+            ("slow exact", |e| {
+                e.batch_size_threshold = 0;
+                e.exact = true;
+            }),
+            ("approximate graph", |e| {
+                e.batch_size_threshold = 0;
+                e.approximate_threshold = 0;
+            }),
+        ];
+        for (name, configure) in paths {
+            for (min_shared, expected) in [
+                (0, vec![vec![0, 1, 2]]),
+                (2, vec![vec![0, 1, 2]]),
+                (3, vec![vec![0, 1]]),
+            ] {
+                let mut engine = ClusterEngine::default();
+                engine.epsilon = 0.1;
+                engine.min_shared_peaks = min_shared;
+                configure(&mut engine);
+                assert_eq!(clustered_ids(engine), expected, "{name}, min_shared_peaks = {min_shared}");
+            }
+        }
     }
 }

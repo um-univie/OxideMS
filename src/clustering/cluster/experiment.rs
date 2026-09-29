@@ -1264,6 +1264,7 @@ impl SpectralExperiment {
         engine.approximate_threshold = self.engine.approximate_threshold;
         engine.exact = self.engine.exact;
         engine.min_neighbors = self.engine.min_neighbors;
+        engine.min_shared_peaks = self.engine.min_shared_peaks;
         engine.hasher = SpectrumHasher::new(
             self.engine.hasher.min_mz,
             self.engine.hasher.max_mz,
