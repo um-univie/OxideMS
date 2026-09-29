@@ -46,7 +46,6 @@ pub struct SpectralExperiment {
     pub parser: MgfParser,
     pub engine: ClusterEngine,
     pub spectra: Vec<MSNSpectrum>,
-    pub filter_unknown_charge: bool,
     pub total_spectra_ingested: usize,
     pub filter_report: FilterReport,
     /// Keys accumulated by [`ingest_file_low_mem`](Self::ingest_file_low_mem)
@@ -69,8 +68,8 @@ pub struct SpectralExperiment {
     /// falling back to the MS2-consensus window.
     pub retain_ms1: bool,
     /// Also write every spectrum that ended up in no cluster to the results
-    /// CSV, with cluster -1: singletons, and spectra removed by the workflow
-    /// or the unknown-charge filter. Must be set before ingestion, since
+    /// CSV, with cluster -1: singletons, and spectra removed by the workflow.
+    /// Must be set before ingestion, since
     /// filtered spectra are only recorded while it is on. MS1 survey scans
     /// and MGF blocks without any peak line are never written.
     pub emit_unclustered: bool,
@@ -371,7 +370,6 @@ impl SpectralExperiment {
 
         Self {
             workflow,
-            filter_unknown_charge: true,
             retain_ms1: true,
             ..Default::default()
         }
@@ -425,7 +423,6 @@ impl SpectralExperiment {
             workflow,
             engine,
             parser: MgfParser::default(),
-            filter_unknown_charge: true,
             retain_ms1: true,
             ..Default::default()
         }
@@ -474,7 +471,6 @@ impl SpectralExperiment {
         Self {
             workflow,
             engine,
-            filter_unknown_charge: true,
             retain_ms1: true,
             ..Default::default()
         }
@@ -797,28 +793,12 @@ impl SpectralExperiment {
             split_off_ms1_scans(parsed, file_index, self.retain_ms1);
         let mut report = self.workflow.execute_with_report(&mut spectra);
 
-        let unknown_charge_dropped = if self.filter_unknown_charge {
-            spectra
-                .iter()
-                .filter(|s| !s.peaks().is_empty() && s.get_charge() == 0)
-                .count()
-        } else {
-            0
-        };
-        report.record("unknown_charge", unknown_charge_dropped);
 
         let filtered = self.filtered_rows(&spectra, file_index);
         let mut local_metadata = Vec::new();
         let processed_spectra: Vec<MSNSpectrum> = spectra
             .into_iter()
-            .filter(|s| {
-                !s.peaks().is_empty()
-                    && if self.filter_unknown_charge {
-                        s.get_charge() != 0
-                    } else {
-                        true
-                    }
-            })
+            .filter(|s| !s.peaks().is_empty())
             .enumerate()
             .map(|(local_idx, s)| {
                 // SCANS is sometimes a range/list (MSn-to-pseudo-MS2 spectra
@@ -856,8 +836,8 @@ impl SpectralExperiment {
         (processed_spectra, local_metadata, raw_count, report, ms1_scans, filtered)
     }
 
-    /// Metadata rows for the spectra of one file that the workflow emptied or
-    /// the unknown-charge filter will drop, if `emit_unclustered` is set.
+    /// Metadata rows for the spectra of one file that the workflow emptied, if
+    /// `emit_unclustered` is set.
     /// Records carry their position in the file as `id` at this point.
     fn filtered_rows(&self, spectra: &[MassSpectralRecord], file_index: usize) -> Vec<SpectrumMetadata> {
         if !self.emit_unclustered {
@@ -865,7 +845,7 @@ impl SpectralExperiment {
         }
         spectra
             .iter()
-            .filter(|s| s.peaks().is_empty() || (self.filter_unknown_charge && s.get_charge() == 0))
+            .filter(|s| s.peaks().is_empty())
             .map(|s| SpectrumMetadata::from_record(s, s.id, file_index))
             .collect()
     }
@@ -890,15 +870,6 @@ impl SpectralExperiment {
         self.ms1_scans.extend(ms1);
         let mut report = self.workflow.execute_with_report(&mut spectra);
 
-        let unknown_charge_dropped = if self.filter_unknown_charge {
-            spectra
-                .iter()
-                .filter(|s| !s.peaks().is_empty() && s.get_charge() == 0)
-                .count()
-        } else {
-            0
-        };
-        report.record("unknown_charge", unknown_charge_dropped);
         self.filter_report.merge(report);
 
         let filtered = self.filtered_rows(&spectra, file_index);
@@ -907,14 +878,7 @@ impl SpectralExperiment {
 
         let msn_spectra: Vec<MSNSpectrum> = spectra
             .into_iter()
-            .filter(|s| {
-                !(s.peaks().len() == 0)
-                    && if self.filter_unknown_charge {
-                        s.get_charge() != 0
-                    } else {
-                        true
-                    }
-            })
+            .filter(|s| !s.peaks().is_empty())
             .enumerate()
             .map(|(index, mut s)| {
                 // The parser numbers records by their position in the file.
@@ -1123,7 +1087,6 @@ impl SpectralExperiment {
             file_index,
             spill_dir,
             &self.workflow,
-            self.filter_unknown_charge,
             self.engine.hasher.min_mz,
             self.engine.hasher.max_mz,
             self.emit_unclustered,
@@ -2181,6 +2144,62 @@ BEGIN IONS\nTITLE=single\nPEPMASS=450.0\nCHARGE=1+\nSCANS=13\n110.0 1000\n170.0 
         let clusters = experiment.cluster();
         experiment.write_results(&clusters, out.to_str().unwrap());
         assert_eq!(data_rows(&std::fs::read_to_string(&out).unwrap()).len(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    const UNKNOWN_CHARGE_MGF: &str = "\
+BEGIN IONS\nTITLE=K1\nPEPMASS=300.0\nCHARGE=1+\n100.0 1000\n150.0 800\n200.0 600\nEND IONS\n\
+BEGIN IONS\nTITLE=K2\nPEPMASS=300.0\nCHARGE=1+\n100.0 1000\n150.0 800\n200.0 600\nEND IONS\n\
+BEGIN IONS\nTITLE=U1\nPEPMASS=300.0\nCHARGE=0\n100.0 1000\n150.0 800\n200.0 600\nEND IONS\n\
+BEGIN IONS\nTITLE=U2\nPEPMASS=300.0\n100.0 1000\n150.0 800\n200.0 600\nEND IONS\n";
+
+    fn titles_by_cluster(csv: &str) -> Vec<Vec<String>> {
+        let mut by_cluster: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for row in data_rows(csv) {
+            let fields: Vec<&str> = row.split(',').collect();
+            by_cluster
+                .entry(fields[fields.len() - 1].to_string())
+                .or_default()
+                .push(fields[2].to_string());
+        }
+        let mut groups: Vec<Vec<String>> = by_cluster.into_values().map(|mut g| { g.sort(); g }).collect();
+        groups.sort();
+        groups
+    }
+
+    #[test]
+    fn unknown_charges_cluster_only_with_each_other_or_are_dropped() {
+        let dir = std::env::temp_dir().join(format!("oxidems_unknown_charge_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mgf = dir.join("charges.mgf");
+        std::fs::write(&mgf, UNKNOWN_CHARGE_MGF).unwrap();
+        let out = dir.join("out.csv");
+
+        let mut experiment = metabolomics_experiment();
+        experiment.ingest_file(mgf.to_str().unwrap());
+        experiment.prepare_clustering();
+        let clusters = experiment.cluster();
+        experiment.write_results(&clusters, out.to_str().unwrap());
+        assert_eq!(
+            titles_by_cluster(&std::fs::read_to_string(&out).unwrap()),
+            vec![vec!["K1".to_string(), "K2".to_string()], vec!["U1".to_string(), "U2".to_string()]],
+        );
+
+        let mut experiment = metabolomics_experiment();
+        experiment.workflow.add_operation(crate::workflow::DropUnknownCharge::new());
+        experiment.emit_unclustered = true;
+        experiment.ingest_file(mgf.to_str().unwrap());
+        experiment.prepare_clustering();
+        let clusters = experiment.cluster();
+        experiment.write_results(&clusters, out.to_str().unwrap());
+        assert_eq!(
+            titles_by_cluster(&std::fs::read_to_string(&out).unwrap()),
+            vec![vec!["K1".to_string(), "K2".to_string()], vec!["U1".to_string(), "U2".to_string()]],
+            "dropped spectra are written with cluster -1",
+        );
+        let csv = std::fs::read_to_string(&out).unwrap();
+        assert!(csv.lines().filter(|l| l.contains(",U")).all(|l| l.ends_with(",-1")));
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -109,6 +109,7 @@ wfm.execute(&mut spectra);
 | `CentroidPeaks` | Merge adjacent peaks within a m/z tolerance into intensity-weighted centroids |
 | `Deisotope` | Collapse C13 isotope satellites into the monoisotopic peak |
 | `RemovePrecursor` | Remove the precursor ion and its charge-state isotopes |
+| `DropUnknownCharge` | Discard spectra whose precursor charge is unknown (0) |
 | `ReplacePrecursor` | Set `PEPMASS` to the highest m/z peak in the spectrum |
 | `MinNumberOfPeaks` | Discard spectra with fewer than N peaks |
 | `MinMZRangeFilter` | Discard spectra whose m/z span is below a threshold |
@@ -193,7 +194,7 @@ The output CSV contains one row per clustered spectrum with columns: `identifier
 
 ### How clustering works
 
-1. **Partitioning** — `prepare_clustering()` splits spectra into sub-groups by charge state and precursor m/z window (and optionally retention time). Each partition is clustered independently.
+1. **Partitioning** — `prepare_clustering()` splits spectra into sub-groups by charge state and precursor m/z window (and optionally retention time). Each partition is clustered independently. A charge is only assigned when the file states one or the precursor isotope spacing shows it; spectra left at charge 0 (unknown) form their own groups, or are discarded with `DropUnknownCharge`.
 
 2. **Similarity** — cosine similarity between hashed or binned intensity vectors.
    - *Approximate mode* (default): spectra are projected into a 4096-dimensional hash space using xxHash32. Similarity is a fast dot product — O(1) per pair after hashing.

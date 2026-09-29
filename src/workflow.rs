@@ -958,6 +958,41 @@ impl SingleOperation for MinNumberOfPeaks {
 }
 
 struct_with_new!(
+    /// Clears spectra whose precursor charge is unknown (0).
+    ///
+    /// Unknown charges are otherwise kept and clustered only with each other;
+    /// add this step to discard them instead. The parsers only leave a charge
+    /// at 0 when the file gives none and the precursor isotopes do not show
+    /// one, which in practice often means a weak or noisy precursor.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oxidems_lib::MassSpectralRecord;
+    /// use oxidems_lib::workflow::{SingleOperation, DropUnknownCharge};
+    ///
+    /// let mut unknown = MassSpectralRecord::from_tuples(&[(100.0f32, 1.0)]);
+    /// unknown.set_charge(0);
+    /// DropUnknownCharge::new().operate_single(&mut unknown);
+    /// assert!(unknown.peaks().is_empty());
+    ///
+    /// let mut known = MassSpectralRecord::from_tuples(&[(100.0f32, 1.0)]);
+    /// known.set_charge(-1);
+    /// DropUnknownCharge::new().operate_single(&mut known);
+    /// assert_eq!(known.peaks().len(), 1);
+    /// ```
+    pub struct DropUnknownCharge {}
+);
+
+impl SingleOperation for DropUnknownCharge {
+    fn operate_single(&self, spectrum: &mut MassSpectralRecord) {
+        if spectrum.get_charge() == 0 {
+            spectrum.peaks_mut().clear();
+        }
+    }
+}
+
+struct_with_new!(
     /// Removes peaks within `mode` tolerance of the precursor and its charge-state isotopes.
     ///
     /// Reads `PEPMASS` from the spectrum's metadata and `charge` from the spectrum itself.

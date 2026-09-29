@@ -15,7 +15,6 @@ fn main() {
     // 1. Ingestion
     let t_ingest = Instant::now();
     let mut experiment = SpectralExperiment::metabolomics();
-    experiment.filter_unknown_charge = false;
     experiment.ingest_file(mzml_path);
     let ingest_duration = t_ingest.elapsed();
     println!("1. Ingest mzML: {:.4} s ({} spectra)", ingest_duration.as_secs_f64(), experiment.total_spectra_ingested);

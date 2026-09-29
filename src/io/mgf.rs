@@ -24,22 +24,23 @@ use std::{
 /// Used to pre-allocate memory when memory-mapping files.
 pub const MGF_SPECTRA_SIZE: usize = 5_000;
 
-/// Best guess for a precursor whose charge is missing or zero: magnitude 3
-/// or 2 if the matching isotope spacing is found next to the precursor,
-/// else 1, with the sign given by the polarity.
+/// Charge for a precursor whose charge is missing or zero, from evidence in
+/// the spectrum only: 3 or 2 if the matching isotope spacing is found next to
+/// the precursor, with the sign given by the polarity. Without such evidence
+/// the charge stays 0 (unknown); unknown-charge spectra are clustered only
+/// with each other, or removed by [`crate::workflow::DropUnknownCharge`].
 pub(crate) fn recover_charge(peaks: &[Peak], precursor_mz: Option<f64>, is_negative: bool) -> i8 {
-    let mut detected_charge = 1i8;
-    if let Some(pmz) = precursor_mz {
-        let tol = 0.02;
-        let has_z3 = peaks.iter().any(|p| (p.mz - (pmz + 0.3344)).abs() < tol);
-        let has_z2 = peaks.iter().any(|p| (p.mz - (pmz + 0.5017)).abs() < tol);
-
-        if has_z3 {
-            detected_charge = 3;
-        } else if has_z2 {
-            detected_charge = 2;
-        }
-    }
+    let Some(pmz) = precursor_mz else {
+        return 0;
+    };
+    let tol = 0.02;
+    let detected_charge = if peaks.iter().any(|p| (p.mz - (pmz + 0.3344)).abs() < tol) {
+        3
+    } else if peaks.iter().any(|p| (p.mz - (pmz + 0.5017)).abs() < tol) {
+        2
+    } else {
+        return 0;
+    };
     if is_negative { -detected_charge } else { detected_charge }
 }
 
@@ -259,10 +260,10 @@ impl MgfParser {
         } else {
             peaks.shrink_to_fit();
 
-            // Recover charge if missing, zero or unparseable:
-            // 1. Magnitude from the precursor isotope envelope in peaks, else 1
-            // 2. Sign from IONMODE / POLARITY metadata
-            // An unsigned CHARGE (e.g. "1") also takes its sign from IONMODE.
+            // A missing, zero or unparseable charge is only replaced when the
+            // precursor isotope envelope shows it (see recover_charge); it
+            // otherwise stays 0. An unsigned CHARGE (e.g. "1") takes its sign
+            // from IONMODE / POLARITY.
             if charge == 0 {
                 charge = recover_charge(&peaks, precursor_mz, is_negative);
             } else if !charge_signed && is_negative {
@@ -423,7 +424,7 @@ impl MgfParser {
     /// small [`SpillKey`] per spectrum. Peak RSS during parsing is bounded
     /// by shard count and per-block working memory, not dataset size.
     ///
-    /// `workflow` and `filter_unknown_charge` are applied per-spectrum here
+    /// `workflow` is applied per-spectrum here
     /// (mirroring what [`SpectralExperiment::ingest_file`] does in a batch
     /// pass after the full parse) so the set of spectra that end up spilled
     /// matches what normal ingestion would have kept.
@@ -455,7 +456,6 @@ impl MgfParser {
         file_index: usize,
         spill_dir: &Path,
         workflow: &WorkFlowManager,
-        filter_unknown_charge: bool,
         mass_bucket_min_da: f64,
         mass_bucket_max_da: f64,
         collect_filtered: bool,
@@ -530,9 +530,7 @@ impl MgfParser {
                     for op in workflow.operations() {
                         op.operate(std::slice::from_mut(&mut record), false);
                     }
-                    if record.peaks().is_empty()
-                        || (filter_unknown_charge && record.get_charge() == 0)
-                    {
+                    if record.peaks().is_empty() {
                         if collect_filtered {
                             filtered.push(SpectrumMetadata::from_record(&record, global_i, file_index));
                         }
@@ -868,14 +866,16 @@ mod mgf_parser_tests {
     }
 
     #[test]
-    fn zero_or_missing_charge_takes_sign_from_ionmode() {
+    fn zero_or_missing_charge_stays_unknown_without_isotope_evidence() {
         let neg_zero = "BEGIN IONS\nPEPMASS=300.0\nIONMODE=Negative\nCHARGE=0\n100.0 10.0\nEND IONS\n";
         let neg_missing = "BEGIN IONS\nPEPMASS=300.0\nIONMODE=negative\n100.0 10.0\nEND IONS\n";
         let pos_zero = "BEGIN IONS\nPEPMASS=300.0\nIONMODE=Positive\nCHARGE=0\n100.0 10.0\nEND IONS\n";
+        let neg_z2 = "BEGIN IONS\nPEPMASS=500.0\nIONMODE=negative\nCHARGE=0\n100.0 10.0\n500.5017 25.0\nEND IONS\n";
         for parse_metadata in [true, false] {
-            assert_eq!(block_charge(neg_zero, parse_metadata), -1);
-            assert_eq!(block_charge(neg_missing, parse_metadata), -1);
-            assert_eq!(block_charge(pos_zero, parse_metadata), 1);
+            assert_eq!(block_charge(neg_zero, parse_metadata), 0);
+            assert_eq!(block_charge(neg_missing, parse_metadata), 0);
+            assert_eq!(block_charge(pos_zero, parse_metadata), 0);
+            assert_eq!(block_charge(neg_z2, parse_metadata), -2);
         }
     }
 
@@ -896,11 +896,11 @@ mod mgf_parser_tests {
 
     #[test]
     fn recovered_charge_is_written_to_metadata_once() {
-        let block = "BEGIN IONS\nPEPMASS=300.0\nIONMODE=negative\nCHARGE=0\n100.0 10.0\nEND IONS\n";
+        let block = "BEGIN IONS\nPEPMASS=500.0\nIONMODE=negative\nCHARGE=0\n100.0 10.0\n500.5017 25.0\nEND IONS\n";
         let rec = MgfParser::parse_block_slice(block.as_bytes(), 0, true).unwrap();
         let charges: Vec<_> = rec.metadata().iter().filter(|(k, _)| k == "CHARGE").collect();
         assert_eq!(charges.len(), 1);
-        assert_eq!(charges[0].1, "-1");
+        assert_eq!(charges[0].1, "-2");
     }
 
     #[test]

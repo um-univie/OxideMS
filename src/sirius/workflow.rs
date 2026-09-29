@@ -534,7 +534,9 @@ impl SiriusClusteringWorkflow {
             WorkflowPreset::Metabolomics => SpectralExperiment::metabolomics(),
             WorkflowPreset::Proteomics => SpectralExperiment::proteomics(),
         };
-        experiment.filter_unknown_charge = self.config.filter_unknown_charge;
+        if self.config.filter_unknown_charge {
+            experiment.workflow.add_operation(crate::workflow::DropUnknownCharge::new());
+        }
 
         experiment.ingest_file(&path_str);
         let total_ingested = experiment.total_spectra_ingested;

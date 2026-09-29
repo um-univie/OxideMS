@@ -204,7 +204,6 @@ fn run_config(
         parser: MgfParser::default(),
         engine,
         spectra: all_spectra,
-        filter_unknown_charge: false,
         total_spectra_ingested: total_raw,
         ..Default::default()
     };

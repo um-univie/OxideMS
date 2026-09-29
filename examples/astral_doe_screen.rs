@@ -1,6 +1,6 @@
 //! Full 8-factor 2-level factorial DOE screen (256 runs) against the real
-//! Astral dataset (tests/Astral, charge-filtered by the default
-//! filter_unknown_charge=true, same as every other preset), scored via the
+//! Astral dataset (tests/Astral; unknown charges are kept and clustered only
+//! with each other, as in every preset), scored via the
 //! MS-RT proxy (calculate_n10_value / average_weighted_cluster_purity --
 //! the same internal ground truth mechanism astral_figures.rs already uses
 //! for the eps-only sweep, just extended to all 8 factors).
