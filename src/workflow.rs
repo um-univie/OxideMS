@@ -995,18 +995,20 @@ impl SingleOperation for RemovePrecursor {
             .and_then(|mz_str| mz_str.split_whitespace().next())
             .and_then(|s| s.parse::<f64>().ok());
 
-        let precursor_charge = spectrum.get_charge();
-
         let Some(mz_val) = precursor_mz else {
             return;
         };
 
-        let adduct_mass = 1.007825;
+        // Negative and unknown (0) charges have a precursor peak too: treat an
+        // unknown charge as 1, and add or remove the proton by polarity.
+        let precursor_charge = spectrum.get_charge();
+        let max_charge = precursor_charge.unsigned_abs().max(1);
+        let adduct_mass = 1.007825 * if precursor_charge < 0 { -1.0 } else { 1.0 };
         let c_mass_diff = 1.003355;
-        let neutral_mass = (mz_val - adduct_mass) * (precursor_charge as f64);
+        let neutral_mass = (mz_val - adduct_mass) * (max_charge as f64);
 
         let mut remove_mzs = Vec::new();
-        for charge in (1..=precursor_charge).rev() {
+        for charge in (1..=max_charge).rev() {
             for iso in 0..=self.isotopes {
                 let mz =
                     (neutral_mass + (iso as f64 * c_mass_diff)) / (charge as f64) + adduct_mass;
@@ -2195,5 +2197,30 @@ mod deisotope_intensity_inversion_regression_test {
         assert_eq!(s.peaks().len(), 1);
         let merged = s.peaks().iter().find(|p| (p.mz - 500.0).abs() < 1e-6).unwrap();
         assert!((merged.intensity - 1350.0).abs() < 1e-3);
+    }
+}
+
+#[cfg(test)]
+mod remove_precursor_tests {
+    use super::*;
+
+    fn precursor_test_spectrum(charge: i8, precursor_mz: f64) -> MassSpectralRecord {
+        let mut s = MassSpectralRecord::new(
+            vec![Peak::new(100.0, 1.0), Peak::new(precursor_mz, 1.0), Peak::new(precursor_mz + 1.003355, 1.0)],
+            charge,
+            0,
+        );
+        s.insert_metadata("PEPMASS", &precursor_mz.to_string());
+        s
+    }
+
+    #[test]
+    fn precursor_is_removed_for_unknown_and_negative_charges() {
+        for charge in [0i8, 1, -1] {
+            let mut s = precursor_test_spectrum(charge, 400.0);
+            RemovePrecursor::new(MassTolerance::Da(0.05), 1).operate_single(&mut s);
+            let mzs: Vec<f64> = s.peaks().iter().map(|p| p.mz).collect();
+            assert_eq!(mzs, vec![100.0], "charge {charge}");
+        }
     }
 }
