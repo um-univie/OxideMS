@@ -1284,23 +1284,7 @@ impl SpectralExperiment {
     /// `self.engine`'s happen to be. Lets partitions be clustered
     /// concurrently without contending on `self.engine`'s shared buffers.
     fn engine_like_self(&self) -> ClusterEngine {
-        let mut engine = ClusterEngine::default();
-        engine.mz_tolerance = self.engine.mz_tolerance;
-        engine.rt_tolerance = self.engine.rt_tolerance;
-        engine.epsilon = self.engine.epsilon;
-        engine.batch_size_threshold = self.engine.batch_size_threshold;
-        engine.approximate_threshold = self.engine.approximate_threshold;
-        engine.exact = self.engine.exact;
-        engine.min_neighbors = self.engine.min_neighbors;
-        engine.min_shared_peaks = self.engine.min_shared_peaks;
-        engine.representative_floor = self.engine.representative_floor;
-        engine.hasher = SpectrumHasher::new(
-            self.engine.hasher.min_mz,
-            self.engine.hasher.max_mz,
-            self.engine.hasher.tolerance,
-            self.engine.hasher.hash_len,
-        );
-        engine
+        self.engine.settings_copy()
     }
 
     /// Full low-memory pipeline: [`finalize_low_mem_partitions`](Self::finalize_low_mem_partitions),

@@ -1094,6 +1094,42 @@ impl ClusterEngine {
         self.hasher.recalculate_lookup_table();
     }
 
+    /// A new engine with the same settings and empty buffers, for clustering
+    /// independent partitions in parallel (the low-mem path). Every field is
+    /// listed, so a new setting cannot be left out silently. GPU offloading
+    /// and progress output stay off: one GPU context cannot be shared across
+    /// the parallel partitions, and per-partition progress would be noise.
+    pub(crate) fn settings_copy(&self) -> ClusterEngine {
+        ClusterEngine {
+            spectral_buffer: Vec::new(),
+            similarity_matrix_buffer: Vec::new(),
+            mz_tolerance: self.mz_tolerance,
+            rt_tolerance: self.rt_tolerance,
+            dense_bit_matrix: Vec::new(),
+            adaptive_alpha: self.adaptive_alpha,
+            null_tail: self.null_tail.clone(),
+            epsilon: self.epsilon,
+            batch_size_threshold: self.batch_size_threshold,
+            approximate_threshold: self.approximate_threshold,
+            hasher: SpectrumHasher::new(
+                self.hasher.min_mz,
+                self.hasher.max_mz,
+                self.hasher.tolerance,
+                self.hasher.hash_len,
+            ),
+            exact: self.exact,
+            min_neighbors: self.min_neighbors,
+            min_shared_peaks: self.min_shared_peaks,
+            representative_floor: self.representative_floor,
+            use_gpu: false,
+            verbose: false,
+            fast_batches: Vec::new(),
+            slow_batches: Vec::new(),
+            #[cfg(feature = "gpu")]
+            gpu: None,
+        }
+    }
+
     fn representative_floor(&self) -> Option<RepresentativeFloor> {
         self.representative_floor.map(|min_cosine| RepresentativeFloor {
             min_cosine,
@@ -2519,5 +2555,43 @@ mod representative_tests {
         assert_eq!(n, 1);
         assert_eq!(assignments.iter().map(|a| (a.0, a.1)).collect::<Vec<_>>(), vec![(0, 10), (0, 11)]);
         assert!(assignments.iter().all(|a| a.2.is_nan()));
+    }
+}
+
+#[cfg(test)]
+mod settings_copy_tests {
+    use super::*;
+
+    #[test]
+    fn settings_copy_keeps_every_setting() {
+        let mut engine = ClusterEngine::default();
+        engine.mz_tolerance = MassTolerance::Da(0.02);
+        engine.rt_tolerance = Some(30.0);
+        engine.adaptive_alpha = Some(0.01);
+        engine.null_tail = Some(vec![(0.5, -2.0), (0.9, -6.0)]);
+        engine.epsilon = 0.2;
+        engine.batch_size_threshold = 7;
+        engine.approximate_threshold = 9;
+        engine.set_mz_range(40.0, 2000.0);
+        engine.set_fragment_tolerance(MassTolerance::Ppm(10.0));
+        engine.set_hash_size(512);
+        engine.exact = true;
+        engine.min_neighbors = 3;
+        engine.min_shared_peaks = 4;
+        engine.representative_floor = Some(0.85);
+
+        let copy = engine.settings_copy();
+        assert!(matches!(copy.mz_tolerance, MassTolerance::Da(t) if t == 0.02));
+        assert_eq!(copy.rt_tolerance, Some(30.0));
+        assert_eq!(copy.adaptive_alpha, Some(0.01));
+        assert_eq!(copy.null_tail, engine.null_tail);
+        assert_eq!(copy.epsilon, 0.2);
+        assert_eq!((copy.batch_size_threshold, copy.approximate_threshold), (7, 9));
+        assert_eq!((copy.hasher.min_mz, copy.hasher.max_mz, copy.hasher.hash_len), (40.0, 2000.0, 512));
+        assert!(matches!(copy.hasher.tolerance, MassTolerance::Ppm(t) if t == 10.0));
+        assert_eq!(copy.hasher.lookup_table, engine.hasher.lookup_table);
+        assert!(copy.exact);
+        assert_eq!((copy.min_neighbors, copy.min_shared_peaks), (3, 4));
+        assert_eq!(copy.representative_floor, Some(0.85));
     }
 }
