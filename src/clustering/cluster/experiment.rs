@@ -15,10 +15,44 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Instant;
+
+/// Cross-platform positional read on an immutable file reference.
+trait PositionalRead {
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()>;
+}
+
+impl PositionalRead for File {
+    #[cfg(unix)]
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        FileExt::read_exact_at(self, buf, offset)
+    }
+
+    #[cfg(windows)]
+    fn read_exact_at(&self, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+        use std::os::windows::fs::FileExt;
+        while !buf.is_empty() {
+            match self.seek_read(buf, offset) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "failed to fill whole buffer",
+                    ))
+                }
+                Ok(n) => {
+                    buf = &mut buf[n..];
+                    offset += n as u64;
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Internal-validation quality metrics for a single cluster, computed against
 /// a consensus (mean, L2-renormalized) vector in the same hashed vector space
@@ -762,10 +796,11 @@ impl SpectralExperiment {
         let start_index = self.file_names.len();
 
         self.file_names.extend(paths.iter().map(|p| {
-            strip_spectral_extension(
-                p.split('/').last().expect("str::split always yields at least one item"),
-            )
-            .to_string()
+            let name = Path::new(p)
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or(p);
+            strip_spectral_extension(name).to_string()
         }));
         self.file_paths.extend(paths.iter().map(PathBuf::from));
 
@@ -880,15 +915,11 @@ impl SpectralExperiment {
 
     pub fn ingest_file(&mut self, file_path: &str) {
         let file_index = self.file_names.len();
-        self.file_names.push(
-            strip_spectral_extension(
-                file_path
-                    .split("/")
-                    .last()
-                    .expect("str::split always yields at least one item"),
-            )
-            .to_string(),
-        );
+        let file_name = Path::new(file_path)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or(file_path);
+        self.file_names.push(strip_spectral_extension(file_name).to_string());
         self.file_paths.push(PathBuf::from(file_path));
 
         let parsed = parse_spectral_file(file_path, true)
@@ -1100,15 +1131,11 @@ impl SpectralExperiment {
             ));
         }
         let file_index = self.file_names.len();
-        self.file_names.push(
-            strip_spectral_extension(
-                file_path
-                    .split("/")
-                    .last()
-                    .expect("str::split always yields at least one item"),
-            )
-            .to_string(),
-        );
+        let file_name = Path::new(file_path)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or(file_path);
+        self.file_names.push(strip_spectral_extension(file_name).to_string());
 
         let (keys, total_parsed, filtered) = self.parser.parse_file_low_mem(
             file_path,
