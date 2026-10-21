@@ -249,6 +249,7 @@ fn main() {
 
     // `--profile out.svg`: sample this process with pprof (SIGPROF, no perf
     // privileges needed) and write a flamegraph on the way out.
+    #[cfg(unix)]
     let guard = profile_out.as_ref().map(|_| {
         pprof::ProfilerGuardBuilder::default()
             .frequency(499)
@@ -256,6 +257,10 @@ fn main() {
             .build()
             .expect("start profiler")
     });
+    #[cfg(not(unix))]
+    if profile_out.is_some() {
+        eprintln!("warning: --profile is only supported on Unix targets; ignoring");
+    }
 
     let mut parser = MgfParser::default();
     let records = parser.parse_file(path).expect("parse mgf");
@@ -496,6 +501,7 @@ fn main() {
     out.push_str("\n]\n");
     fs::write(format!("{out_dir}/eval.json"), out).unwrap();
 
+    #[cfg(unix)]
     if let (Some(g), Some(path)) = (guard, profile_out.as_ref()) {
         let report = g.report().build().expect("build profile");
         let file = fs::File::create(path).expect("create flamegraph");
