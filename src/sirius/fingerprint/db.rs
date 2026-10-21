@@ -956,10 +956,11 @@ mod tests {
             contexts: vec![SampleContext::Plant, SampleContext::AllBio],
         });
 
-        let tmp_path = "/tmp/test_db_roundtrip.oxdb";
-        db.save_to_file(tmp_path).expect("Failed to save database");
+        let tmp_path = std::env::temp_dir().join("test_db_roundtrip.oxdb");
+        let tmp_path_str = tmp_path.to_str().expect("valid temp path");
+        db.save_to_file(tmp_path_str).expect("Failed to save database");
 
-        let loaded = StructureDatabase::load_from_file(tmp_path).expect("Failed to load database");
+        let loaded = StructureDatabase::load_from_file(tmp_path_str).expect("Failed to load database");
         assert_eq!(loaded.total_structures, 1);
         assert_eq!(loaded.scope, DatabaseScope::BioMetabolites);
 
@@ -970,6 +971,6 @@ mod tests {
         assert_eq!(cands[0].inchi_key.as_deref(), Some("CLXVBVLQKLQNRQ-UHFFFAOYSA-N"));
         assert_eq!(cands[0].contexts, vec![SampleContext::Plant, SampleContext::AllBio]);
 
-        let _ = std::fs::remove_file(tmp_path);
+        let _ = std::fs::remove_file(&tmp_path);
     }
 }
