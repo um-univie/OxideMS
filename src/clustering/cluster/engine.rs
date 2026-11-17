@@ -7,7 +7,10 @@ use crate::{
     MSNSpectrum, SpectrumHasher,
     clustering::{
         bitset::{BitSetOpsMSB0, WORDSIZE},
-        k_cluster_ivf::{Edge, WINDOWED_EDGES_BLOCK_SIZE, graph_dbscan, windowed_mass_edges},
+        k_cluster_ivf::{
+            Edge, IvfTraining, WINDOWED_EDGES_BLOCK_SIZE, graph_dbscan, windowed_mass_edges,
+            windowed_mass_edges_with,
+        },
     },
     workflow::MassTolerance,
 };
@@ -688,12 +691,193 @@ fn dense_labels_mass_filtered(
     )
 }
 
+/// What the shared neighbours of two linked spectra are measured against.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OverlapMeasure {
+    /// Against the union of the two neighbourhoods (Jaccard index).
+    #[default]
+    Jaccard,
+    /// Against the smaller neighbourhood. A spectrum on the rim of a group,
+    /// with few links that all lead into the group, then overlaps fully
+    /// with a spectrum at its centre, where the Jaccard index would be low.
+    Smaller,
+}
+
+/// [`ClusterEngine::min_neighbor_overlap`] with its measure.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct OverlapRule {
+    min_overlap: f32,
+    measure: OverlapMeasure,
+}
+
+#[cfg(test)]
+impl From<f32> for OverlapRule {
+    fn from(min_overlap: f32) -> Self {
+        Self { min_overlap, measure: OverlapMeasure::Jaccard }
+    }
+}
+
+/// Unions the linked pairs of one mass interval whose neighbourhoods overlap
+/// enough ([`ClusterEngine::min_neighbor_overlap`]).
+///
+/// A spectrum's neighbourhood is itself plus the interval members it is
+/// linked to; a link is kept when the overlap of its two ends'
+/// neighbourhoods, measured as [`OverlapMeasure`] says, reaches the minimum. Two replicates of one analyte share
+/// most of their neighbours, while a link bridging two otherwise separate
+/// groups shares almost none, so this cuts chains without touching dense
+/// groups or isolated pairs (whose index is 1).
+fn union_overlapping_neighbors(
+    uf: &mut UnionFind,
+    members: &[usize],
+    links: &BatchLinks,
+    position_in_interval: &mut [u32],
+    rule: OverlapRule,
+) {
+    let k = members.len();
+    let mut neighbors: Vec<Vec<u32>> = (0..k).map(|p| vec![p as u32]).collect();
+    match links {
+        BatchLinks::Adjacency(adj) => {
+            for (p, &member) in members.iter().enumerate() {
+                position_in_interval[member] = p as u32;
+            }
+            for (p, &member) in members.iter().enumerate() {
+                for &neighbor in &adj[member] {
+                    let q = position_in_interval[neighbor];
+                    if q != u32::MAX && q as usize != p {
+                        neighbors[p].push(q);
+                    }
+                }
+            }
+            for &member in members {
+                position_in_interval[member] = u32::MAX;
+            }
+        }
+        _ => {
+            for p in 0..k {
+                for q in (p + 1)..k {
+                    if links.linked(members[p], members[q]) {
+                        neighbors[p].push(q as u32);
+                        neighbors[q].push(p as u32);
+                    }
+                }
+            }
+        }
+    }
+    for list in neighbors.iter_mut() {
+        list.sort_unstable();
+        list.dedup();
+    }
+    for p in 0..k {
+        for &q in &neighbors[p] {
+            let q = q as usize;
+            // Only connectivity matters, so a link between two spectra that
+            // are already joined decides nothing. In a dense group almost
+            // every link is skipped here, which is what keeps this from
+            // costing links x neighbours.
+            if q <= p || uf.find(p) == uf.find(q) {
+                continue;
+            }
+            let (a, b) = (&neighbors[p], &neighbors[q]);
+            let needed = rule.shared_needed(a.len(), b.len());
+            if shares_at_least(a, b, needed) {
+                uf.union(p, q);
+            }
+        }
+    }
+}
+
+impl OverlapRule {
+    fn holds(&self, shared: usize, a: usize, b: usize) -> bool {
+        let against = match self.measure {
+            OverlapMeasure::Jaccard => a + b - shared,
+            OverlapMeasure::Smaller => a.min(b),
+        };
+        // In f64 with a margin, so that a pair sitting exactly on the
+        // minimum passes whatever the neighbourhood size: 0.3 as an f32 is
+        // slightly above 0.3, which would otherwise pass 3 of 10 and fail
+        // 30 of 100.
+        shared as f64 >= self.min_overlap as f64 * against as f64 * (1.0 - 1e-6)
+    }
+
+    /// Fewest shared neighbours with which two neighbourhoods of sizes `a`
+    /// and `b` overlap enough; more than `min(a, b)` when no count does.
+    /// [`Self::holds`] can only turn true as `shared` grows, so this is a
+    /// binary search over it.
+    fn shared_needed(&self, a: usize, b: usize) -> usize {
+        let (mut low, mut high) = (0, a.min(b) + 1);
+        while low < high {
+            let middle = (low + high) / 2;
+            if self.holds(middle, a, b) {
+                high = middle;
+            } else {
+                low = middle + 1;
+            }
+        }
+        low
+    }
+}
+
+/// Whether two sorted, deduplicated lists share at least `needed` values,
+/// stopping as soon as that is decided either way.
+fn shares_at_least(a: &[u32], b: &[u32], needed: usize) -> bool {
+    let (small, large) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    if needed == 0 {
+        return true;
+    }
+    if needed > small.len() {
+        return false;
+    }
+    let mut shared = 0;
+    if large.len() / 16 > small.len() {
+        // Lists of very different length: look each value of the short one
+        // up in what is left of the long one.
+        let mut rest = large;
+        for (done, value) in small.iter().enumerate() {
+            let at = rest.partition_point(|x| x < value);
+            rest = &rest[at..];
+            if rest.first() == Some(value) {
+                shared += 1;
+                if shared >= needed {
+                    return true;
+                }
+            } else if shared + (small.len() - done - 1) < needed {
+                return false;
+            }
+        }
+        return false;
+    }
+    let (mut x, mut y) = (0, 0);
+    while x < small.len() && y < large.len() {
+        match small[x].cmp(&large[y]) {
+            std::cmp::Ordering::Less => {
+                x += 1;
+                // `small[x - 1]` is in no later position of `large`.
+                if shared + (small.len() - x) < needed {
+                    return false;
+                }
+            }
+            std::cmp::Ordering::Greater => y += 1,
+            std::cmp::Ordering::Equal => {
+                shared += 1;
+                if shared >= needed {
+                    return true;
+                }
+                x += 1;
+                y += 1;
+            }
+        }
+    }
+    false
+}
+
 fn collect_and_refine(
     dbscan_labels: Vec<ClusterLabel>,
     spectra: &[MSNSpectrum],
     mz_tolerance: MassTolerance,
     links: &BatchLinks,
+    overlap_rule: impl Into<OverlapRule>,
 ) -> (Vec<(usize, u64)>, usize) {
+    let overlap_rule: OverlapRule = overlap_rule.into();
     let max_label = dbscan_labels
         .iter()
         .filter_map(|l| {
@@ -763,28 +947,32 @@ fn collect_and_refine(
             // the interval itself.
             let k = members.len();
             let mut uf = UnionFind::new(k);
-            match links {
-                BatchLinks::Adjacency(adj) => {
-                    for (p, &member) in members.iter().enumerate() {
-                        position_in_interval[member] = p as u32;
-                    }
-                    for (p, &member) in members.iter().enumerate() {
-                        for &neighbor in &adj[member] {
-                            let q = position_in_interval[neighbor];
-                            if q != u32::MAX {
-                                uf.union(p, q as usize);
+            if overlap_rule.min_overlap > 0.0 {
+                union_overlapping_neighbors(&mut uf, members, links, &mut position_in_interval, overlap_rule);
+            } else {
+                match links {
+                    BatchLinks::Adjacency(adj) => {
+                        for (p, &member) in members.iter().enumerate() {
+                            position_in_interval[member] = p as u32;
+                        }
+                        for (p, &member) in members.iter().enumerate() {
+                            for &neighbor in &adj[member] {
+                                let q = position_in_interval[neighbor];
+                                if q != u32::MAX {
+                                    uf.union(p, q as usize);
+                                }
                             }
                         }
+                        for &member in members {
+                            position_in_interval[member] = u32::MAX;
+                        }
                     }
-                    for &member in members {
-                        position_in_interval[member] = u32::MAX;
-                    }
-                }
-                _ => {
-                    for p in 0..k {
-                        for q in (p + 1)..k {
-                            if links.linked(members[p], members[q]) {
-                                uf.union(p, q);
+                    _ => {
+                        for p in 0..k {
+                            for q in (p + 1)..k {
+                                if links.linked(members[p], members[q]) {
+                                    uf.union(p, q);
+                                }
                             }
                         }
                     }
@@ -817,8 +1005,11 @@ fn collect_and_refine(
         // component of the same cluster -- one holding a spectrum it is
         // actually linked to -- could take it without breaking the
         // precursor-mass diameter rule.
+        // With the overlap rule on, most lone spectra were cut by the rule
+        // rather than by the mass split, and there can be a great many of
+        // them, so these diagnostics are skipped.
         for (ci, component) in group_components.iter().enumerate() {
-            if component.len() != 1 {
+            if component.len() != 1 || overlap_rule.min_overlap > 0.0 {
                 continue;
             }
             let orphan = component[0];
@@ -1121,6 +1312,9 @@ pub struct ClusterEngine {
     pub batch_size_threshold: usize,
     /// Threshold for switching to approximate graph-based clustering.
     pub approximate_threshold: usize,
+    /// How the IVF index is trained when a large batch has a neighbourhood
+    /// too dense for the windowed matmul (see `windowed_mass_edges`).
+    pub ivf_training: IvfTraining,
     /// Component used to vectorize sparse peaks.
     pub hasher: SpectrumHasher,
     /// Whether to use exact peak alignment instead of binning.
@@ -1130,6 +1324,13 @@ pub struct ClusterEngine {
     /// Minimum fragment peaks a pair must share to become an edge, on top of
     /// the cosine threshold; 0 turns the check off. See [`SharedPeaks`].
     pub min_shared_peaks: usize,
+    /// Minimum overlap (0 to 1) between the neighbourhoods of two linked
+    /// spectra for the link to hold a cluster together; 0 turns the check
+    /// off. See [`union_overlapping_neighbors`]. Has no effect on batches
+    /// clustered on the GPU, which hand over no links to check.
+    pub min_neighbor_overlap: f32,
+    /// What that overlap is measured against.
+    pub overlap_measure: OverlapMeasure,
     /// When set, every cluster gets a representative (its medoid) and
     /// members whose exact cosine to it is below this value are split off.
     /// `Some(0.0)` picks representatives without splitting.
@@ -1163,10 +1364,13 @@ impl Default for ClusterEngine {
             null_tail: None,
             batch_size_threshold: FAST_BATCH_NUMBER,
             approximate_threshold: LARGE_BATCH_THRESHOLD,
+            ivf_training: IvfTraining::default(),
             hasher: SpectrumHasher::new(101.0, 1500.0, MassTolerance::Da(0.05), hash_size),
             exact: false,
             min_neighbors: MIN_NEIGHBORS,
             min_shared_peaks: 0,
+            min_neighbor_overlap: 0.0,
+            overlap_measure: OverlapMeasure::default(),
             representative_floor: None,
             complete_linkage: false,
             use_gpu: false,
@@ -1210,6 +1414,10 @@ impl ClusterEngine {
         self.hasher.recalculate_lookup_table();
     }
 
+    fn overlap_rule(&self) -> OverlapRule {
+        OverlapRule { min_overlap: self.min_neighbor_overlap, measure: self.overlap_measure }
+    }
+
     /// A new engine with the same settings and empty buffers, for clustering
     /// independent partitions in parallel (the low-mem path). Every field is
     /// listed, so a new setting cannot be left out silently. GPU offloading
@@ -1227,6 +1435,7 @@ impl ClusterEngine {
             epsilon: self.epsilon,
             batch_size_threshold: self.batch_size_threshold,
             approximate_threshold: self.approximate_threshold,
+            ivf_training: self.ivf_training,
             hasher: SpectrumHasher::new(
                 self.hasher.min_mz,
                 self.hasher.max_mz,
@@ -1236,6 +1445,8 @@ impl ClusterEngine {
             exact: self.exact,
             min_neighbors: self.min_neighbors,
             min_shared_peaks: self.min_shared_peaks,
+            min_neighbor_overlap: self.min_neighbor_overlap,
+            overlap_measure: self.overlap_measure,
             representative_floor: self.representative_floor,
             complete_linkage: self.complete_linkage,
             use_gpu: false,
@@ -1681,7 +1892,7 @@ impl ClusterEngine {
                             words_per_vertex,
                         };
                         finish_clusters(
-                            collect_and_refine(labels, spectra, precursor_mz_tolerance, &links),
+                            collect_and_refine(labels, spectra, precursor_mz_tolerance, &links, self.overlap_rule()),
                             spectra,
                             self.cluster_post(spectra),
                         )
@@ -1758,6 +1969,7 @@ impl ClusterEngine {
                                     spectra,
                                     precursor_mz_tolerance,
                                     &links,
+                                    self.overlap_rule(),
                                 ),
                                 spectra,
                                 self.cluster_post(spectra),
@@ -1817,7 +2029,7 @@ impl ClusterEngine {
                             min_similarity: threshold,
                         };
                         finish_clusters(
-                            collect_and_refine(labels, spectra, precursor_mz_tolerance, &links),
+                            collect_and_refine(labels, spectra, precursor_mz_tolerance, &links, self.overlap_rule()),
                             spectra,
                             self.cluster_post(spectra),
                         )
@@ -1909,7 +2121,7 @@ impl ClusterEngine {
                     words_per_vertex,
                 };
                 let result = finish_clusters(
-                    collect_and_refine(labels, spectra, precursor_mz_tolerance, &links),
+                    collect_and_refine(labels, spectra, precursor_mz_tolerance, &links, self.overlap_rule()),
                     spectra,
                     self.cluster_post(spectra),
                 );
@@ -1932,7 +2144,7 @@ impl ClusterEngine {
             None => BatchLinks::Unavailable,
         };
         finish_clusters(
-            collect_and_refine(dbscan_labels, spectra, precursor_mz_tolerance, &links),
+            collect_and_refine(dbscan_labels, spectra, precursor_mz_tolerance, &links, self.overlap_rule()),
             spectra,
             self.cluster_post(spectra),
         )
@@ -1969,7 +2181,7 @@ impl ClusterEngine {
                 hasher.into_vector_native(spectrum.spectrum.peaks.as_slice(), true, buf);
             });
         let neutral_masses: Vec<f64> = spectra.iter().map(|s| s.get_neutral_mass()).collect();
-        let edges = windowed_mass_edges(
+        let edges = windowed_mass_edges_with(
             &self.spectral_buffer,
             hash_size,
             &neutral_masses,
@@ -1982,6 +2194,7 @@ impl ClusterEngine {
             // genuinely dense local neighborhood (not chaining), which is
             // exactly the ANN problem IVF exists for.
             self.approximate_threshold,
+            self.ivf_training,
         );
         let mut edges = edges;
         if let Some(shared) = SharedPeaks::new(spectra, self.hasher.tolerance, self.min_shared_peaks) {
@@ -2286,11 +2499,109 @@ mod connectivity_tests {
         );
         let _ = take_connectivity_stats();
         let (assignments, n_clusters) =
-            collect_and_refine(labels, &spectra, MassTolerance::Da(0.01), &links);
+            collect_and_refine(labels, &spectra, MassTolerance::Da(0.01), &links, 0.0);
         assert_eq!(n_clusters, 2, "the mass split should produce two intervals");
         assert_eq!(assignments.len(), 4, "every spectrum stays clustered");
         let (_, split, dropped) = take_connectivity_stats();
         assert_eq!((split, dropped), (0, 0));
+    }
+
+    /// Two groups of four, every pair inside a group linked, joined by a
+    /// single link. Plain connectivity chains all eight together; requiring
+    /// neighbourhood overlap drops the bridge (it shares 2 of 8 neighbours)
+    /// and keeps both groups whole (their links share 4 of 5 or more).
+    #[test]
+    fn neighbor_overlap_cuts_a_bridge_between_two_groups() {
+        let _guard = COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let spectra: Vec<MSNSpectrum> = (0..8).map(|i| spectrum(i, 500.0, 2)).collect();
+        let mut edges = Vec::new();
+        for group in [0usize, 4] {
+            for i in group..group + 4 {
+                for j in (i + 1)..group + 4 {
+                    edges.push(Edge { source_id: i, target_id: j, score: 1.0 });
+                }
+            }
+        }
+        edges.push(Edge { source_id: 3, target_id: 4, score: 1.0 });
+        let links = BatchLinks::from_edges(8, &edges);
+        let clusters = |min_overlap: f32| {
+            let labels = vec![ClusterLabel::Cluster(0); 8];
+            collect_and_refine(labels, &spectra, MassTolerance::Da(0.01), &links, min_overlap).1
+        };
+        assert_eq!(clusters(0.0), 1);
+        assert_eq!(clusters(0.3), 2);
+    }
+
+    #[test]
+    fn shares_at_least_agrees_with_counting() {
+        let mut state = 0x9E3779B97F4A7C15u64;
+        let mut next = move |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        for _ in 0..4000 {
+            let range = 1 + next(300);
+            let (len_a, len_b) = (next(400), next(12));
+            let mut list = |len: u64| {
+                let mut values: Vec<u32> = (0..len).map(|_| next(range) as u32).collect();
+                values.sort_unstable();
+                values.dedup();
+                values
+            };
+            let (a, b) = (list(len_a), list(len_b));
+            let shared = a.iter().filter(|v| b.binary_search(v).is_ok()).count();
+            for needed in [0, 1, shared.saturating_sub(1), shared, shared + 1, b.len(), b.len() + 1] {
+                assert_eq!(shares_at_least(&a, &b, needed), shared >= needed, "{a:?} {b:?} {needed}");
+                assert_eq!(shares_at_least(&b, &a, needed), shared >= needed);
+            }
+            for measure in [OverlapMeasure::Jaccard, OverlapMeasure::Smaller] {
+                for min_overlap in [0.1, 0.5, 0.6, 1.0] {
+                    let rule = OverlapRule { min_overlap, measure };
+                    let needed = rule.shared_needed(a.len(), b.len());
+                    assert_eq!(shared >= needed, rule.holds(shared, a.len(), b.len()));
+                }
+            }
+        }
+    }
+
+    /// Two groups of four, a spectrum linked to two members of each, and a
+    /// spectrum on the rim of the first group with a single link into it.
+    #[test]
+    fn overlap_against_the_smaller_neighbourhood_keeps_rim_spectra() {
+        let _guard = COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let spectra: Vec<MSNSpectrum> = (0..10).map(|i| spectrum(i, 500.0, 2)).collect();
+        let mut edges = Vec::new();
+        for group in [0usize, 4] {
+            for i in group..group + 4 {
+                for j in (i + 1)..group + 4 {
+                    edges.push(Edge { source_id: i, target_id: j, score: 1.0 });
+                }
+            }
+        }
+        for target in [0usize, 1, 4, 5] {
+            edges.push(Edge { source_id: 8, target_id: target, score: 1.0 });
+        }
+        edges.push(Edge { source_id: 9, target_id: 0, score: 1.0 });
+        let links = BatchLinks::from_edges(10, &edges);
+        let cluster_of = |measure: OverlapMeasure| {
+            let labels = vec![ClusterLabel::Cluster(0); 10];
+            let rule = OverlapRule { min_overlap: 0.7, measure };
+            let (assignments, _) = collect_and_refine(labels, &spectra, MassTolerance::Da(0.01), &links, rule);
+            // Spectra left alone are not assigned; give each its own value.
+            let mut cluster_of: Vec<usize> = (100..110).collect();
+            for (cluster, id) in assignments {
+                cluster_of[id as usize] = cluster;
+            }
+            cluster_of
+        };
+        let smaller = cluster_of(OverlapMeasure::Smaller);
+        assert_eq!(smaller[9], smaller[0], "the rim spectrum stays with its group");
+        assert_ne!(smaller[0], smaller[4], "the two groups stay apart");
+        assert!(smaller[8] != smaller[0] && smaller[8] != smaller[4], "the spectrum between them joins neither");
+        let jaccard = cluster_of(OverlapMeasure::Jaccard);
+        assert_ne!(jaccard[9], jaccard[0], "the Jaccard index drops the rim spectrum");
     }
 
     /// The failure the re-check exists for: spectra 0 and 2 are close in
@@ -2316,7 +2627,7 @@ mod connectivity_tests {
         let labels = vec![ClusterLabel::Cluster(0); 3];
         let _ = take_connectivity_stats();
         let (assignments, n_clusters) =
-            collect_and_refine(labels, &spectra, MassTolerance::Da(0.01), &links);
+            collect_and_refine(labels, &spectra, MassTolerance::Da(0.01), &links, 0.0);
         let (_, split, dropped) = take_connectivity_stats();
         assert_eq!(split, 1, "the interval holding 0 and 2 is not connected");
         assert_eq!(
@@ -2520,6 +2831,7 @@ mod connectivity_tests {
             &spectra,
             MassTolerance::Da(0.01),
             &BatchLinks::Unavailable,
+            0.0,
         );
         let (_, split, dropped) = take_connectivity_stats();
         assert_eq!((split, dropped), (0, 0), "no re-check runs without links");
