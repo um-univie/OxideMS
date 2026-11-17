@@ -17,7 +17,7 @@ use super::formula::Formula;
 use super::generator::FormulaGenerator;
 use super::rules::ChemicalRules;
 use super::scoring::{FormulaScorer, calculate_isotope_distribution};
-use super::solver::{FragmentationTreeBuilder, TreeSolverConfig};
+use super::solver::{FragmentationTreeBuilder, SolverKind, TreeSolverConfig};
 use super::tree::FragmentationTree;
 use crate::clustering::cluster::experiment::SpectralExperiment;
 use crate::clustering::cluster::flat_clusters::FlatClusters;
@@ -521,6 +521,20 @@ impl SiriusClusteringWorkflow {
     /// Sets whether to filter out peaks at or above precursor m/z (+ 0.5 Da) prior to fragment tree search.
     pub fn with_filter_peaks_above_precursor(mut self, filter: bool) -> Self {
         self.config.filter_peaks_above_precursor = filter;
+        self
+    }
+
+    /// Sets the fragmentation-tree solver. With `exact_top_n = Some(n)`, a fast
+    /// first pass ranks the candidates and only the best `n` are re-solved with
+    /// `solver`. The default (`Exact`, no shortlist) falls back to the
+    /// Critical-Path heuristic on trees with more than 14 colours, which at a
+    /// 60-peak budget is most spectra; `SolverKind::Ilp` with `Some(20)` is the
+    /// configuration the published formula accuracy was measured with.
+    pub fn with_solver(mut self, solver: SolverKind, exact_top_n: Option<usize>) -> Self {
+        let mut tree_config = self.tree_builder.config().clone();
+        tree_config.solver = solver;
+        tree_config.exact_top_n = exact_top_n;
+        self.tree_builder = FragmentationTreeBuilder::new(tree_config);
         self
     }
 

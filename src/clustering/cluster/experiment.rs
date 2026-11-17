@@ -220,10 +220,7 @@ fn log_partition_timing_summary(stats: &[PartitionStats], overall_elapsed: std::
     }
 }
 
-/// Known spectral file extensions, in the order checked. Both parsers return
-/// the same `Vec<MassSpectralRecord>`, so callers can treat any mix of
-/// these formats identically once parsed.
-const SPECTRAL_FILE_EXTENSIONS: [&str; 3] = ["mgf", "mzml", "mzML"];
+use crate::io::SPECTRAL_FILE_EXTENSIONS;
 
 /// Column header of the cluster results CSV.
 const RESULTS_CSV_COLUMNS: &str =
@@ -369,22 +366,7 @@ fn strip_spectral_extension(file_stem: &str) -> &str {
     file_stem
 }
 
-/// Parses a single spectral file with the parser matching its extension
-/// (case-insensitive on `.mzml`/`.mzML`; `.mgf` otherwise). `parallel`
-/// controls each parser's own internal per-file parallelism -- pass `false`
-/// when the caller already parallelizes across files (e.g. rayon over
-/// multiple files at once), to avoid oversubscribing threads.
-fn parse_spectral_file(path: &str, parallel: bool) -> io::Result<Vec<MassSpectralRecord>> {
-    if path.to_lowercase().ends_with(".mzml") {
-        let mut config = MzmlParserConfig::default();
-        config.use_parallel_parsing = parallel;
-        MzmlParser::new(config).parse_file(path)
-    } else {
-        let mut parser = MgfParser::default();
-        parser.config.use_parallel_parsing = parallel;
-        parser.parse_file(path)
-    }
-}
+use crate::io::read_spectra as parse_spectral_file;
 
 /// Pulls the MS1 survey scans (`ms_level == 1`) out of a freshly parsed record
 /// list, converting them to [`Ms1Scan`] for `file_index`, and returns the

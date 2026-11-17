@@ -12,7 +12,7 @@ The library targets large-scale experiments — hundreds of MGF files, millions 
 
 ## Features
 
-- **Parsing** — fast, memory-mapped MGF parser with parallel ingestion across files
+- **Parsing** — fast, memory-mapped MGF and mzML parsers with parallel ingestion across files
 - **Workflow** — composable preprocessing pipeline with 16 built-in operations and parallelism via Rayon
 - **Clustering** — DBSCAN over cosine similarity with exact (sparse matrix) and approximate (hashed) modes
 - **Plotting** — single/mirror spectrum plots and a full batch of experiment-level diagnostic charts
@@ -40,11 +40,30 @@ should turn it off:
 oxidems_lib = { git = "https://github.com/um-univie/OxideMS", branch = "main", default-features = false }
 ```
 
+## Command-line tool
+
+The `cli` feature builds an `oxidems` binary for quick work on spectral files.
+Clustering has its own CLI, [RedshiftMS](https://github.com/um-univie/RedshiftMS).
+
+```bash
+cargo install --git https://github.com/um-univie/OxideMS --features cli
+
+oxidems info data/                        # spectra per MS level, charges, m/z and RT ranges
+oxidems convert run.mzML -o run.mgf       # MS/MS spectra to MGF (--ms-level 0 keeps all)
+oxidems formula 195.0877                  # formulas for an [M+H]+ ion within 5 ppm
+oxidems annotate library.mgf -o out.csv   # top formulas per MS/MS spectrum by tree score
+```
+
+`annotate` scores every candidate formula with a fragmentation tree and, by
+default, re-solves the 20 best exactly (`--solver ilp --exact-top-n 20`). It
+uses the precursor m/z as measured. Run `oxidems <command> --help` for the
+options.
+
 ---
 
 ## Parsing
 
-MGF (Mascot Generic Format) and mzML are both supported input formats, dispatched automatically by file extension — a single input folder may freely mix `.mgf` and `.mzML` files. Both parsers use memory-mapped I/O with no intermediate string allocations, making them suitable for very large files.
+MGF (Mascot Generic Format) and mzML are both supported input formats, dispatched automatically by file extension (`oxidems_lib::io::read_spectra`) — a single input folder may freely mix `.mgf` and `.mzML` files. Both parsers use memory-mapped I/O with no intermediate string allocations, making them suitable for very large files.
 
 ```rust
 use oxidems_lib::io::mgf::MgfParser;
