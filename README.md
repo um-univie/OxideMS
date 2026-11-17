@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="logo.png" alt="OxideMS" width="320"/>
+  <img src="https://raw.githubusercontent.com/um-univie/OxideMS/main/logo.png" alt="OxideMS" width="320"/>
 </p>
 
 <p align="center">High-performance mass spectrometry data processing and clustering in Rust.</p>
@@ -328,5 +328,7 @@ This module is under active development and the API is not yet stable.
 
 OxideMS is MIT-licensed (see [LICENSE](LICENSE)), except four files in
 `src/sirius/` that are ported from SIRIUS and are licensed under the
-LGPL-3.0-or-later. [ATTRIBUTION.md](ATTRIBUTION.md) lists them along with all
+LGPL-3.0-or-later. They are only compiled with the `sirius` feature (on by
+default); RedshiftMS and other clustering-only users who disable it build
+nothing but MIT code. [ATTRIBUTION.md](ATTRIBUTION.md) lists them along with all
 other third-party attributions.

@@ -19,7 +19,9 @@ option) any later version, and not under the MIT license:
 The license texts are in `LICENSES/LGPL-3.0-or-later.txt` and
 `LICENSES/GPL-3.0-or-later.txt` (the LGPL grants additional permissions on top
 of the GPL, so both apply). Each file starts with a notice naming the original
-copyright holders and stating that it was modified.
+copyright holders and stating that it was modified. These files are only
+compiled with the `sirius` Cargo feature (on by default); a build with
+`default-features = false` contains no LGPL code.
 
 SIRIUS is developed by the Chair of Bioinformatics, Friedrich-Schiller
 University Jena. The source files these ports come from carry the notice
@@ -82,6 +84,11 @@ chemical taxonomy (identifiers, names and parent relations of 81 classes):
 > Djoumbou Feunang, Y. et al. *ClassyFire: automated chemical classification
 > with a comprehensive, computable taxonomy.* J. Cheminform. **8**, 61 (2016).
 > <https://doi.org/10.1186/s13321-016-0174-y>
+
+## Tuffy font
+
+`src/assets/Tuffy.ttf`, embedded by `src/plotting.rs` for plot labels, is the
+Tuffy typeface by Thatcher Ulrich, released into the public domain.
 
 ## Everything else
 

@@ -3,6 +3,19 @@ name = "oxidems_lib"
 version = "0.1.1"
 edition = "2024"
 license = "MIT AND LGPL-3.0-or-later"
+description = "Spectral clustering and SIRIUS-style annotation for mass spectrometry"
+repository = "https://github.com/um-univie/OxideMS"
+# Only source and license files are published; scratch/, data and experiment
+# outputs stay out of the crate.
+include = [
+    "/src/**",
+    "/examples/**",
+    "/benches/**",
+    "/LICENSE",
+    "/LICENSES/**",
+    "/ATTRIBUTION.md",
+    "/README.md",
+]
 
 [dependencies]
 similarity = "0.2.0"
@@ -65,7 +78,9 @@ pprof = { version = "0.15.0", features = ["flamegraph"] }
 default = ["sirius"]
 # SIRIUS-style annotation (fragmentation trees, fingerprint prediction). Pulls
 # in candle, good_lp and the sibling oxidane crate; clustering-only users such
-# as RedshiftMS disable it.
+# as RedshiftMS disable it. Includes the files ported from SIRIUS, which are
+# LGPL-3.0-or-later (see ATTRIBUTION.md); without this feature the build is
+# MIT only.
 sirius = ["dep:candle-core", "dep:candle-nn", "dep:good_lp", "dep:oxidane"]
 gpu = ["dep:wgpu", "dep:pollster"]
 # plotting = ["dep:plotters"]
