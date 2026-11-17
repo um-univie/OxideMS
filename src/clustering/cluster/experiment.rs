@@ -349,19 +349,21 @@ fn csv_field(value: &str) -> std::borrow::Cow<'_, str> {
 }
 
 fn has_known_spectral_extension(path: &str) -> bool {
-    SPECTRAL_FILE_EXTENSIONS
-        .iter()
-        .any(|ext| path.ends_with(&format!(".{ext}")))
+    Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            SPECTRAL_FILE_EXTENSIONS.iter().any(|known| ext.eq_ignore_ascii_case(known))
+        })
 }
 
 /// Strips whichever known spectral extension a filename ends with, for
 /// deriving a display/lookup name from a file path (e.g. "run1.mzML" ->
 /// "run1"). Falls back to the original name unchanged if none match.
 fn strip_spectral_extension(file_stem: &str) -> &str {
-    for ext in SPECTRAL_FILE_EXTENSIONS {
-        let suffix = format!(".{ext}");
-        if let Some(stripped) = file_stem.strip_suffix(&suffix) {
-            return stripped;
+    if let Some((stem, ext)) = file_stem.rsplit_once('.') {
+        if SPECTRAL_FILE_EXTENSIONS.iter().any(|known| ext.eq_ignore_ascii_case(known)) {
+            return stem;
         }
     }
     file_stem
@@ -778,6 +780,9 @@ impl SpectralExperiment {
             .unwrap_or_else(|e| panic!("cannot read directory {folder_path:?}: {e}"))
             .filter_map(|e| {
                 let path = e.ok()?.path();
+                if !path.is_file() {
+                    return None;
+                }
                 let s = path.to_str()?.to_string();
                 if has_known_spectral_extension(&s) { Some(s) } else { None }
             })
@@ -1084,7 +1089,7 @@ impl SpectralExperiment {
                 .unwrap_or_else(|e| panic!("error reading entry in {folder_path:?}: {e}"))
                 .path();
             if let Some(path_str) = file_path.to_str() {
-                if !path_str.ends_with(".mgf") {
+                if !file_path.is_file() || !has_known_spectral_extension(path_str) {
                     continue;
                 }
                 self.ingest_file(path_str);
