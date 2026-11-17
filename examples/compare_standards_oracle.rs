@@ -70,17 +70,17 @@ fn main() {
 
     let standards = [
         (
-            "/scratch/muhlir/downloads/ms-pred/data/exp_specs/clinical/hercynine_standard.ms",
+            "hercynine_standard.ms",
             "C9H15N3O2",
             "Hercynine",
         ),
         (
-            "/scratch/muhlir/downloads/ms-pred/data/exp_specs/clinical/gaba_arg_standard.ms",
+            "gaba_arg_standard.ms",
             "C10H21N5O3",
             "GABA-Arg",
         ),
         (
-            "/scratch/muhlir/downloads/ms-pred/data/exp_specs/clinical/lpc19-0_standard.ms",
+            "lpc19-0_standard.ms",
             "C27H56NO7P",
             "LPC 19:0 (Lipid)",
         ),
@@ -89,7 +89,15 @@ fn main() {
     let tolerance = MassTolerance::Ppm(15.0);
     let rules = ChemicalRules::default();
 
-    for (path, formula_str, label) in standards {
+    // The standards ship with ms-pred (data/exp_specs/clinical/).
+    let ms_pred_dir = std::env::var("MS_PRED_DIR").unwrap_or_else(|_| {
+        eprintln!("set MS_PRED_DIR to an ms-pred checkout");
+        std::process::exit(2)
+    });
+    for (file_name, formula_str, label) in standards {
+        let path_buf = std::path::Path::new(&ms_pred_dir).join("data/exp_specs/clinical").join(file_name);
+        let path = path_buf.to_string_lossy();
+        let path = path.as_ref();
         println!("-------------------------------------------------------------------------");
         println!("Analyzing Standard: {} (Ground Truth: {})", label, formula_str);
         println!("File: {}", path);

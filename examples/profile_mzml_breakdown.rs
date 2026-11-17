@@ -8,7 +8,8 @@ use std::time::Instant;
 
 fn main() {
     let path = std::env::args().nth(1).unwrap_or_else(|| {
-        "/scratch/muhlir/data/mass_spec_data/MSV000093526_mzML/001_Blk_Water_POS.mzML".to_string()
+        eprintln!("usage: profile_mzml_breakdown <input .mzML>");
+        std::process::exit(2)
     });
 
     println!("=========================================================================");

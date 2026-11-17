@@ -9,6 +9,16 @@ use oxidems_lib::sirius::fingerprint::{
 use std::path::Path;
 use std::time::Instant;
 
+/// A file in the directory named by OXIDEMS_MOLECULES_DIR (PubChem CID-SMILES,
+/// COCONUT4MetFrag.csv, HMDB4.csv).
+fn molecules_file(name: &str) -> String {
+    let dir = std::env::var("OXIDEMS_MOLECULES_DIR").unwrap_or_else(|_| {
+        eprintln!("set OXIDEMS_MOLECULES_DIR to the directory holding {name}");
+        std::process::exit(2)
+    });
+    std::path::Path::new(&dir).join(name).to_string_lossy().into_owned()
+}
+
 fn main() {
     println!("=========================================================================");
     println!("       OxideMS Pre-Indexed Binary Database (.oxdb) Builder Tool          ");
@@ -48,7 +58,8 @@ fn main() {
         );
     }
 
-    let coconut_csv = "/var/home/manu/projects/molecules-data/COCONUT4MetFrag.csv";
+    let coconut_csv_owned = molecules_file("COCONUT4MetFrag.csv");
+    let coconut_csv = coconut_csv_owned.as_str();
     println!("\n[2/3] Ingesting COCONUT Natural Products from {} (412k compounds)...", coconut_csv);
     if Path::new(coconut_csv).exists() {
         let t_start = Instant::now();
@@ -64,7 +75,8 @@ fn main() {
         );
     }
 
-    let hmdb_csv = "/var/home/manu/projects/molecules-data/HMDB4.csv";
+    let hmdb_csv_owned = molecules_file("HMDB4.csv");
+    let hmdb_csv = hmdb_csv_owned.as_str();
     println!("\n[3/3] Ingesting HMDB Human Metabolites from {} (114k compounds)...", hmdb_csv);
     if Path::new(hmdb_csv).exists() {
         let t_start = Instant::now();
@@ -105,7 +117,8 @@ fn main() {
     );
 
     // 2. Build & Save PubChem Candidate Database
-    let pubchem_path = "/var/home/manu/projects/molecules-data/CID-SMILES";
+    let pubchem_path_owned = molecules_file("CID-SMILES");
+    let pubchem_path = pubchem_path_owned.as_str();
     let pubchem_oxdb_path = "models/pubchem_subset.oxdb";
 
     println!("\n[2/2] Building PubChem Candidate Database from {} (100,000 molecules with Rayon)...", pubchem_path);

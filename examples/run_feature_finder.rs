@@ -3,12 +3,10 @@ use std::env;
 use std::time::Instant;
 
 fn main() {
-    let default_file = "/scratch/muhlir/data/mass_spec_data/MSV000080554_mzML/A10_GA10_01_7891.mzML";
     let args: Vec<String> = env::args().collect();
-    let mzml_path = if args.len() > 1 {
-        &args[1]
-    } else {
-        default_file
+    let Some(mzml_path) = args.get(1) else {
+        eprintln!("usage: run_feature_finder <input .mzML>");
+        std::process::exit(2)
     };
 
     println!("=========================================================================");

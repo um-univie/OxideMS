@@ -34,10 +34,15 @@ fn doublets(peaks: &[Peak]) -> usize {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let (Some(truth_path), Some(mgf_path)) = (args.get(1), args.get(2)) else {
+        eprintln!("usage: preproc_audit <truth.json> <eval.mgf>");
+        std::process::exit(2)
+    };
     let truth: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string("scratch/mona/truth.json").unwrap()).unwrap();
+        serde_json::from_str(&std::fs::read_to_string(truth_path).unwrap()).unwrap();
     let mut parser = MgfParser::default();
-    let records = parser.parse_file("scratch/mona/eval.mgf").expect("mgf");
+    let records = parser.parse_file(mgf_path).expect("mgf");
     let wf = SiriusClusteringWorkflow::new(SiriusWorkflowConfig::default());
 
     let (mut spectra, mut before, mut after, mut lost_all) = (0usize, 0usize, 0usize, 0usize);

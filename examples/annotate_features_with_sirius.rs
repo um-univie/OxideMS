@@ -67,8 +67,10 @@ struct AnnotatedFeatureResult {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let default_file = "/scratch/muhlir/data/mass_spec_data/MSV000080554_mzML/A10_GA10_01_7891.mzML";
-    let mzml_path = args.get(1).map(|s| s.as_str()).unwrap_or(default_file);
+    let Some(mzml_path) = args.get(1).map(|s| s.as_str()) else {
+        eprintln!("usage: annotate_features_with_sirius <input .mzML> [max features] [output .csv]");
+        std::process::exit(2)
+    };
     let max_annotate: usize = args
         .get(2)
         .and_then(|s| s.parse().ok())
@@ -429,12 +431,15 @@ fn main() {
         out.flush().unwrap();
         let python = std::env::var("OXIDEMS_PYTHON").unwrap_or_else(|_| ".venv-ml/bin/python".into());
         let mut command = std::process::Command::new(python);
-        command.arg("scratch/ml/predict_graphs.py");
+        // The DGAT inference script is not part of this repository.
+        let script = std::env::var("OXIDEMS_DGAT_SCRIPT")
+            .expect("set OXIDEMS_DGAT_SCRIPT to the DGAT predict_graphs.py script");
+        command.arg(script);
         if let Ok(data) = std::env::var("OXIDEMS_DGAT_DATA") { command.args(["--data", &data]); }
         let status = command
             .args(["--checkpoint", checkpoint,
                    "--input", &request_path, "--output", &prediction_path])
-            .env("OXFP_VOCAB", std::env::var("OXFP_VOCAB").unwrap_or_else(|_| "scratch/ml/vocab_db.json".into()))
+            .env("OXFP_VOCAB", std::env::var("OXFP_VOCAB").expect("set OXFP_VOCAB to the fingerprint vocabulary JSON"))
             .env("OXFP_RDK_BITS", std::env::var("OXFP_RDK_BITS").unwrap_or_else(|_| "4096".into()))
             .status().expect("start DGAT batch inference");
         assert!(status.success(), "DGAT inference failed; no successful annotated CSV will be exported");

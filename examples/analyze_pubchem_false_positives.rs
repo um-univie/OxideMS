@@ -19,6 +19,16 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::str::FromStr;
 use std::time::Instant;
+/// A file in the directory named by OXIDEMS_MOLECULES_DIR (PubChem CID-SMILES,
+/// COCONUT4MetFrag.csv, HMDB4.csv).
+fn molecules_file(name: &str) -> String {
+    let dir = std::env::var("OXIDEMS_MOLECULES_DIR").unwrap_or_else(|_| {
+        eprintln!("set OXIDEMS_MOLECULES_DIR to the directory holding {name}");
+        std::process::exit(2)
+    });
+    std::path::Path::new(&dir).join(name).to_string_lossy().into_owned()
+}
+
 fn main() {
     println!("=========================================================================");
     println!("     PubChem Isomer Space & False Positive Analysis for CSI:FingerID     ");
@@ -49,7 +59,8 @@ fn main() {
         println!("  • {:<14} | Formula: {:<10} | [M+H]+: {:.4}", name, formula, mz);
     }
 
-    let pubchem_path = "/var/home/manu/projects/molecules-data/CID-SMILES";
+    let pubchem_path_owned = molecules_file("CID-SMILES");
+    let pubchem_path = pubchem_path_owned.as_str();
     println!("\nScanning PubChem ({})... extracting isomer pools for target formulas...", pubchem_path);
     let t_scan = Instant::now();
 

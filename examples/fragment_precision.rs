@@ -6,7 +6,7 @@
 //! that directly against human-assigned annotations rather than a reachability
 //! heuristic.
 //!
-//! Usage: fragment_precision --truth scratch/mona/truth.json --mgf scratch/mona/eval.mgf
+//! Usage: fragment_precision --truth <truth.json> --mgf <eval.mgf>
 //!                           [--tree-size B] [--max-peaks M] [--ppm P]
 
 use oxidems_lib::io::mgf::MgfParser;
@@ -36,8 +36,16 @@ fn main() {
     let get = |n: &str, d: &str| -> String {
         args.iter().position(|a| a == n).and_then(|i| args.get(i + 1)).cloned().unwrap_or(d.into())
     };
-    let truth_path = get("--truth", "scratch/mona/truth.json");
-    let mgf_path = get("--mgf", "scratch/mona/eval.mgf");
+    let required = |n: &str| -> String {
+        let value = get(n, "");
+        if value.is_empty() {
+            eprintln!("usage: {} --truth <truth.json> --mgf <eval.mgf> [options]", env!("CARGO_CRATE_NAME"));
+            std::process::exit(2)
+        }
+        value
+    };
+    let truth_path = required("--truth");
+    let mgf_path = required("--mgf");
     let tree_size: f64 = get("--tree-size", "3").parse().unwrap();
     let max_peaks: usize = get("--max-peaks", "60").parse().unwrap();
     let ppm: f64 = get("--ppm", "20").parse().unwrap();

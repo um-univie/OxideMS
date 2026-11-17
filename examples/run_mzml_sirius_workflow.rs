@@ -4,7 +4,8 @@ use std::time::Instant;
 
 fn main() {
     let mzml_path: String = std::env::args().nth(1).unwrap_or_else(|| {
-        "/scratch/muhlir/data/mass_spec_data/MSV000080554_mzML/A10_GA10_01_7891.mzML".to_string()
+        eprintln!("usage: run_mzml_sirius_workflow <input .mzML>");
+        std::process::exit(2)
     });
     let mzml_path = mzml_path.as_str();
 

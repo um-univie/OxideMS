@@ -20,7 +20,11 @@ fn extract_formula_from_inchi(inchi: &str) -> Option<Formula> {
 }
 
 fn main() {
-    let mgf_path = "/scratch/muhlir/data/mass_spec_data/ALL_GNPS.mgf";
+    let mgf_path_arg = std::env::args().nth(1).unwrap_or_else(|| {
+        eprintln!("usage: {} <GNPS spectral library .mgf>", env!("CARGO_CRATE_NAME"));
+        std::process::exit(2)
+    });
+    let mgf_path = mgf_path_arg.as_str();
     println!("Loading GNPS Reference Spectral Library: {}", mgf_path);
 
     let start_parse = Instant::now();

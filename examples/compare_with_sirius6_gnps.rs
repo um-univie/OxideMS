@@ -31,7 +31,11 @@ struct EvalRecord {
 }
 
 fn main() {
-    let gnps_path = "/scratch/muhlir/data/mass_spec_data/ALL_GNPS.mgf";
+    let gnps_path_arg = std::env::args().nth(1).unwrap_or_else(|| {
+        eprintln!("usage: {} <GNPS spectral library .mgf>", env!("CARGO_CRATE_NAME"));
+        std::process::exit(2)
+    });
+    let gnps_path = gnps_path_arg.as_str();
     let subset_mgf = "test_files/gnps_eval_100.mgf";
     let sirius_out_dir = "scratch/sirius6_eval_out";
 
@@ -203,8 +207,9 @@ fn main() {
     let _ = fs::remove_dir_all(sirius_out_dir);
 
     let t_sirius = Instant::now();
-    let sirius_bin = "/scratch/muhlir/bin/sirius/bin/sirius";
-    let sirius_output = Command::new(sirius_bin)
+    // The SIRIUS launcher; set SIRIUS_BIN if it is not on PATH.
+    let sirius_bin = std::env::var("SIRIUS_BIN").unwrap_or_else(|_| "sirius".to_string());
+    let sirius_output = Command::new(&sirius_bin)
         .arg("-i")
         .arg(subset_mgf)
         .arg("-o")

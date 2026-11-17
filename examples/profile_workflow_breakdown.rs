@@ -4,7 +4,11 @@ use oxidems_lib::workflow::MassTolerance;
 use std::time::Instant;
 
 fn main() {
-    let mzml_path = "/scratch/muhlir/data/mass_spec_data/MSV000080554_mzML/A10_GA10_01_7891.mzML";
+    let mzml_path_arg = std::env::args().nth(1).unwrap_or_else(|| {
+        eprintln!("usage: {} <input .mzML>", env!("CARGO_CRATE_NAME"));
+        std::process::exit(2)
+    });
+    let mzml_path = mzml_path_arg.as_str();
 
     println!("=========================================================================");
     println!("  OxideMS Workflow Phase Bottleneck Profiling");

@@ -18,7 +18,11 @@ fn extract_formula_from_inchi(inchi: &str) -> Option<Formula> {
 }
 
 fn main() {
-    let gnps_path = "/scratch/muhlir/data/mass_spec_data/ALL_GNPS.mgf";
+    let gnps_path_arg = std::env::args().nth(1).unwrap_or_else(|| {
+        eprintln!("usage: {} <GNPS spectral library .mgf>", env!("CARGO_CRATE_NAME"));
+        std::process::exit(2)
+    });
+    let gnps_path = gnps_path_arg.as_str();
     println!("=========================================================================");
     println!("  OxideMS Algorithmic Hotspot Profiler (Sub-Millisecond Instrumentation)");
     println!("=========================================================================\n");
