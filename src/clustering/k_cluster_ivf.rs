@@ -48,15 +48,7 @@ impl<'a> BucketIndex<'a> {
         let mut centroids = vec![0.0; n_list * dim];
         // Deterministic seed derived from the bucket's shape and contents so the ANN
         // (k-means++) path is reproducible run-to-run, as claimed in the manuscript.
-        let seed = {
-            let mut s = 0x9E3779B97F4A7C15u64
-                ^ (n_vectors as u64).wrapping_mul(0x2545F491_4F6CDD1D)
-                ^ (n_list as u64).wrapping_mul(0x9E3779B9);
-            for &v in bucket_data.iter().take(8) {
-                s = s.rotate_left(5) ^ (v.to_bits() as u64);
-            }
-            s
-        };
+        let seed = bucket_seed(bucket_data, n_list, n_vectors);
         let mut rng = StdRng::seed_from_u64(seed);
 
         // Pick the very first centroid uniformly at random
@@ -151,7 +143,18 @@ impl<'a> BucketIndex<'a> {
     /// `par` controls the k-means routing matmul's own threading: pass
     /// [`faer::Par::Seq`] when the caller is already inside a rayon task, so
     /// the matmul does not compete with its sibling tasks for the pool.
-    pub fn build(bucket_data: &'a [f32], dim: usize, max_k: usize, par: faer::Par) -> Self {
+    pub fn build(bucket_data: &'a [f32], dim: usize, _max_k: usize, par: faer::Par) -> Self {
+        Self::build_with(bucket_data, dim, par, IvfTraining::default())
+    }
+
+    /// [`build`](Self::build) with an explicit choice of how the coarse
+    /// quantizer is trained.
+    pub fn build_with(
+        bucket_data: &'a [f32],
+        dim: usize,
+        par: faer::Par,
+        training: IvfTraining,
+    ) -> Self {
         let n_vectors = bucket_data.len() / dim;
 
         let n_list = if n_vectors < 100 {
@@ -168,7 +171,15 @@ impl<'a> BucketIndex<'a> {
             std::cmp::min((n_list as f64 / 8.0).ceil() as usize, 32)
         };
 
-        // Initialize centroids: copy the first `n_list` vectors
+        if let IvfTraining::EMeans { epochs } = training
+            && n_list > 1
+        {
+            let (centroids, assignments) =
+                train_emeans(bucket_data, dim, n_list, n_vectors, epochs, par);
+            return Self::from_assignments(bucket_data, dim, n_list, n_probe, centroids, assignments);
+        }
+
+        // Lloyd: k-means++ seeding, then 10 full-batch iterations.
         let mut centroids = Self::kmeans_plusplus_init(bucket_data, dim, n_list, n_vectors);
 
         let mut assignments = vec![0; n_vectors];
@@ -284,6 +295,21 @@ faer::linalg::matmul::matmul(
                 }
             }
         }
+        Self::from_assignments(bucket_data, dim, n_list, n_probe, centroids, assignments)
+    }
+
+    /// Builds the inverted lists and per-list radii from a trained quantizer.
+    /// `assignments` need not be each vector's *nearest* centroid: radii are
+    /// measured against the centroid a vector was actually filed under.
+    fn from_assignments(
+        bucket_data: &'a [f32],
+        dim: usize,
+        n_list: usize,
+        n_probe: usize,
+        centroids: Vec<f32>,
+        assignments: Vec<usize>,
+    ) -> Self {
+        let n_vectors = assignments.len();
         let mut radii = vec![1.0; n_list]; // Start at max similarity
         for i in 0..n_vectors {
             let c_id = assignments[i];
@@ -491,6 +517,337 @@ faer::linalg::matmul::matmul(
     }
 }
 
+/// How [`BucketIndex`] trains its coarse quantizer.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum IvfTraining {
+    /// k-means++ seeding followed by 10 full-batch spherical Lloyd iterations.
+    #[default]
+    Lloyd,
+    /// Spherical e-means (Bessa et al. 2026, arXiv:2611.09501): mini-batch
+    /// updates of exponentially decayed per-cluster sums and counts, from a
+    /// random-sample start, for `epochs` passes over the data. `epochs` is
+    /// held to 1..=64; a fractional part shorter than one mini-batch is
+    /// dropped.
+    EMeans { epochs: f32 },
+}
+
+/// Deterministic seed derived from the bucket's shape and contents so the ANN
+/// path is reproducible run-to-run, as claimed in the manuscript.
+fn bucket_seed(bucket_data: &[f32], n_list: usize, n_vectors: usize) -> u64 {
+    let mut s = 0x9E3779B97F4A7C15u64
+        ^ (n_vectors as u64).wrapping_mul(0x2545F491_4F6CDD1D)
+        ^ (n_list as u64).wrapping_mul(0x9E3779B9);
+    for &v in bucket_data.iter().take(8) {
+        s = s.rotate_left(5) ^ (v.to_bits() as u64);
+    }
+    s
+}
+
+/// Batch size and initial step from the e-means scaling laws (section 5 of
+/// the paper), so neither needs a sweep. The laws were fitted for `n` in
+/// 1e5..1e8 and `k` in 256..65536; below that they are an extrapolation.
+fn emeans_batch_and_step(n: usize, k: usize, epochs: f32) -> (usize, f32) {
+    let (nf, kf, t) = (n as f64, k as f64, epochs as f64);
+    let mut b = 0.035134 * kf.powf(0.134749) * nf.powf(0.876473) * t.powf(0.813344);
+    if n > 2_000_000 {
+        b /= 8.0;
+    }
+    let batch = 2f64.powf(b.log2().round()) as usize;
+    let batch = batch.clamp(k.min(n), (n / 2).max(1));
+    let alpha0 = 0.8244
+        * kf.powf(-0.4617)
+        * (batch as f64).powf(0.9003)
+        * nf.powf(-0.4498)
+        * t.powf(-0.1057);
+    (batch, alpha0.clamp(1e-4, 1.0) as f32)
+}
+
+/// Spherical e-means. Returns `(centroids, assignments)`: unit-norm centroids
+/// (`k * dim`) and, for every vector, the centroid it was assigned to during
+/// the final pass.
+///
+/// Each cluster keeps a decayed sum `S_j` and count `N_j`; a mini-batch with
+/// per-cluster sum `s_j` and count `n_j` updates them as
+/// `S_j <- (1-a) S_j + a s_j`, `N_j <- (1-a) N_j + a n_j`, with `a` annealed
+/// by a cosine schedule from `a0` to `0.1 a0`. The paper's method is
+/// Euclidean (centroid `S_j / N_j`); the vectors here are L2-normalized and
+/// compared by cosine, so the centroid is `S_j / |S_j|` instead and
+/// assignment is by largest dot product -- `N_j` is kept only to detect dead
+/// clusters. Every fifth batch, clusters whose count has decayed below a
+/// tenth of the mean are revived by splitting a cluster drawn in proportion
+/// to its count. The last pass also accumulates exact per-cluster sums, and
+/// the returned centroids are those means rather than the EMA readout.
+fn train_emeans(
+    data: &[f32],
+    dim: usize,
+    k: usize,
+    n: usize,
+    epochs: f32,
+    par: faer::Par,
+) -> (Vec<f32>, Vec<usize>) {
+    use rand::seq::SliceRandom;
+
+    const REVIVE_EVERY: usize = 5;
+    const REVIVE_THRESHOLD: f32 = 0.1;
+    const SPLIT_DELTA: f32 = 1.0 / 128.0;
+    const SCHEDULE_FLOOR: f32 = 0.1;
+
+    let epochs = if epochs.is_finite() { epochs.clamp(1.0, 64.0) } else { 1.0 };
+    let (batch, alpha0) = emeans_batch_and_step(n, k, epochs);
+    let mut rng = StdRng::seed_from_u64(bucket_seed(data, k, n));
+
+    // Random-sample start: k-means++ costs about one Lloyd iteration in
+    // sequential picks and the paper finds it buys nothing here.
+    let mut centroids = vec![0.0f32; k * dim];
+    for (slot, idx) in rand::seq::index::sample(&mut rng, n, k).into_iter().enumerate() {
+        centroids[slot * dim..(slot + 1) * dim].copy_from_slice(&data[idx * dim..(idx + 1) * dim]);
+    }
+    let mut counts = vec![1e-10f32; k];
+    let mut sums: Vec<f32> = centroids.iter().map(|&c| c * 1e-10).collect();
+
+    // A leading partial pass carries any fractional part of `epochs`; the
+    // final pass is always whole so every vector ends up with an assignment.
+    let full_passes = epochs.floor() as usize;
+    let partial_len = (((epochs - full_passes as f32) * n as f32) as usize).min(n);
+    let mut pass_lens = Vec::with_capacity(full_passes + 1);
+    if partial_len >= batch {
+        pass_lens.push(partial_len);
+    }
+    pass_lens.extend(std::iter::repeat_n(n, full_passes));
+    let total_steps: usize = pass_lens.iter().map(|len| len.div_ceil(batch)).sum();
+
+    let mut order: Vec<usize> = (0..n).collect();
+    let mut assignments = vec![0usize; n];
+    let mut final_sums = vec![0.0f32; k * dim];
+    let mut final_counts = vec![0u32; k];
+
+    let mut batch_data = vec![0.0f32; batch * dim];
+    let mut scores = vec![0.0f32; batch * k];
+    let mut batch_assign = vec![0usize; batch];
+    // Batch rows grouped by assigned centroid (counting sort), so the update
+    // can run one task per centroid with no shared accumulator.
+    let mut group_start = vec![0usize; k + 1];
+    let mut grouped = vec![0usize; batch];
+
+    let mut step = 0usize;
+    let last_pass = pass_lens.len() - 1;
+    for (pass, &pass_len) in pass_lens.iter().enumerate() {
+        order.shuffle(&mut rng);
+        let is_last = pass == last_pass;
+        for ids in order[..pass_len].chunks(batch) {
+            let m = ids.len();
+            let progress = step as f32 / total_steps as f32;
+            let alpha = alpha0
+                * (SCHEDULE_FLOOR
+                    + (1.0 - SCHEDULE_FLOOR) * 0.5 * (1.0 + (std::f32::consts::PI * progress).cos()));
+            step += 1;
+
+            batch_data[..m * dim]
+                .par_chunks_exact_mut(dim)
+                .zip(ids.par_iter())
+                .for_each(|(row, &id)| row.copy_from_slice(&data[id * dim..(id + 1) * dim]));
+
+            matmul::matmul(
+                faer::MatMut::from_row_major_slice_mut(&mut scores[..m * k], m, k),
+                faer::Accum::Replace,
+                faer::MatRef::from_row_major_slice(&batch_data[..m * dim], m, dim),
+                faer::MatRef::from_row_major_slice(&centroids, k, dim).transpose(),
+                1.0,
+                par,
+            );
+            batch_assign[..m]
+                .par_iter_mut()
+                .zip(scores[..m * k].par_chunks_exact(k))
+                .for_each(|(assignment, row)| {
+                    *assignment = row
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(Ordering::Equal))
+                        .unwrap()
+                        .0;
+                });
+
+            group_start.fill(0);
+            for &c in &batch_assign[..m] {
+                group_start[c + 1] += 1;
+            }
+            for c in 0..k {
+                group_start[c + 1] += group_start[c];
+            }
+            let mut cursor = group_start.clone();
+            for (row, &c) in batch_assign[..m].iter().enumerate() {
+                grouped[cursor[c]] = row;
+                cursor[c] += 1;
+            }
+            if is_last {
+                for (&id, &c) in ids.iter().zip(&batch_assign[..m]) {
+                    assignments[id] = c;
+                }
+            }
+
+            let batch_rows = &batch_data[..m * dim];
+            let (group_start, grouped) = (&group_start, &grouped);
+            sums.par_chunks_exact_mut(dim)
+                .zip(centroids.par_chunks_exact_mut(dim))
+                .zip(counts.par_iter_mut())
+                .zip(final_sums.par_chunks_exact_mut(dim).zip(final_counts.par_iter_mut()))
+                .enumerate()
+                .for_each_init(
+                    || vec![0.0f32; dim],
+                    |batch_sum, (c, (((sum, centroid), count), (final_sum, final_count)))| {
+                        let members = &grouped[group_start[c]..group_start[c + 1]];
+                        batch_sum.fill(0.0);
+                        for &row in members {
+                            let v = &batch_rows[row * dim..(row + 1) * dim];
+                            for d in 0..dim {
+                                batch_sum[d] += v[d];
+                            }
+                        }
+                        if is_last {
+                            for d in 0..dim {
+                                final_sum[d] += batch_sum[d];
+                            }
+                            *final_count += members.len() as u32;
+                        }
+                        *count = (1.0 - alpha) * *count + alpha * members.len() as f32;
+                        let mut norm_sq = 0.0f32;
+                        for d in 0..dim {
+                            sum[d] = (1.0 - alpha) * sum[d] + alpha * batch_sum[d];
+                            norm_sq += sum[d] * sum[d];
+                        }
+                        // A sum decayed to nothing keeps its last direction
+                        // until revival replaces it.
+                        if norm_sq > 0.0 {
+                            let inv = norm_sq.sqrt().recip();
+                            for d in 0..dim {
+                                centroid[d] = sum[d] * inv;
+                            }
+                        }
+                    },
+                );
+
+            // Not during the last pass: its members are being filed under
+            // centroid ids for the final means, and a revived id would mix
+            // members of two unrelated regions.
+            if step % REVIVE_EVERY == 0 && !is_last {
+                revive_dead_clusters(
+                    &mut sums,
+                    &mut counts,
+                    &mut centroids,
+                    dim,
+                    REVIVE_THRESHOLD,
+                    SPLIT_DELTA,
+                    &mut rng,
+                );
+            }
+        }
+    }
+
+    // Finalize on the exact mean of the last pass's members. A cluster that
+    // received none keeps its EMA centroid and an empty list.
+    centroids
+        .par_chunks_exact_mut(dim)
+        .zip(final_sums.par_chunks_exact(dim))
+        .zip(final_counts.par_iter())
+        .for_each(|((centroid, final_sum), &final_count)| {
+            let norm_sq: f32 = final_sum.iter().map(|x| x * x).sum();
+            if final_count > 0 && norm_sq > 0.0 {
+                let inv = norm_sq.sqrt().recip();
+                for d in 0..dim {
+                    centroid[d] = final_sum[d] * inv;
+                }
+            }
+        });
+
+    (centroids, assignments)
+}
+
+/// Replaces every cluster whose decayed count is below `threshold` times the
+/// mean with half of a live cluster drawn in proportion to its count: the
+/// donor's sum is split into two copies perturbed in opposite directions
+/// (alternating `1 +/- delta` over its non-zero coordinates) and its count
+/// is halved.
+fn revive_dead_clusters(
+    sums: &mut [f32],
+    counts: &mut [f32],
+    centroids: &mut [f32],
+    dim: usize,
+    threshold: f32,
+    delta: f32,
+    rng: &mut StdRng,
+) {
+    let k = counts.len();
+    let mean = counts.iter().sum::<f32>() / k as f32;
+    let cutoff = threshold * mean;
+    let dead: Vec<usize> = (0..k).filter(|&c| counts[c] < cutoff).collect();
+    if dead.is_empty() || dead.len() == k {
+        return;
+    }
+    let live: Vec<usize> = (0..k).filter(|&c| counts[c] >= cutoff).collect();
+    let mut cumulative = Vec::with_capacity(live.len());
+    let mut total = 0.0f64;
+    for &c in &live {
+        total += counts[c] as f64;
+        cumulative.push(total);
+    }
+    let mut used = vec![false; live.len()];
+    let mut n_used = 0usize;
+
+    for dead_id in dead {
+        if n_used == live.len() {
+            break;
+        }
+        // Without replacement: redraw on a donor already split this round,
+        // falling back to the next unused one if the draws keep colliding.
+        let mut draw = |rng: &mut StdRng| {
+            let target = rng.random_range(0.0..total);
+            cumulative.partition_point(|&w| w < target)
+        };
+        let mut pick = draw(rng);
+        for _ in 0..8 {
+            if !used[pick.min(live.len() - 1)] {
+                break;
+            }
+            pick = draw(rng);
+        }
+        let mut pick = pick.min(live.len() - 1);
+        while used[pick] {
+            pick = (pick + 1) % live.len();
+        }
+        used[pick] = true;
+        n_used += 1;
+        let donor_id = live[pick];
+
+        let half = counts[donor_id] * 0.5;
+        counts[donor_id] = half;
+        counts[dead_id] = half;
+        let (mut donor_norm, mut dead_norm) = (0.0f32, 0.0f32);
+        // The sign alternates over the non-zero coordinates, not over all of
+        // them: sparse vectors can have every non-zero on one parity, and
+        // scaling all of them alike would leave both halves pointing the
+        // same way.
+        let mut sign = delta;
+        for d in 0..dim {
+            let base = sums[donor_id * dim + d] * 0.5;
+            if base != 0.0 {
+                sign = -sign;
+            }
+            let (a, b) = (base * (1.0 - sign), base * (1.0 + sign));
+            sums[donor_id * dim + d] = a;
+            sums[dead_id * dim + d] = b;
+            donor_norm += a * a;
+            dead_norm += b * b;
+        }
+        if donor_norm > 0.0 && dead_norm > 0.0 {
+            let (donor_inv, dead_inv) = (donor_norm.sqrt().recip(), dead_norm.sqrt().recip());
+            for d in 0..dim {
+                centroids[donor_id * dim + d] = sums[donor_id * dim + d] * donor_inv;
+                centroids[dead_id * dim + d] = sums[dead_id * dim + d] * dead_inv;
+            }
+        }
+    }
+}
+
 pub fn graph_dbscan(
     n_vectors: usize,
     edges: &[Edge],
@@ -695,6 +1052,31 @@ pub fn windowed_mass_edges(
     block_size: usize,
     dense_window_threshold: usize,
 ) -> Vec<Edge> {
+    windowed_mass_edges_with(
+        bucket_data,
+        dim,
+        neutral_masses,
+        tolerance,
+        epsilon,
+        block_size,
+        dense_window_threshold,
+        IvfTraining::default(),
+    )
+}
+
+/// [`windowed_mass_edges`] with an explicit choice of how the IVF fallback
+/// trains its quantizer. Irrelevant to blocks resolved by direct matmul.
+#[allow(clippy::too_many_arguments)]
+pub fn windowed_mass_edges_with(
+    bucket_data: &[f32],
+    dim: usize,
+    neutral_masses: &[f64],
+    tolerance: MassTolerance,
+    epsilon: f32,
+    block_size: usize,
+    dense_window_threshold: usize,
+    ivf_training: IvfTraining,
+) -> Vec<Edge> {
     let n_vectors = neutral_masses.len();
     if n_vectors < 2 {
         return Vec::new();
@@ -767,6 +1149,7 @@ pub fn windowed_mass_edges(
                     max_gap_at,
                     min_similarity,
                     inner_par,
+                    ivf_training,
                 );
             }
 
@@ -829,9 +1212,10 @@ fn dense_window_edges_via_ivf(
     max_gap_at: impl Fn(f64) -> f64,
     min_similarity: f32,
     par: faer::Par,
+    training: IvfTraining,
 ) -> Vec<Edge> {
     let candidate_slice = &bucket_data[block_start * dim..window_end * dim];
-    let index = BucketIndex::build(candidate_slice, dim, 64, par);
+    let index = BucketIndex::build_with(candidate_slice, dim, par, training);
     let query_len = block_end - block_start;
     // Search only from this block's own rows. The rest of the window is
     // candidates here and queries in their own block, so searching from them
@@ -1049,6 +1433,75 @@ mod windowed_mass_edges_tests {
                 "unexpected cross-cluster edge: {edge:?}"
             );
         }
+    }
+
+    /// e-means has to hand back a usable quantizer: unit centroids, every
+    /// vector filed exactly once, and edge recall on par with the Lloyd-trained index.
+    #[test]
+    fn emeans_index_recall_is_close_to_lloyd() {
+        let (dim, n, n_groups) = (16, 2000, 8);
+        let mut rng = StdRng::seed_from_u64(11);
+        let mut data = vec![0.0f32; n * dim];
+        for (i, row) in data.chunks_exact_mut(dim).enumerate() {
+            row[i % n_groups] = 1.0;
+            for x in row.iter_mut() {
+                *x += rng.random_range(0.0f32..0.05);
+            }
+            let norm = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+            row.iter_mut().for_each(|x| *x /= norm);
+        }
+
+        let emeans = BucketIndex::build_with(
+            &data,
+            dim,
+            faer::Par::Seq,
+            IvfTraining::EMeans { epochs: 3.0 },
+        );
+        assert!(emeans.n_list > 1, "test must exercise real training");
+        for centroid in emeans.centroids.chunks_exact(dim) {
+            let norm = centroid.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-3, "centroid norm {norm}");
+        }
+        let mut filed = emeans.flat_indices.clone();
+        filed.sort_unstable();
+        assert_eq!(filed, (0..n).collect::<Vec<_>>());
+
+        // Neither index is exact (only `n_probe` lists are scanned), so
+        // both are held against the true edge set rather than each other.
+        let (k, epsilon) = (n, 0.2f32);
+        let mut truth = std::collections::HashSet::new();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let score =
+                    fast_dot_product(&data[i * dim..(i + 1) * dim], &data[j * dim..(j + 1) * dim]);
+                if score >= 1.0 - epsilon {
+                    truth.insert((i, j));
+                }
+            }
+        }
+        let recall = |index: &BucketIndex| {
+            let found = edge_set(&index.extract_edges(k, epsilon));
+            assert!(found.is_subset(&truth), "index returned an edge below the threshold");
+            found.len() as f64 / truth.len() as f64
+        };
+        let lloyd = BucketIndex::build_with(&data, dim, faer::Par::Seq, IvfTraining::Lloyd);
+        let (emeans_recall, lloyd_recall) = (recall(&emeans), recall(&lloyd));
+        eprintln!("recall: e-means {emeans_recall:.4}, lloyd {lloyd_recall:.4}");
+        assert!(
+            emeans_recall >= lloyd_recall - 0.05,
+            "e-means recall {emeans_recall:.4} well below lloyd {lloyd_recall:.4}"
+        );
+    }
+
+    #[test]
+    fn emeans_is_deterministic() {
+        let (data, _) = random_dataset(3000, 5, 0.01);
+        let build = || {
+            BucketIndex::build_with(&data, 4, faer::Par::Seq, IvfTraining::EMeans { epochs: 2.0 })
+        };
+        let (a, b) = (build(), build());
+        assert_eq!(a.centroids, b.centroids);
+        assert_eq!(a.flat_indices, b.flat_indices);
     }
 
     #[test]
