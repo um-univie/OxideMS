@@ -275,12 +275,16 @@ fn audit(run: &Run, falcon: &Run, lab: &Labelled, peptides: &[String], sizes_of_
     println!("    our hashed cosine of pairs only the other merges: {}", quantiles(&mut falcon_only_cos));
 }
 
+mod support;
+
+const USAGE: &str = "usage: cluster_error_audit <data dir> <labels.csv> <falcon clusters.csv> <falcon eps>";
+
 fn main() {
     let mut args = std::env::args().skip(1);
-    let dir = args.next().expect("data dir");
-    let labels_path = args.next().expect("labels csv");
-    let falcon_path = args.next().expect("falcon csv");
-    let falcon_eps: f32 = args.next().expect("falcon eps").parse().unwrap();
+    let dir = args.next().unwrap_or_else(|| support::fail(USAGE));
+    let labels_path = args.next().unwrap_or_else(|| support::fail(USAGE));
+    let falcon_path = args.next().unwrap_or_else(|| support::fail(USAGE));
+    let falcon_eps: f32 = args.next().unwrap_or_else(|| support::fail(USAGE)).parse().unwrap();
 
     let mut truth: HashMap<(String, usize), String> = HashMap::new();
     for line in BufReader::new(std::fs::File::open(&labels_path).unwrap()).lines().skip(1) {

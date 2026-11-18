@@ -904,6 +904,7 @@ mod mgf_parser_tests {
     }
 
     #[test]
+    #[ignore = "needs test_files/test2.mgf (600,566 spectra, not in git); see README \"Tests\""]
     fn test_sequential_with_metadata() {
         let mut config = MgfParserConfig::default();
         config.use_parallel_parsing = false;
@@ -917,6 +918,7 @@ mod mgf_parser_tests {
     }
 
     #[test]
+    #[ignore = "needs test_files/test2.mgf (600,566 spectra, not in git); see README \"Tests\""]
     fn test_parallel_without_metadata() {
         let mut config = MgfParserConfig::default();
         config.use_parallel_parsing = true;

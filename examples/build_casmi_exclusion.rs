@@ -23,8 +23,13 @@ fn csv_fields(line: &str) -> Vec<String> {
     out
 }
 
+mod support;
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() < 3 {
+        support::fail("usage: build_casmi_exclusion <CASMI solutions.csv> <output manifest.json>");
+    }
     let sol = &args[1];
     let out = &args[2];
 

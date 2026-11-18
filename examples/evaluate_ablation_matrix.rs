@@ -96,7 +96,10 @@ fn run_evaluation(
     }
 }
 
+mod support;
+
 fn main() {
+    support::require("evaluate_ablation_matrix", &[("models/sirius_fingerprints.oxfp", support::MODEL), ("models/biometabolites.oxdb", support::STRUCTURE_DB), ("test_files/gnps_eval_100.mgf", support::GNPS_EVAL), ("test_files/test2.mgf", support::MSNLIB)]);
     println!("=========================================================================");
     println!("     OxideMS SIRIUS Feature Ablation & Multi-Adduct / Halogen Matrix     ");
     println!("=========================================================================");

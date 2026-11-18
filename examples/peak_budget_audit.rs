@@ -17,7 +17,10 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::str::FromStr;
 
+mod support;
+
 fn main() {
+    support::require("peak_budget_audit", &[("test_files/MoNA-export-LC-MS-MS_Positive_Mode.msp", support::MONA)]);
     let args: Vec<String> = std::env::args().collect();
     let arg = |n: &str, d: usize| -> usize {
         args.iter().position(|a| a == n).and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(d)

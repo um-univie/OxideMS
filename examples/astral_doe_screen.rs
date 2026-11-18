@@ -113,7 +113,10 @@ fn run_row(row: &Row) -> (f64, usize, usize, f64, usize) {
     (purity, n10, n_clustered, completeness, experiment.total_spectra_ingested)
 }
 
+mod support;
+
 fn main() {
+    support::require("astral_doe_screen", &[(PATH, support::ASTRAL)]);
     let rows = all_rows();
     println!(
         "epsilon,fragment_tolerance,precursor_tolerance,transform,top_n_peaks,min_peaks,min_mz_range,min_relative_intensity,weighted_purity,n10,n_clustered,completeness,total_spectra,elapsed_s"

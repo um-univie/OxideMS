@@ -1,8 +1,12 @@
 use oxidems_lib::clustering::cluster::experiment::SpectralExperiment;
 use oxidems_lib::set_global_thread_limit;
 
+mod support;
+
 fn main() {
-    let path = "tests/Astral";
+    let path = support::arg_or(1, "tests/Astral");
+    support::require("basic_clustering", &[(&path, support::ASTRAL)]);
+    let path = path.as_str();
     let mut spectral_experiment = SpectralExperiment::default();
     spectral_experiment.engine.exact = true;
 

@@ -70,7 +70,10 @@ fn clean_spectrum(peaks: &[Peak], precursor_mz: f64, max_peaks: usize) -> Vec<Pe
     clean
 }
 
+mod support;
+
 fn main() {
+    support::require("ilp_vs_dagdp", &[("test_files/gnps_eval_100.mgf", support::GNPS_EVAL)]);
     println!("================================================================================");
     println!("     DAG DP vs ILP: Is a globally optimal tree solver worth it?                ");
     println!("================================================================================\n");

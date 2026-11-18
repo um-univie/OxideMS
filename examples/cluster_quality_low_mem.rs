@@ -16,10 +16,13 @@ fn find_mgf_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+mod support;
+
 fn main() {
     let dataset_dir = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "../msgf_full_run".to_string());
+    support::require("cluster_quality_low_mem", &[(&dataset_dir, "directory of MGF files to cluster (first argument)")]);
     let spill_dir = PathBuf::from("target/low_mem_spill");
     let out_csv = "low_mem_clusters.csv";
     let out_png = "low_mem_cluster_quality.png";

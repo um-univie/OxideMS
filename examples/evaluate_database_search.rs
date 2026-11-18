@@ -646,6 +646,8 @@ fn binned(rows: &[DiagRow], label: &str, edges: &[f64], key: impl Fn(&DiagRow) -
     }
 }
 
+mod support;
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut model_path = "models/sirius_fingerprints.oxfp".to_string();
@@ -773,6 +775,7 @@ fn main() {
 
     // 1. Load trained neural network weights
     println!("Loading trained fingerprint model from: {}...", model_path);
+    support::require("evaluate_database_search", &[(&model_path, support::MODEL), (&spectra_path, "query spectra (--spectra; default the MoNA MSP export, https://mona.mass.ms/downloads)")]);
     let mut model_file = File::open(&model_path).expect("Could not open trained model file. Run train_fingerprint_model first.");
     let predictor = FingerprintPredictor::load_weights(&mut model_file).expect("Failed to parse model weights");
     println!("  Model successfully loaded! Parameters: {}\n", predictor.num_parameters());

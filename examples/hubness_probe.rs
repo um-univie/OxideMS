@@ -180,12 +180,15 @@ fn skewness(values: &[f64]) -> f64 {
     (m3 / n) / (m2 / n).powf(1.5)
 }
 
+mod support;
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let dir = args.next().unwrap_or_else(|| "tests/PXD000561_pilot".to_string());
     let truth_path = args.next().unwrap_or_else(|| format!("{dir}/overall_spectrum_annotations.csv"));
     let floor: f32 = args.next().map_or(0.3, |a| a.parse().expect("cosine floor"));
     let out_path = args.next();
+    support::require("hubness_probe", &[(&dir, support::PXD000561), (&truth_path, "per-spectrum peptide annotations CSV (second argument)")]);
     let truth = load_ground_truth(&truth_path);
 
     let mut experiment = SpectralExperiment::proteomics();

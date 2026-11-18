@@ -63,7 +63,10 @@ fn clean_spectrum(peaks: &[Peak], precursor_mz: f64, max_peaks: usize) -> Vec<Pe
     clean
 }
 
+mod support;
+
 fn main() {
+    support::require("diagnose_failures", &[("test_files/gnps_eval_100.mgf", support::GNPS_EVAL)]);
     println!("================================================================================");
     println!("     Deep Failure Diagnostic: Why does the correct formula lose?");
     println!("================================================================================\n");

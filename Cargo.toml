@@ -53,7 +53,9 @@ wgpu = {version="29.0.1", optional = true}
 pollster = {version="0.4.0", optional = true}
 rkyv = "0.8.16"
 libdeflater = "1.25.2"
-oxidane = { path = "../oxidane", default-features = false, optional = true }
+# Public oxidane at a fixed revision (not on crates.io). To develop both
+# crates together, see "Developing with a local oxidane" in README.md.
+oxidane = { git = "https://github.com/um-univie/oxidane", rev = "8dcee8b3921699872c5e92b3768ec8edf1598e06", default-features = false, optional = true }
 candle-core = { version = "0.11.0", optional = true }
 candle-nn = { version = "0.11.0", optional = true }
 serde = { version = "1.0.229", features = ["derive"] }

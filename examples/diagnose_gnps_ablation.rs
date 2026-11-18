@@ -5,7 +5,10 @@ use oxidems_lib::sirius::workflow::{AdductSearchStrategy, SiriusClusteringWorkfl
 use oxidems_lib::workflow::MassTolerance;
 use std::path::Path;
 
+mod support;
+
 fn main() {
+    support::require("diagnose_gnps_ablation", &[("models/sirius_fingerprints.oxfp", support::MODEL), ("models/biometabolites.oxdb", support::STRUCTURE_DB), ("test_files/gnps_eval_100.mgf", support::GNPS_EVAL)]);
     let fp_model_path = "models/sirius_fingerprints.oxfp";
     let predictor = FingerprintPredictor::load_from_file(fp_model_path)
         .expect("Failed to load CSI:FingerID model weights");

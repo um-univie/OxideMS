@@ -1,5 +1,7 @@
 /target
-/test_files
+/test_files/*
+!/test_files/test1.mgf
+!/test_files/README.md
 /data
 /temp_spectra
 /tests

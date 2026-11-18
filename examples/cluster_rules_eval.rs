@@ -304,11 +304,15 @@ fn parse_list(text: &str) -> Vec<f32> {
     text.split(',').map(|v| v.parse().expect("number")).collect()
 }
 
+mod support;
+
+const USAGE: &str = "usage: cluster_rules_eval <data dir> <labels.csv> <output prefix> [--flag value ...]";
+
 fn main() {
     let mut args = std::env::args().skip(1);
-    let dir = args.next().expect("data dir");
-    let labels_path = args.next().expect("labels csv");
-    let out_prefix = args.next().expect("output prefix");
+    let dir = args.next().unwrap_or_else(|| support::fail(USAGE));
+    let labels_path = args.next().unwrap_or_else(|| support::fail(USAGE));
+    let out_prefix = args.next().unwrap_or_else(|| support::fail(USAGE));
     let (mut measure, mut metabolomics) = (OverlapMeasure::Jaccard, false);
     let mut csv_runs: Vec<(String, String)> = Vec::new();
     let (mut epsilons, mut overlaps): (Vec<f32>, Vec<f32>) = (Vec::new(), vec![0.0]);

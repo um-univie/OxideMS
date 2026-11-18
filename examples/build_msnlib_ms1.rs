@@ -24,8 +24,13 @@ use std::io::Write;
 const ISO_LO: f64 = 1.6;
 const ISO_HI: f64 = 6.5;
 
+mod support;
+
 fn main() {
     let a: Vec<String> = std::env::args().collect();
+    if a.len() < 4 {
+        support::fail("usage: build_msnlib_ms1 <MSnLib .mgf> <directory of MSnLib .mzML runs> <output .mgf>\n  MSnLib: MassIVE MSV000094528, doi:10.5281/zenodo.21105617");
+    }
     let (mgf_path, mzml_dir, out_path) = (&a[1], &a[2], &a[3]);
 
     let mut parser = MgfParser::default();

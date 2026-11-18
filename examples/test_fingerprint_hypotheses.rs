@@ -371,7 +371,10 @@ fn run_experiment_3_reliability_weighting_database_search(
         (weighted_top3 as f64 / q_f) * 100.0, weighted_top3, queries_evaluated);
 }
 
+mod support;
+
 fn main() {
+    support::require("test_fingerprint_hypotheses", &[("test_files/MoNA-export-LC-MS-MS_Positive_Mode.msp", support::MONA), ("models/sirius_fingerprints.oxfp", support::MODEL)]);
     let msp_path = "test_files/MoNA-export-LC-MS-MS_Positive_Mode.msp";
     let model_path = "models/sirius_fingerprints.oxfp";
 

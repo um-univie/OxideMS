@@ -14,8 +14,12 @@ use oxidems_lib::plotting::SpectrumPlotter;
 const MZ_TOL: f64 = 0.01;
 const RT_TOL: f32 = 30.0;
 
+mod support;
+
 fn main() {
-    let path = "tests/Astral";
+    let path = support::arg_or(1, "tests/Astral");
+    support::require("astral_figures", &[(&path, support::ASTRAL)]);
+    let path = path.as_str();
     let eps_values = [0.02, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
 
     // Used to pick a representative matched pair for the mirror plot.

@@ -50,6 +50,6 @@ mod tests {
 
     #[test]
     fn other_extensions_are_read_as_mgf() {
-        assert!(!read_spectra("test_files/test2.mgf", false).unwrap().is_empty());
+        assert!(!read_spectra("test_files/test1.mgf", false).unwrap().is_empty());
     }
 }

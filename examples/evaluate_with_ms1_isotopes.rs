@@ -14,7 +14,10 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::Instant;
 
+mod support;
+
 fn main() {
+    support::require("evaluate_with_ms1_isotopes", &[("models/sirius_fingerprints.oxfp", support::MODEL), ("models/biometabolites.oxdb", support::STRUCTURE_DB), ("test_files/gnps_eval_100.mgf", support::GNPS_EVAL)]);
     println!("=========================================================================");
     println!("     OxideMS SIRIUS Evaluation: MS2-Only vs MS1 Isotope Rescue Pattern   ");
     println!("=========================================================================");

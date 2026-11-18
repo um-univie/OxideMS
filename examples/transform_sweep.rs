@@ -41,13 +41,17 @@ fn mgf_dirs(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+mod support;
+
+const USAGE: &str = "usage: transform_sweep <dataset dir> <preset> <none|sqrt|log> <epsilon> <output.csv>";
+
 fn main() {
     let mut args = std::env::args().skip(1);
-    let dataset_dir = args.next().expect("dataset dir");
-    let preset = args.next().expect("preset");
-    let transform = args.next().expect("none|sqrt|log");
-    let epsilon: f32 = args.next().and_then(|a| a.parse().ok()).expect("epsilon");
-    let out_path = args.next().expect("output csv");
+    let dataset_dir = args.next().unwrap_or_else(|| support::fail(USAGE));
+    let preset = args.next().unwrap_or_else(|| support::fail(USAGE));
+    let transform = args.next().unwrap_or_else(|| support::fail(USAGE));
+    let epsilon: f32 = args.next().and_then(|a| a.parse().ok()).unwrap_or_else(|| support::fail(USAGE));
+    let out_path = args.next().unwrap_or_else(|| support::fail(USAGE));
 
     let mut experiment = match preset.as_str() {
         "metabolomics" => SpectralExperiment::metabolomics(),

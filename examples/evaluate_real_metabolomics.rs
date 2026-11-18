@@ -25,7 +25,10 @@ struct RealMetabolomicsResult {
     latency_ms: f64,
 }
 
+mod support;
+
 fn main() {
+    support::require("evaluate_real_metabolomics", &[("models/sirius_fingerprints.oxfp", support::MODEL), ("models/biometabolites.oxdb", support::STRUCTURE_DB), ("test_files/test2.mgf", support::MSNLIB), ("test_files/gnps_eval_100.mgf", support::GNPS_EVAL)]);
     println!("=========================================================================");
     println!("    OxideMS SIRIUS + CSI:FingerID Real Orbitrap Metabolomics Benchmark   ");
     println!("           Dataset: GNPS MSV000094528 (Thermo Orbitrap ID-X)             ");

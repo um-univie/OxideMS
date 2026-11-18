@@ -1,8 +1,10 @@
 use oxidems_lib::io::mgf::MgfParser;
 use std::time::Instant;
 
+mod support;
+
 fn main() {
-    let path = std::env::args().nth(1).unwrap();
+    let path = std::env::args().nth(1).unwrap_or_else(|| support::fail("usage: parse_timing <file.mzML>"));
     let mut parser = MgfParser::default();
     let start = Instant::now();
     let records = parser.parse_file(&path).unwrap();

@@ -1,12 +1,16 @@
 use itertools::Itertools;
 use oxidems_lib::clustering::cluster::experiment::SpectralExperiment;
 
+mod support;
+
 fn main() {
     let start_time = std::time::Instant::now();
     let mut spectral_experiment = SpectralExperiment::proteomics();
     spectral_experiment.engine.exact = true;
 
-    let path = "tests/Astral";
+    let path = support::arg_or(1, "tests/Astral");
+    support::require("cluster_grid_search", &[(&path, support::ASTRAL)]);
+    let path = path.as_str();
 
     spectral_experiment.ingest_files_parallel(path);
 

@@ -69,7 +69,7 @@ fn load_massspecgym(
     folds: &std::collections::HashSet<String>,
     excluded: &std::collections::HashSet<String>,
 ) -> Vec<RawSample> {
-    let file = File::open(path).expect("Could not open MassSpecGym TSV");
+    let file = File::open(path).unwrap_or_else(|e| support::fail(format!("cannot open {}: {e}\n  MassSpecGym TSV, https://huggingface.co/datasets/roman-bushuiev/MassSpecGym", path.display())));
     let reader = BufReader::with_capacity(16 * 1024 * 1024, file);
     let mut lines = reader.lines();
     let header = lines.next().expect("empty TSV").expect("unreadable header");
@@ -139,7 +139,7 @@ fn load_mona(
     max_records: usize,
     excluded: &std::collections::HashSet<String>,
 ) -> Vec<RawSample> {
-    let file = File::open(path).expect("Could not open MSP file");
+    let file = File::open(path).unwrap_or_else(|e| support::fail(format!("cannot open {}: {e}\n  {} (or pass --tsv for MassSpecGym)", path.display(), support::MONA)));
     let reader = BufReader::with_capacity(16 * 1024 * 1024, file);
 
     let mut samples = Vec::new();
@@ -312,6 +312,8 @@ fn hash_formula_bytes(formula: &Formula, seed: u32, n_buckets: usize) -> usize {
     let hash = xxh32(&bytes, seed);
     (hash as usize) % n_buckets
 }
+
+mod support;
 
 fn main() {
     // export_training_data [--limit N] [--out PATH] [--exclude FILE] [--graph-only]

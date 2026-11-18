@@ -142,7 +142,10 @@ fn run_point(
     (purity, n10, n_clustered, completeness)
 }
 
+mod support;
+
 fn main() {
+    support::require("astral_doe_auc_screen", &[(PATH, support::ASTRAL)]);
     let outer_combos = all_outer_combos();
     let inner_combos = all_inner_combos();
     let total_runs = outer_combos.len() * inner_combos.len() * EPS_GRID.len();

@@ -29,7 +29,10 @@ struct BenchmarkResult {
     latency_ms: f64,
 }
 
+mod support;
+
 fn main() {
+    support::require("run_tiered_database_search", &[("models/sirius_fingerprints.oxfp", support::MODEL), ("test_files/gnps_eval_100.mgf", support::GNPS_EVAL)]);
     println!("=========================================================================");
     println!("   OxideMS SIRIUS + CSI:FingerID + CANOPUS + Tiered Structure Database   ");
     println!("                 (High-Throughput Parallel Rayon Engine)                 ");

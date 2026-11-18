@@ -4,6 +4,8 @@
 use oxidems_lib::sirius::fingerprint::StructureDatabase;
 use std::io::Write;
 
+mod support;
+
 fn main() {
     // `--smiles OUT` dumps "inchikey<TAB>smiles" for every structure, so a vocabulary
     // can be counted over the search space rather than over the training spectra. The
@@ -11,6 +13,9 @@ fn main() {
     // the candidate structures, against 95 % in its own corpus.
     let args: Vec<String> = std::env::args().collect();
     let out = args.iter().position(|a| a == "--smiles").and_then(|i| args.get(i + 1)).cloned();
+    if !args.iter().skip(1).any(|a| !a.starts_with("--") && Some(a) != out.as_ref()) {
+        support::fail(format!("usage: db_stats <database.oxdb>... [--smiles OUT.tsv]\n  {}", support::STRUCTURE_DB));
+    }
     let mut sink = out.as_ref().map(|p| {
         std::io::BufWriter::new(std::fs::File::create(p).expect("create --smiles output"))
     });

@@ -36,6 +36,8 @@ fn simple_rng(seed: &mut u64) -> u64 {
     *seed
 }
 
+mod support;
+
 fn main() {
     let gnps_dir = std::env::args()
         .nth(1)
@@ -44,6 +46,7 @@ fn main() {
         .nth(2)
         .unwrap_or_else(|| "dataset_manifests/metabolomics/gnps/ground_truth.csv".to_string());
 
+    support::require("gnps_identity_similarity", &[(&gnps_dir, "directory of GNPS library MGF files (first argument)"), (&ground_truth_path, "ground-truth CSV mapping spectra to identities (second argument)")]);
     eprintln!("Loading ground truth from {ground_truth_path}");
     let gt_content = fs::read_to_string(&ground_truth_path).expect("read ground truth");
     let mut identity_of: HashMap<String, String> = HashMap::new();

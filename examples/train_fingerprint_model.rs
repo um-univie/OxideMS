@@ -47,7 +47,7 @@ struct RawMspRecord {
 }
 
 fn parse_mona_msp(path: &Path, max_records: usize) -> Vec<RawMspRecord> {
-    let file = File::open(path).expect("Could not open MSP file");
+    let file = File::open(path).unwrap_or_else(|e| support::fail(format!("cannot open {}: {e}\n  {} (or pass --msp PATH)", path.display(), support::MONA)));
     let reader = BufReader::with_capacity(16 * 1024 * 1024, file);
 
     let mut records = Vec::new();
@@ -117,6 +117,8 @@ fn parse_mona_msp(path: &Path, max_records: usize) -> Vec<RawMspRecord> {
 
     records
 }
+
+mod support;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

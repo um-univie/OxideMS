@@ -5,7 +5,10 @@ use oxidems_lib::{BinnedSpectrumConfig, MassSpectralRecord, SpectrumComparison};
 
 use oxidems_lib::plotting::SpectrumPlotter;
 
+mod support;
+
 fn main() {
+    support::require("spectrum_comparison", &[("tests/Astral/029_Sa04_Methanol_POS.mgf", support::ASTRAL)]);
     let mut peaks1: Vec<(f32, f32)> = vec![
         (75.0, 100.0),
         (100.0, 1000.0),

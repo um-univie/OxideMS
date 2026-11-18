@@ -1,7 +1,9 @@
 use oxidems_lib::io::mzml::{MzmlParser, MzmlParserConfig};
 
+mod support;
+
 fn main() {
-    let path = std::env::args().nth(1).unwrap();
+    let path = std::env::args().nth(1).unwrap_or_else(|| support::fail("usage: cross_check <file.mzML>"));
 
     let mut fast = MzmlParser::new(MzmlParserConfig { use_fast_tokenizer: true, ..MzmlParserConfig::default() });
     let fast_records = fast.parse_file(&path).unwrap();

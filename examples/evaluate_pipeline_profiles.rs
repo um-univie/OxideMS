@@ -7,10 +7,14 @@ use rayon::prelude::*;
 use std::io::Write;
 use std::time::Instant;
 
+mod support;
+
+const USAGE: &str = "usage: evaluate_pipeline_profiles <input.mgf> <output.jsonl> [limit=200]";
+
 fn main() {
     let args: Vec<_> = std::env::args().collect();
-    let input = args.get(1).expect("INPUT.mgf required");
-    let output = args.get(2).expect("OUTPUT.jsonl required");
+    let input = args.get(1).unwrap_or_else(|| support::fail(USAGE));
+    let output = args.get(2).unwrap_or_else(|| support::fail(USAGE));
     let limit: usize = args.get(3).map(|s| s.parse().unwrap()).unwrap_or(200);
     let mut parser = MgfParser::default();
     let records = parser.parse_file(input).expect("read MGF");

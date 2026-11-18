@@ -37,9 +37,13 @@ fn mgf_dirs(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+mod support;
+
+const USAGE: &str = "usage: null_similarity <dataset dir> [preset=proteomics] [pairs=2000000] [fragment tol Da=0.05]";
+
 fn main() {
     let mut args = std::env::args().skip(1);
-    let dataset_dir = args.next().expect("dataset dir");
+    let dataset_dir = args.next().unwrap_or_else(|| support::fail(USAGE));
     let preset = args.next().unwrap_or_else(|| "proteomics".into());
     let n_pairs: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(2_000_000);
     let frag_tol: f64 = args.next().and_then(|a| a.parse().ok()).unwrap_or(0.05);

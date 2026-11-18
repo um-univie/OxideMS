@@ -1,8 +1,12 @@
 use oxidems_lib::clustering::cluster::experiment::SpectralExperiment;
 use oxidems_lib::plotting::ClusterQualityAnalyzer;
 
+mod support;
+
 fn main() {
-    let path = "tests/PXD000561_pilot";
+    let path = support::arg_or(1, "tests/PXD000561_pilot");
+    support::require("cluster_quality", &[(&path, support::PXD000561)]);
+    let path = path.as_str();
 
     let t0 = std::time::Instant::now();
     let mut experiment = SpectralExperiment::proteomics();

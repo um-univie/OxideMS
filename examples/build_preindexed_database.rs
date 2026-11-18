@@ -19,6 +19,8 @@ fn molecules_file(name: &str) -> String {
     std::path::Path::new(&dir).join(name).to_string_lossy().into_owned()
 }
 
+mod support;
+
 fn main() {
     println!("=========================================================================");
     println!("       OxideMS Pre-Indexed Binary Database (.oxdb) Builder Tool          ");
@@ -30,6 +32,7 @@ fn main() {
     let model_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "models/sirius_fingerprints.oxfp".to_string());
+    support::require("build_preindexed_database", &[(&model_path, support::MODEL)]);
     let predictor = FingerprintPredictor::load_from_file(&model_path)
         .expect("Trained model required to fix the fingerprint layout");
     let layout = FingerprintSearcher::for_predictor(&predictor).dictionary().clone();

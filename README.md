@@ -28,17 +28,46 @@ oxidems_lib = { git = "https://github.com/um-univie/OxideMS", branch = "main" }
 
 # Optional features
 # oxidems_lib = { git = "...", features = ["gpu"] }   # GPU-accelerated similarity
-# oxidems_lib = { git = "...", features = ["ml"] }    # Burn-based machine learning
+# oxidems_lib = { git = "...", features = ["cli"] }   # the `oxidems` command-line tool
 ```
 
 The default `sirius` feature builds the SIRIUS-style annotation stack
-(`oxidems_lib::sirius`), which pulls in candle, good_lp and the sibling
-`oxidane` crate (a path dependency). Clustering-only users
-should turn it off:
+(`oxidems_lib::sirius`), which pulls in candle, good_lp and the
+[oxidane](https://github.com/um-univie/oxidane) cheminformatics crate (fetched
+from GitHub at a pinned revision). Clustering-only users should turn it off:
 
 ```toml
 oxidems_lib = { git = "https://github.com/um-univie/OxideMS", branch = "main", default-features = false }
 ```
+
+### Developing with a local oxidane
+
+To work on oxidane and OxideMS together, override the pinned revision with a
+checkout next to this repository. Put this in `.cargo/config.toml` of your own
+workspace, or pass it per command, and do not commit it:
+
+```bash
+cargo build --config 'patch."https://github.com/um-univie/oxidane".oxidane.path="../oxidane"'
+```
+
+### Tests
+
+```bash
+cargo test --release
+```
+
+runs on a fresh clone. `test_files/test1.mgf` holds two MSnLib spectra (see
+`test_files/README.md`). Three tests need a 600,566-spectrum MGF that is too
+large for git; they are marked `#[ignore]`. Place it at `test_files/test2.mgf`
+and run `cargo test --release -- --ignored`.
+
+### Examples
+
+`examples/` holds benchmarks and research tools. Each one prints its usage and
+the data or model it needs when run without arguments, for example
+`cargo run --release --example dataset_overview`. Most need public datasets
+(GNPS, MoNA, MSnLib, MassIVE/PRIDE runs) or a fingerprint model trained with
+`train_fingerprint_model`; none of these are in the repository.
 
 ## Command-line tool
 

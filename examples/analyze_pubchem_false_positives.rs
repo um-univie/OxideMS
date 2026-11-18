@@ -29,7 +29,10 @@ fn molecules_file(name: &str) -> String {
     std::path::Path::new(&dir).join(name).to_string_lossy().into_owned()
 }
 
+mod support;
+
 fn main() {
+    support::require("analyze_pubchem_false_positives", &[("models/sirius_fingerprints.oxfp", support::MODEL)]);
     println!("=========================================================================");
     println!("     PubChem Isomer Space & False Positive Analysis for CSI:FingerID     ");
     println!("=========================================================================");

@@ -243,6 +243,8 @@ struct Outcome {
     winner_name: Option<String>,
 }
 
+mod support;
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut get = |flag: &str, default: &str| -> String {
@@ -328,7 +330,7 @@ fn main() {
         Ok(p) => Some(p),
         Err(e) => {
             if external_fp.is_empty() && export_graphs.is_none() {
-                panic!("cannot load model {model_path}: {e}");
+                support::fail(format!("cannot load model {model_path}: {e}\n  {}", support::MODEL));
             }
             println!("  (no built-in model at {model_path}; using external predictions)");
             None

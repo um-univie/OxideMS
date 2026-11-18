@@ -313,7 +313,10 @@ fn run_evaluation(
     results
 }
 
+mod support;
+
 fn main() {
+    support::require("ablation_improvements", &[("test_files/gnps_eval_100.mgf", support::GNPS_EVAL)]);
     println!("================================================================================");
     println!("     OxideMS SIRIUS: Systematic Improvement Ablation Benchmark");
     println!("================================================================================");

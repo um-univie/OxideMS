@@ -1909,6 +1909,7 @@ mod low_mem_tests {
     }
 
     #[test]
+    #[ignore = "needs test_files/test2.mgf (600,566 spectra, not in git); see README \"Tests\""]
     fn low_mem_partitioning_matches_engine_split_on_mz_and_charge() {
         let file = "test_files/test2.mgf";
         let tmp_dir = std::env::temp_dir().join("oxidems_low_mem_test");
