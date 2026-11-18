@@ -8,9 +8,9 @@
 use std::fmt::Display;
 use std::path::Path;
 
-pub const GNPS_EVAL: &str = "100 annotated GNPS library spectra with known formulas (any annotated GNPS library MGF works, https://external.gnps2.org/gnpslibrary)";
+pub const GNPS_EVAL: &str = "100 GNPS library spectra with known formulas and structures, an evaluation subset of the GNPS library (https://external.gnps2.org/gnpslibrary)";
 pub const MONA: &str =
-    "MoNA LC-MS/MS positive-mode export in MSP format, from https://mona.mass.ms/downloads";
+    "MoNA LC-MS/MS positive-mode export in MSP format, from https://massbank.us/downloads";
 pub const MSNLIB: &str = "a large annotated MS/MS library MGF (the original runs used 600,566 MSnLib spectra, doi:10.5281/zenodo.21105617)";
 pub const MODEL: &str =
     "fingerprint model; train it with `cargo run --release --example train_fingerprint_model`";
