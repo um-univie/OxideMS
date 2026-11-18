@@ -43,11 +43,13 @@ fn checkpoint(label: &str, t0: Instant) {
     );
 }
 
+mod support;
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let spill_dir = args
         .next()
-        .expect("usage: partition_spill_prototype <SPILL_DIR> <FILE_OR_DIR>...");
+        .unwrap_or_else(|| support::fail("usage: partition_spill_prototype <SPILL_DIR> <FILE_OR_DIR>..."));
     let inputs: Vec<String> = args.collect();
     assert!(!inputs.is_empty(), "need at least one input file or directory");
     let spill_dir = Path::new(&spill_dir);

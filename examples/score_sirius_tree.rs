@@ -52,8 +52,10 @@ fn get<'a>(v: &'a serde_json::Value, k: &str) -> &'a serde_json::Value {
     &v[k]
 }
 
+mod support;
+
 fn main() {
-    let dir = std::env::args().nth(1).expect("usage: score_sirius_tree <compare_out_dir>");
+    let dir = std::env::args().nth(1).unwrap_or_else(|| support::fail("usage: score_sirius_tree <compare_out_dir>"));
     let sigma_ppm: f64 = std::env::args()
         .nth(2)
         .and_then(|s| s.parse().ok())

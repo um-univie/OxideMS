@@ -168,9 +168,11 @@ fn write_table(path: &str, acc: &Acc) {
     fs::write(path, j).unwrap();
 }
 
+mod support;
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let path = args.get(1).expect("usage: build_loss_table <gnps.mgf> [--limit N] [--ppm P] [--max-peaks M] [--split S] [--out DIR]");
+    let path = args.get(1).unwrap_or_else(|| support::fail("usage: build_loss_table <gnps.mgf> [--limit N] [--ppm P] [--max-peaks M] [--split S] [--out DIR]"));
 
     let mut limit = 40_000usize;
     let mut ppm = 10.0f64;

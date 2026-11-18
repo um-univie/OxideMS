@@ -249,9 +249,11 @@ fn median(mut v: Vec<f64>) -> f64 {
     v[v.len() / 2]
 }
 
+mod support;
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let path = args.get(1).expect("usage: diagnose_trees <spectra.mgf> [--max-peaks N] [--ppm P]");
+    let path = args.get(1).unwrap_or_else(|| support::fail("usage: diagnose_trees <spectra.mgf> [--max-peaks N] [--ppm P]"));
     let mut max_peaks_list = vec![25usize];
     let mut ppm = 20.0f64;
     let mut i = 2;

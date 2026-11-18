@@ -122,9 +122,11 @@ fn parse_ms1(meta: Option<&str>) -> Vec<Peak> {
         .collect()
 }
 
+mod support;
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let path = args.get(1).expect("usage: eval_tree_scoring <mgf> [--limit N] [--ppm P] [--sigma S] [--loss-sigma L] [--out DIR]");
+    let path = args.get(1).unwrap_or_else(|| support::fail("usage: eval_tree_scoring <mgf> [--limit N] [--ppm P] [--sigma S] [--loss-sigma L] [--out DIR]"));
 
     let d = TreeSolverConfig::default();
     let mut limit = 400usize;

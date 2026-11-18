@@ -1,6 +1,8 @@
 use oxidems_lib::io::mzml::{MzmlParser, MzmlParserConfig};
 use std::time::Instant;
 
+mod support;
+
 fn main() {
     eprintln!("rayon threads available: {}", rayon::current_num_threads());
     let args: Vec<String> = std::env::args().collect();
@@ -9,7 +11,7 @@ fn main() {
         .iter()
         .skip(1)
         .find(|a| !a.starts_with("--"))
-        .expect("usage: mzml_timing <file.mzML> [--sequential]");
+        .unwrap_or_else(|| support::fail("usage: mzml_timing <file.mzML> [--sequential]"));
 
     let mut parser = MzmlParser::new(MzmlParserConfig {
         parse_metadata: true,

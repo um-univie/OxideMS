@@ -59,7 +59,8 @@ cargo test --release
 runs on a fresh clone. `test_files/test1.mgf` holds two MSnLib spectra (see
 `test_files/README.md`). Three tests need a 600,566-spectrum MGF that is too
 large for git; they are marked `#[ignore]`. Place it at `test_files/test2.mgf`
-and run `cargo test --release -- --ignored`.
+and run `cargo test --release -- --ignored`. Two mzML parser tests also
+run there; point `OXIDEMS_TEST_MZML_FIXTURE` at any indexed mzML file.
 
 ### Examples
 

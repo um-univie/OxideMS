@@ -74,11 +74,13 @@ fn json_escape(s: &str) -> String {
     out
 }
 
+mod support;
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let path = args
         .get(1)
-        .expect("usage: compare_trees_sirius <spectra.mgf> [--limit N] [--ppm P] [--max-peaks M] [--out DIR]");
+        .unwrap_or_else(|| support::fail("usage: compare_trees_sirius <spectra.mgf> [--limit N] [--ppm P] [--max-peaks M] [--out DIR]"));
 
     let mut limit = 200usize;
     let mut ppm = 10.0f64;

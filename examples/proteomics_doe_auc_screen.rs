@@ -266,10 +266,12 @@ fn run_point(
     (purity, n10, completeness)
 }
 
+mod support;
+
 fn main() {
     let data_root = std::env::args()
         .nth(1)
-        .expect("usage: proteomics_doe_auc_screen <data_root>");
+        .unwrap_or_else(|| support::fail("usage: proteomics_doe_auc_screen <data_root>"));
 
     let outer_combos = all_outer_combos();
     let inner_combos = all_inner_combos();
